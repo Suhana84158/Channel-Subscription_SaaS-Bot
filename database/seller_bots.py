@@ -62,6 +62,13 @@ async def save_bot(
     )
     return await get_bot(owner_id)
 
+async def get_all_active_bots():
+    return await seller_bots_collection().find(
+        {
+            "active": True,
+            "bot_token_encrypted": {"$exists": True, "$ne": None},
+        }
+    ).to_list(length=None)
 
 async def get_decrypted_bot_token(owner_id: int) -> str | None:
     bot = await get_bot(owner_id)
