@@ -3,15 +3,20 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, Optional
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import Conflict, InvalidToken, TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from database.seller_bots import (
     get_all_active_bots,
     get_bot,
     get_decrypted_bot_token,
     set_runtime_status,
+)
+from database.seller_data import (
+    ensure_seller_defaults,
+    get_active_seller_plans,
+    get_seller_settings,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,25 +39,80 @@ class SellerBotManager:
     def is_running(self, owner_id: int) -> bool:
         return owner_id in self._running
 
-    async def _child_start(
+    @staticmethod
+    def _main_menu() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("📋 Plans", callback_data="child_plans"),
+                    InlineKeyboardButton("💳 Buy", callback_data="child_buy"),
+                ],
+                [
+                    InlineKeyboardButton("👤 My Profile", callback_data="child_profile"),
+                    InlineKeyboardButton("🔄 Renew", callback_data="child_renew"),
+                ],
+                [
+                    InlineKeyboardButton("🎁 Referral", callback_data="child_referral"),
+                    InlineKeyboardButton("📞 Support", callback_data="child_support"),
+                ],
+            ]
+        )
+
+    async def _child_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        owner_id = int(context.application.bot_data["seller_owner_id"])
+        record = await get_bot(owner_id)
+        fallback_name = record.get("bot_name", "Subscription Bot") if record else "Subscription Bot"
+        settings = await ensure_seller_defaults(owner_id, fallback_name)
+        welcome = settings.get("welcome_message") or f"👋 Welcome to {fallback_name}!"
+
+        await update.effective_message.reply_text(
+            f"{welcome}\n\nChoose an option below.",
+            reply_markup=self._main_menu(),
+        )
+
+    async def _child_menu_callback(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
+        query = update.callback_query
+        await query.answer()
         owner_id = int(context.application.bot_data["seller_owner_id"])
-        record = await get_bot(owner_id)
-        bot_name = record.get("bot_name", "Subscription Bot") if record else "Subscription Bot"
+        action = query.data
 
-        await update.effective_message.reply_text(
-            f"👋 Welcome to {bot_name}!\n\n"
-            "✅ This seller bot is live.\n"
-            "Seller-specific plans, channels and payments will be connected in the next phase.",
-        )
+        if action in {"child_plans", "child_buy", "child_renew"}:
+            plans = await get_active_seller_plans(owner_id)
+            if not plans:
+                text = "📋 No subscription plans have been added yet."
+            else:
+                settings = await get_seller_settings(owner_id)
+                currency = settings.get("currency", "INR")
+                lines = ["📋 Available Plans\n"]
+                for plan in plans:
+                    name = plan.get("name", "Plan")
+                    duration = plan.get("duration_text", "-")
+                    price = plan.get("price", 0)
+                    lines.append(f"• {name} — {duration} — {currency} {price}")
+                text = "\n".join(lines)
+
+        elif action == "child_profile":
+            text = "👤 Your seller-specific profile will appear here in the next step."
+        elif action == "child_referral":
+            text = "🎁 Seller-specific referral rewards will be connected after subscriptions."
+        elif action == "child_support":
+            settings = await get_seller_settings(owner_id)
+            support = settings.get("support_username") or "Not set by seller"
+            text = f"📞 Support: {support}"
+        else:
+            text = "This option is being connected."
+
+        await query.edit_message_text(text, reply_markup=self._main_menu())
 
     def _build_child_application(self, token: str, owner_id: int) -> Application:
         app = Application.builder().token(token).build()
         app.bot_data["seller_owner_id"] = owner_id
         app.add_handler(CommandHandler("start", self._child_start))
+        app.add_handler(CallbackQueryHandler(self._child_menu_callback, pattern=r"^child_"))
         return app
 
     async def start_bot(self, owner_id: int) -> bool:
@@ -71,6 +131,7 @@ class SellerBotManager:
 
             app: Optional[Application] = None
             try:
+                await ensure_seller_defaults(owner_id, record.get("bot_name", "Subscription Bot"))
                 app = self._build_child_application(token, owner_id)
                 await app.initialize()
                 await app.start()
