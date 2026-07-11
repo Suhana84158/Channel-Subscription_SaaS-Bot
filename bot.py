@@ -12,6 +12,7 @@ from database.admins import initialize_admins
 from database.settings import initialize_default_settings
 from database.sellers import initialize_seller_indexes
 from database.seller_bots import initialize_seller_bot_indexes
+from database.seller_data import initialize_seller_data_indexes
 
 from handlers.start import start_command, start_callback_handler
 from handlers.errors import error_handler
@@ -40,6 +41,7 @@ async def post_init(application: Application):
     await initialize_default_settings()
     await initialize_seller_indexes()
     await initialize_seller_bot_indexes()
+    await initialize_seller_data_indexes()
 
     start_scheduler()
     restore_result = await bot_manager.restore_active_bots()
