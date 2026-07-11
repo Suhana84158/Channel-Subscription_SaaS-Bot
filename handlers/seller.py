@@ -12,6 +12,7 @@ from database.seller_bots import (
     set_bot_active,
 )
 from database.sellers import get_or_create_seller
+from services.bot_manager import bot_manager
 
 
 def seller_dashboard_keyboard(has_bot: bool, bot_active: bool = False):
@@ -115,12 +116,15 @@ async def receive_seller_bot_token(update: Update, context: ContextTypes.DEFAULT
             bot_token=token,
         )
 
+        started = await bot_manager.restart_bot(update.effective_user.id)
         context.user_data.pop("waiting_seller_bot_token", None)
+        runtime_text = "🟢 Bot is running" if started else "🔴 Bot saved, but runtime failed. Check Render logs."
         await status_message.edit_text(
             "✅ Bot connected successfully!\n\n"
             f"🤖 Name: {me.full_name}\n"
             f"👤 Username: @{me.username}\n"
-            f"🆔 Bot ID: {me.id}",
+            f"🆔 Bot ID: {me.id}\n"
+            f"{runtime_text}",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🏪 Seller Dashboard", callback_data="seller_home")]]
             ),
@@ -154,7 +158,9 @@ async def seller_my_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Name: {record.get('bot_name', '-')}\n"
         f"Username: @{record.get('bot_username', '-')}\n"
         f"Bot ID: {record.get('bot_id', '-')}\n"
-        f"Status: {'🟢 Active' if record.get('active') else '⏸ Paused'}\n\n"
+        f"Status: {'🟢 Active' if record.get('active') else '⏸ Paused'}\n"
+        f"Runtime: {record.get('runtime_status', 'unknown')}\n"
+        f"Runtime Error: {record.get('runtime_error') or '-'}\n\n"
         "Token is stored encrypted and is never shown here.",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("⬅ Back", callback_data="seller_home")]]
@@ -168,7 +174,15 @@ async def seller_toggle_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not record:
         await query.answer("No bot connected.", show_alert=True)
         return
-    await set_bot_active(query.from_user.id, not bool(record.get("active")))
+
+    should_activate = not bool(record.get("active"))
+    await set_bot_active(query.from_user.id, should_activate)
+
+    if should_activate:
+        await bot_manager.start_bot(query.from_user.id)
+    else:
+        await bot_manager.stop_bot(query.from_user.id, runtime_status="paused")
+
     await seller_dashboard(update, context)
 
 
@@ -189,6 +203,7 @@ async def seller_remove_bot_confirm(update: Update, context: ContextTypes.DEFAUL
 async def seller_remove_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await bot_manager.stop_bot(query.from_user.id, runtime_status="removed")
     await delete_bot(query.from_user.id)
     await query.edit_message_text(
         "✅ Bot removed from your seller account.",
