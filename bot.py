@@ -27,6 +27,7 @@ from handlers.admin import admin_handlers, receive_upi_qr
 from handlers.payment_approval import payment_approval_handlers
 from handlers.support import support_callback, support_reply_handler
 from handlers.seller import seller_handlers
+from services.bot_manager import bot_manager
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,12 @@ async def post_init(application: Application):
     await initialize_seller_bot_indexes()
 
     start_scheduler()
+    restore_result = await bot_manager.restore_active_bots()
+    logger.info(
+        "Seller bots restored: started=%s failed=%s",
+        restore_result["started"],
+        restore_result["failed"],
+    )
 
     logger.info("Bot started successfully.")
 
