@@ -103,3 +103,21 @@ async def bot_exists(owner_id: int):
 
 async def total_bots():
     return await seller_bots_collection().count_documents({})
+
+
+async def set_runtime_status(
+    owner_id: int,
+    running: bool,
+    error: str | None = None,
+):
+    await seller_bots_collection().update_one(
+        {"owner_id": owner_id},
+        {
+            "$set": {
+                "runtime_running": running,
+                "runtime_error": error,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+    
