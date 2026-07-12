@@ -10,7 +10,6 @@ from scheduler import start_scheduler
 from database.mongo import connect_database
 from database.admins import initialize_admins
 from database.settings import initialize_default_settings
-from database.sellers import initialize_seller_indexes
 from database.seller_bots import initialize_seller_bot_indexes
 from database.seller_data import initialize_seller_data_indexes
 
@@ -39,19 +38,18 @@ async def post_init(application: Application):
     await connect_database()
     await initialize_admins()
     await initialize_default_settings()
-    await initialize_seller_indexes()
     await initialize_seller_bot_indexes()
     await initialize_seller_data_indexes()
 
     start_scheduler()
-    restore_result = await bot_manager.restore_active_bots()
-    logger.info(
-        "Seller bots restored: started=%s failed=%s",
-        restore_result["started"],
-        restore_result["failed"],
-    )
+    restored = await bot_manager.restore_active_bots()
+    logger.info("Seller bots restored: %s", restored)
 
     logger.info("Bot started successfully.")
+
+
+async def post_shutdown(application: Application):
+    await bot_manager.shutdown_all()
 
 
 def build_application():
@@ -59,16 +57,17 @@ def build_application():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
 
 def register_handlers(application: Application):
+    for handler in seller_handlers():
+        application.add_handler(handler, group=-10)
+
     application.add_handler(start_command())
     application.add_handler(start_callback_handler())
-
-    for handler in seller_handlers():
-        application.add_handler(handler, group=-2)
     application.add_handler(plans_handler())
     application.add_handler(profile_callback())
     application.add_handler(payment_handler())
