@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import Conflict, InvalidToken, TelegramError
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from database.seller_bots import get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status
 from database.seller_data import (
@@ -186,7 +186,7 @@ class SellerBotManager:
             return
         if a=="a_history":
             ps=await payment_history(owner); text="📜 Payment History\n\n"+"\n".join(f"{'✅' if p['status']=='approved' else '❌'} {p['user_id']} ₹{p['amount']:g} {p['plan']}" for p in ps[:20]); await q.edit_message_text(text,reply_markup=self.back()); return
-        if a=="a_broadcast": context.user_data.clear(); context.user_data["wait_broadcast"]=True; await q.edit_message_text("Send broadcast text",reply_markup=self.back()); return
+        if a=="a_broadcast": context.user_data.clear(); context.user_data["wait_broadcast"]=True; await q.edit_message_text("📢 Send any one message to broadcast.\n\nSupported: text, photo with caption, video, document, audio, voice, GIF, sticker and forwarded messages.",reply_markup=self.back()); return
         if a=="a_stats":
             s=await stats(owner); await q.edit_message_text(f"📊 Statistics\n\nUsers: {s['users']}\nPlans: {s['plans']}\nChannels: {s['channels']}\nPending: {s['pending']}\nRevenue: ₹{s['revenue']:g}",reply_markup=self.admin_menu()); return
 
@@ -219,15 +219,53 @@ class SellerBotManager:
                 try: days=int(text)
                 except ValueError: await update.effective_message.reply_text("❌ Send number"); return
                 await set_seller_setting(owner,"reminder_days",days); context.user_data.clear(); await update.effective_message.reply_text("✅ Updated",reply_markup=self.settings_menu()); return
-            if context.user_data.get("wait_broadcast"):
-                from database.seller_data import c, USERS
-                ids=await c(USERS).find({"owner_id":owner}).to_list(length=None); ok=0
-                for u in ids:
-                    try: await context.bot.send_message(u["user_id"],text); ok+=1
-                    except Exception: pass
-                context.user_data.clear(); await update.effective_message.reply_text(f"✅ Broadcast sent to {ok} users",reply_markup=self.admin_menu()); return
         if context.user_data.get("waiting_support_message"):
             context.user_data.clear(); await context.bot.send_message(owner,f"📩 Support message\nUser: {update.effective_user.id}\n{text}"); await update.effective_message.reply_text("✅ Sent to admin",reply_markup=self.main_menu())
+
+    async def broadcast_message_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
+        owner=self.owner(context)
+
+        if update.effective_user.id!=owner:
+            return
+
+        if not context.user_data.get("wait_broadcast"):
+            return
+
+        from database.seller_data import c, USERS
+
+        users=await c(USERS).find(
+            {"owner_id":owner},
+            {"user_id":1},
+        ).to_list(length=None)
+
+        success=0
+        failed=0
+
+        for user in users:
+            user_id=user.get("user_id")
+            if not user_id or user_id==owner:
+                continue
+
+            try:
+                await context.bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=update.effective_chat.id,
+                    message_id=update.effective_message.message_id,
+                )
+                success+=1
+            except Exception:
+                failed+=1
+
+        context.user_data.clear()
+
+        await update.effective_message.reply_text(
+            "✅ Broadcast completed\n\n"
+            f"Success: {success}\n"
+            f"Failed: {failed}",
+            reply_markup=self.admin_menu(),
+        )
+
+        raise ApplicationHandlerStop
 
     async def photo_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
@@ -266,7 +304,10 @@ class SellerBotManager:
         app=Application.builder().token(token).build(); app.bot_data["seller_owner_id"]=owner
         app.add_handler(CommandHandler("start",self.child_start)); app.add_handler(CommandHandler("admin",self.admin))
         app.add_handler(CallbackQueryHandler(self.child_callback,pattern=r"^c_")); app.add_handler(CallbackQueryHandler(self.admin_callback,pattern=r"^a_"))
-        app.add_handler(MessageHandler(filters.FORWARDED,self.forward_handler),group=-2); app.add_handler(MessageHandler(filters.PHOTO,self.photo_handler),group=-1); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,self.text_handler))
+        app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,self.broadcast_message_handler),group=-3)
+        app.add_handler(MessageHandler(filters.FORWARDED,self.forward_handler),group=-2)
+        app.add_handler(MessageHandler(filters.PHOTO,self.photo_handler),group=-1)
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,self.text_handler))
         if app.job_queue: app.job_queue.run_repeating(self.expiry_job,interval=300,first=60,name=f"seller_expiry_{owner}")
         return app
 
