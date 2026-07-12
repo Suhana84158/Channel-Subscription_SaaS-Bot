@@ -47,17 +47,9 @@ async def handle_payment_screenshot(
 
     photo = update.message.photo[-1].file_id
 
-    duration_minutes = int(
-        plan.get("duration_minutes", 1440)
-    )
-    duration_text = plan.get(
-        "duration_text",
-        "1d",
-    )
-    plan_name = plan.get(
-        "name",
-        "Premium",
-    ).replace("_", "-")
+    duration_minutes = int(plan.get("duration_minutes", 1440))
+    duration_text = plan.get("duration_text", "1d")
+    plan_name = plan.get("name", "Premium").replace("_", "-")
 
     payment = await create_payment(
         user_id=user.id,

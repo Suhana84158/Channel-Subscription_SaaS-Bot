@@ -1,60 +1,130 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import CallbackQueryHandler, ContextTypes
+from telegram import Update, ForceReply
+from telegram.ext import (
+    CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
 
-from database.settings import get_setting_value
+from config import ADMIN_IDS
+from database.admins import get_all_admins
+
+WAIT_SUPPORT = 1
+SUPPORT_REPLY_MAP = {}
 
 
 async def support_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    support_username = await get_setting_value("support_username", "")
-    support_username = (support_username or "").strip()
-
-    keyboard = []
-
-    if support_username:
-        clean_username = support_username.lstrip("@")
-        text = (
-            "📞 Support\n\n"
-            f"Contact our support team: @{clean_username}"
-        )
-        keyboard.append([
-            InlineKeyboardButton(
-                "💬 Contact Support",
-                url=f"https://t.me/{clean_username}",
-            )
-        ])
-    else:
-        text = (
-            "📞 Support\n\n"
-            "Support username has not been configured yet."
-        )
-
-    keyboard.append([
-        InlineKeyboardButton("⬅ Back", callback_data="start")
-    ])
-
     await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        "📞 *Support*\n\n"
+        "Please send your problem.\n\n"
+        "Admin will reply soon.",
+        parse_mode="Markdown",
     )
 
+    return WAIT_SUPPORT
 
-async def support_refresh_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    await support_handler(update, context)
+
+async def receive_support_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.message
+
+    admin_ids = set(ADMIN_IDS)
+
+    try:
+        admins = await get_all_admins()
+        for admin in admins:
+            admin_id = admin.get("admin_id") or admin.get("user_id")
+            if admin_id:
+                admin_ids.add(int(admin_id))
+    except Exception:
+        pass
+
+    text = (
+        "📞 NEW SUPPORT REQUEST\n\n"
+        f"👤 User: {user.first_name}\n"
+        f"🆔 User ID: {user.id}\n"
+        f"📛 Username: @{user.username if user.username else 'None'}\n\n"
+        f"💬 Message:\n{message.text}"
+    )
+
+    sent = 0
+
+    for admin_id in admin_ids:
+        try:
+            admin_msg = await context.bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                reply_markup=ForceReply(selective=True),
+            )
+
+            SUPPORT_REPLY_MAP[admin_msg.message_id] = user.id
+            sent += 1
+
+        except Exception as e:
+            print(f"Support send failed: {e}")
+
+    if sent:
+        await message.reply_text("✅ Your support request has been sent.")
+    else:
+        await message.reply_text("❌ Failed to send support request.")
+
+    return ConversationHandler.END
+
+
+async def admin_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+
+    if not message.reply_to_message:
+        return
+
+    replied_id = message.reply_to_message.message_id
+    user_id = SUPPORT_REPLY_MAP.get(replied_id)
+
+    if not user_id:
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "📞 *Admin Reply*\n\n"
+                f"{message.text}"
+            ),
+            parse_mode="Markdown",
+        )
+
+        await message.reply_text("✅ Reply sent to user.")
+
+    except Exception as e:
+        await message.reply_text(f"❌ Failed to send reply:\n{e}")
 
 
 def support_callback():
-    return CallbackQueryHandler(support_handler, pattern=r"^support$")
+    return ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(
+                support_handler,
+                pattern="^support$",
+            )
+        ],
+        states={
+            WAIT_SUPPORT: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    receive_support_message,
+                )
+            ]
+        },
+        fallbacks=[],
+    )
 
 
 def support_reply_handler():
-    # Separate callback pattern so it does not intercept normal text/admin messages.
-    return CallbackQueryHandler(
-        support_refresh_handler,
-        pattern=r"^support_refresh$",
+    return MessageHandler(
+        filters.TEXT & filters.REPLY,
+        admin_reply_handler,
     )

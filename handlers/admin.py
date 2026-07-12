@@ -553,75 +553,19 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not await is_admin(update.effective_user.id):
         return
 
-    message_text = update.message.text.strip()
+    text = update.message.text.strip()
 
     if context.user_data.get("waiting_bot_name"):
-        await set_setting("bot_name", message_text)
+        await set_setting("bot_name", text)
         context.user_data.clear()
         await update.message.reply_text(
-            f"✅ Bot Name updated successfully!\n\nNew Name: {message_text}",
-            reply_markup=admin_keyboard(),
-        )
-        return
-
-    if context.user_data.get("waiting_support_username"):
-        support_username = message_text
-        if support_username and not support_username.startswith("@"):
-            support_username = "@" + support_username
-        await set_setting("support_username", support_username)
-        context.user_data.clear()
-        await update.message.reply_text(
-            f"✅ Support Username updated successfully!\n\n{support_username}",
-            reply_markup=admin_keyboard(),
-        )
-        return
-
-    if context.user_data.get("waiting_currency"):
-        currency = message_text.upper()
-        await set_setting("currency", currency)
-        context.user_data.clear()
-        await update.message.reply_text(
-            f"✅ Currency updated successfully!\n\n{currency}",
-            reply_markup=admin_keyboard(),
-        )
-        return
-
-    if context.user_data.get("waiting_timezone"):
-        try:
-            ZoneInfo(message_text)
-        except Exception:
-            await update.message.reply_text(
-                "❌ Invalid timezone.\n\nExample: Asia/Kolkata"
-            )
-            return
-        await set_setting("timezone", message_text)
-        context.user_data.clear()
-        await update.message.reply_text(
-            f"✅ Timezone updated successfully!\n\n{message_text}",
-            reply_markup=admin_keyboard(),
-        )
-        return
-
-    if context.user_data.get("waiting_reminder_days"):
-        try:
-            reminder_days = int(message_text)
-            if reminder_days < 0 or reminder_days > 365:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Send a valid number from 0 to 365."
-            )
-            return
-        await set_setting("reminder_days", reminder_days)
-        context.user_data.clear()
-        await update.message.reply_text(
-            f"✅ Reminder Days updated successfully!\n\n{reminder_days} day(s)",
+            f"✅ Bot Name updated successfully!\n\nNew Name: {text}",
             reply_markup=admin_keyboard(),
         )
         return
 
     if context.user_data.get("waiting_welcome_message"):
-        await set_setting("welcome_message", message_text)
+        await set_setting("welcome_message", text)
         context.user_data.clear()
         await update.message.reply_text(
             "✅ Welcome Message updated successfully!",
@@ -629,28 +573,77 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
+    if context.user_data.get("waiting_support_username"):
+        value = text if text.startswith("@") else f"@{text}"
+        await set_setting("support_username", value)
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ Support Username updated!\n\n{value}",
+            reply_markup=admin_keyboard(),
+        )
+        return
+
+    if context.user_data.get("waiting_currency"):
+        value = text.upper()
+        await set_setting("currency", value)
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ Currency updated!\n\n{value}",
+            reply_markup=admin_keyboard(),
+        )
+        return
+
+    if context.user_data.get("waiting_timezone"):
+        try:
+            ZoneInfo(text)
+        except Exception:
+            await update.message.reply_text(
+                "❌ Invalid timezone. Example: Asia/Kolkata"
+            )
+            return
+        await set_setting("timezone", text)
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ Timezone updated!\n\n{text}",
+            reply_markup=admin_keyboard(),
+        )
+        return
+
+    if context.user_data.get("waiting_reminder_days"):
+        try:
+            days = int(text)
+            if not 0 <= days <= 365:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Send a number from 0 to 365."
+            )
+            return
+        await set_setting("reminder_days", days)
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ Reminder Days updated!\n\n{days} day(s)",
+            reply_markup=admin_keyboard(),
+        )
+        return
+
     if context.user_data.get("waiting_upi_id"):
-        await set_setting("upi_id", message_text)
+        await set_setting("upi_id", text)
         context.user_data.clear()
         await update.message.reply_text("✅ UPI ID updated successfully.")
         return
 
     if context.user_data.get("waiting_upi_name"):
-        await set_setting("upi_name", message_text)
+        await set_setting("upi_name", text)
         context.user_data.clear()
         await update.message.reply_text("✅ UPI Name updated successfully.")
         return
 
     if context.user_data.get("give_sub_user") or context.user_data.get("extend_sub_user"):
-        duration_text = message_text.lower()
-
+        duration_text = text.lower()
         try:
-            duration_minutes, unit = parse_plan_time(duration_text)
-
-            if duration_minutes % 1440 == 0:
-                duration_days = duration_minutes // 1440
-            else:
-                duration_days = 0
+            duration_minutes, _ = parse_plan_time(duration_text)
+            duration_days = duration_minutes // 1440 if duration_minutes % 1440 == 0 else 0
 
             if context.user_data.get("give_sub_user"):
                 user_id = context.user_data.get("give_sub_user")
@@ -672,29 +665,22 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
             await grant_channel_access(user_id)
             context.user_data.clear()
-
-            expiry_text = format_time(expiry)
-
             await update.message.reply_text(
                 f"✅ Subscription {action_text} successfully!\n\n"
                 f"👤 User ID: {user_id}\n"
                 f"⏳ Duration: {duration_text}\n"
-                f"📅 Expiry: {expiry_text}"
+                f"📅 Expiry: {format_time(expiry)}"
             )
-
         except Exception as e:
             await update.message.reply_text(
                 "❌ Invalid duration or error.\n\n"
-                "Use format like:\n"
-                "1m, 30m, 1h, 1d, 30d\n\n"
+                "Use format like: 1m, 30m, 1h, 1d, 30d\n\n"
                 f"Error: {e}"
             )
-
         return
 
     if context.user_data.get("waiting_user_search"):
-        search = message_text
-
+        search = text
         if search.startswith("@"):
             user = await get_user_by_username(search)
         else:
@@ -704,7 +690,6 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 user = None
 
         context.user_data["waiting_user_search"] = False
-
         if not user:
             await update.message.reply_text(
                 "❌ User not found.",
@@ -712,54 +697,42 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
-        text = await build_user_details_text(user)
+        details = await build_user_details_text(user)
         banned = bool(user.get("banned"))
-
         await update.message.reply_text(
-            text,
+            details,
             reply_markup=user_action_keyboard(user["user_id"], banned),
         )
         return
 
     if context.user_data.get("waiting_plans"):
         pending_channel = context.user_data.get("pending_channel")
-
         if not pending_channel:
             context.user_data["waiting_plans"] = False
-            await update.message.reply_text(
-                "❌ Channel data missing. Please try again."
-            )
+            await update.message.reply_text("❌ Channel data missing. Please try again.")
             return
 
         try:
-            plans = parse_plans(message_text)
-
+            plans = parse_plans(text)
             await add_channel(
                 chat_id=pending_channel["chat_id"],
                 title=pending_channel["title"],
                 plans=plans,
             )
-
             context.user_data["waiting_plans"] = False
             context.user_data.pop("pending_channel", None)
-
-            text = (
+            result = (
                 "✅ Channel/Group added successfully!\n\n"
                 f"Title: {pending_channel['title']}\n"
-                f"ID: {pending_channel['chat_id']}\n\n"
-                "Plans:\n"
+                f"ID: {pending_channel['chat_id']}\n\nPlans:\n"
             )
-
             for plan in plans:
-                text += f"• {plan['duration_text']} = ₹{plan['price']}\n"
-
-            await update.message.reply_text(text)
-
+                result += f"• {plan['duration_text']} = ₹{plan['price']}\n"
+            await update.message.reply_text(result)
         except Exception:
             await update.message.reply_text(
                 "❌ Invalid plan format.\n\n"
-                "Use this format:\n"
-                "5m:10, 1h:20, 1d:99"
+                "Use this format:\n5m:10, 1h:20, 1d:99"
             )
 
 
