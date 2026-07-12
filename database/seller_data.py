@@ -24,13 +24,13 @@ async def ensure_seller_defaults(owner_id:int, bot_name="Subscription Bot"):
     await c(SETTINGS).update_one({"owner_id":owner_id},{"$setOnInsert":{
         "owner_id":owner_id,"bot_name":bot_name,"welcome_message":f"👋 Welcome to {bot_name}!",
         "support_username":"","currency":"INR","timezone":"Asia/Kolkata","reminder_days":1,
-        "upi_id":"","upi_name":"","upi_qr_file_id":"","created_at":now,"updated_at":now}},upsert=True)
+        "upi_id":"","upi_name":"","upi_qr_file_id":"","welcome_media_type":"","welcome_media_file_id":"","welcome_buttons":[],"created_at":now,"updated_at":now}},upsert=True)
     return await get_seller_settings(owner_id)
 
 
 async def get_seller_settings(owner_id:int): return await c(SETTINGS).find_one({"owner_id":owner_id}) or {}
 async def set_seller_setting(owner_id:int,key:str,value):
-    allowed={"bot_name","welcome_message","support_username","currency","timezone","reminder_days","upi_id","upi_name","upi_qr_file_id"}
+    allowed={"bot_name","welcome_message","support_username","currency","timezone","reminder_days","upi_id","upi_name","upi_qr_file_id","welcome_media_type","welcome_media_file_id","welcome_buttons"}
     if key not in allowed: raise ValueError("Unsupported setting")
     now=datetime.now(timezone.utc)
     await c(SETTINGS).update_one({"owner_id":owner_id},{"$set":{key:value,"updated_at":now},"$setOnInsert":{"owner_id":owner_id,"created_at":now}},upsert=True)
