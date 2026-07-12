@@ -1,506 +1,313 @@
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import timezone
 from typing import Dict, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import Conflict, InvalidToken, TelegramError
-from telegram.ext import (
-    Application, CallbackQueryHandler, CommandHandler,
-    ContextTypes, MessageHandler, filters,
-)
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from database.seller_bots import (
-    get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status,
-)
+from database.seller_bots import get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status
 from database.seller_data import (
-    add_seller_channel, count_seller_channels, count_seller_users,
-    create_seller_plan, delete_seller_plan, ensure_seller_defaults,
-    get_active_seller_plans, get_all_seller_plans, get_seller_channels,
-    get_seller_plan, get_seller_settings, remove_seller_channel,
-    set_seller_plan_active, update_seller_plan,
+    activate_subscription, add_channel, create_payment, create_plan, delete_plan,
+    ensure_seller_defaults, expired_subscriptions, get_channels, get_payment,
+    get_plan, get_plans, get_seller_settings, get_subscription, mark_expired,
+    payment_history, pending_payments, remove_channel, set_payment_status,
+    set_seller_setting, stats, update_plan, upsert_user,
 )
 
-logger = logging.getLogger(__name__)
-
+logger=logging.getLogger(__name__)
 
 @dataclass
 class RunningSellerBot:
-    owner_id: int
-    bot_id: int
-    application: Application
-
+    owner_id:int; bot_id:int; application:Application
 
 class SellerBotManager:
-    def __init__(self) -> None:
-        self._running: Dict[int, RunningSellerBot] = {}
-        self._lock = asyncio.Lock()
-
-    def is_running(self, owner_id: int) -> bool:
-        return owner_id in self._running
+    def __init__(self): self._running:Dict[int,RunningSellerBot]={}; self._lock=asyncio.Lock()
+    def is_running(self,owner_id:int)->bool:return owner_id in self._running
 
     @staticmethod
-    def _main_menu() -> InlineKeyboardMarkup:
+    def main_menu():
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 Plans", callback_data="child_plans"),
-             InlineKeyboardButton("💳 Buy", callback_data="child_buy")],
-            [InlineKeyboardButton("👤 My Profile", callback_data="child_profile"),
-             InlineKeyboardButton("🔄 Renew", callback_data="child_renew")],
-            [InlineKeyboardButton("🎁 Referral", callback_data="child_referral"),
-             InlineKeyboardButton("📞 Support", callback_data="child_support")],
+            [InlineKeyboardButton("📋 Plans",callback_data="c_plans"),InlineKeyboardButton("💳 Buy",callback_data="c_buy")],
+            [InlineKeyboardButton("👤 My Profile",callback_data="c_profile"),InlineKeyboardButton("🔄 Renew",callback_data="c_renew")],
+            [InlineKeyboardButton("🎁 Referral",callback_data="c_referral"),InlineKeyboardButton("📞 Support",callback_data="c_support")],
         ])
-
     @staticmethod
-    def _admin_menu() -> InlineKeyboardMarkup:
+    def admin_menu():
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📦 Manage Plans", callback_data="seller_admin_plans")],
-            [InlineKeyboardButton("📢 Channels / Groups", callback_data="seller_admin_channels")],
-            [InlineKeyboardButton("💳 Payment Settings", callback_data="seller_admin_payment")],
-            [InlineKeyboardButton("⚙️ Bot Settings", callback_data="seller_admin_settings")],
-            [InlineKeyboardButton("📊 Statistics", callback_data="seller_admin_stats")],
+            [InlineKeyboardButton("📦 Manage Plans",callback_data="a_plans")],
+            [InlineKeyboardButton("📢 Channels / Groups",callback_data="a_channels")],
+            [InlineKeyboardButton("💳 Payment Settings",callback_data="a_payment")],
+            [InlineKeyboardButton("📨 Pending Payments",callback_data="a_pending")],
+            [InlineKeyboardButton("📜 Payment History",callback_data="a_history")],
+            [InlineKeyboardButton("⚙️ Bot Settings",callback_data="a_settings")],
+            [InlineKeyboardButton("📢 Broadcast",callback_data="a_broadcast")],
+            [InlineKeyboardButton("📊 Statistics",callback_data="a_stats")],
         ])
+    @staticmethod
+    def back(target="a_home"): return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back",callback_data=target)]])
+    @staticmethod
+    def plans_admin_menu():
+        return InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add Plan",callback_data="a_plan_add")],[InlineKeyboardButton("📋 View Plans",callback_data="a_plan_list")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
+    @staticmethod
+    def channels_menu():
+        return InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add Channel/Group",callback_data="a_channel_add")],[InlineKeyboardButton("📋 Channel List",callback_data="a_channel_list")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
+    @staticmethod
+    def payment_menu():
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🏦 Set UPI ID",callback_data="a_set_upi_id")],[InlineKeyboardButton("👤 Set UPI Name",callback_data="a_set_upi_name")],[InlineKeyboardButton("🖼 Upload QR",callback_data="a_set_qr")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
+    @staticmethod
+    def settings_menu():
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Bot Name",callback_data="a_set_bot_name")],[InlineKeyboardButton("💬 Welcome Message",callback_data="a_set_welcome")],[InlineKeyboardButton("📞 Support Username",callback_data="a_set_support")],[InlineKeyboardButton("💵 Currency",callback_data="a_set_currency"),InlineKeyboardButton("🕒 Timezone",callback_data="a_set_timezone")],[InlineKeyboardButton("🔔 Reminder Days",callback_data="a_set_reminder")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
 
     @staticmethod
-    def _plans_admin_menu() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add Plan", callback_data="seller_plan_add")],
-            [InlineKeyboardButton("📋 View Plans", callback_data="seller_plan_list")],
-            [InlineKeyboardButton("⬅ Back", callback_data="seller_admin_home")],
-        ])
-
-    @staticmethod
-    def _channels_admin_menu() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add Channel/Group", callback_data="seller_channel_add")],
-            [InlineKeyboardButton("📋 Channel List", callback_data="seller_channel_list")],
-            [InlineKeyboardButton("⬅ Back", callback_data="seller_admin_home")],
-        ])
-
-    @staticmethod
-    def _parse_duration(value: str) -> int:
-        value = value.strip().lower()
-        if len(value) < 2:
-            raise ValueError("Invalid duration")
-        number = int(value[:-1])
-        unit = value[-1]
-        if number <= 0:
-            raise ValueError("Duration must be greater than zero")
-        if unit == "m":
-            return number
-        if unit == "h":
-            return number * 60
-        if unit == "d":
-            return number * 1440
+    def parse_duration(value:str)->int:
+        value=value.strip().lower(); n=int(value[:-1]); unit=value[-1]
+        if n<=0: raise ValueError("Duration must be positive")
+        if unit=="m": return n
+        if unit=="h": return n*60
+        if unit=="d": return n*1440
         raise ValueError("Use m, h or d")
-
     @classmethod
-    def _parse_plan_input(cls, text: str) -> tuple[str, str, int, float]:
-        parts = [part.strip() for part in text.split("|")]
-        if len(parts) != 3:
-            raise ValueError("Use format: Plan Name | Duration | Price")
-        name, duration_text, price_text = parts
-        if not name:
-            raise ValueError("Plan name is required")
-        duration_minutes = cls._parse_duration(duration_text)
-        price = float(price_text)
-        if price < 0:
-            raise ValueError("Price cannot be negative")
-        return name, duration_text.lower(), duration_minutes, price
+    def parse_plan(cls,text:str):
+        p=[x.strip() for x in text.split("|")]
+        if len(p)!=3: raise ValueError("Use: Plan Name | Duration | Price")
+        return p[0],p[1].lower(),cls.parse_duration(p[1]),float(p[2])
 
-    async def _child_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        owner_id = int(context.application.bot_data["seller_owner_id"])
-        record = await get_bot(owner_id)
-        fallback_name = record.get("bot_name", "Subscription Bot") if record else "Subscription Bot"
-        settings = await ensure_seller_defaults(owner_id, fallback_name)
-        welcome = settings.get("welcome_message") or f"👋 Welcome to {fallback_name}!"
-        await update.effective_message.reply_text(
-            f"{welcome}\n\nChoose an option below.",
-            reply_markup=self._main_menu(),
-        )
+    def owner(self,context): return int(context.application.bot_data["seller_owner_id"])
+    async def auth(self,update,context): return update.effective_user.id==self.owner(context)
 
-    async def _child_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        owner_id = int(context.application.bot_data["seller_owner_id"])
-        if update.effective_user.id != owner_id:
-            await update.effective_message.reply_text("❌ You are not authorized.")
+    async def child_start(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
+        owner=self.owner(context); await upsert_user(owner,update.effective_user)
+        record=await get_bot(owner); settings=await ensure_seller_defaults(owner,(record or {}).get("bot_name","Subscription Bot"))
+        await update.effective_message.reply_text((settings.get("welcome_message") or "Welcome!")+"\n\nChoose an option:",reply_markup=self.main_menu())
+
+    async def admin(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
+        if not await self.auth(update,context): await update.effective_message.reply_text("❌ Not authorized"); return
+        context.user_data.clear(); await update.effective_message.reply_text("🛠 Seller Admin Panel",reply_markup=self.admin_menu())
+
+    async def show_plans(self,q,owner,select=False):
+        plans=await get_plans(owner,True); settings=await get_seller_settings(owner); currency=settings.get("currency","INR")
+        if not plans: await q.edit_message_text("📋 No plans available.",reply_markup=self.main_menu()); return
+        kb=[]; lines=["📋 Available Plans\n"]
+        for p in plans:
+            lines.append(f"• {p['name']} — {p['duration_text']} — {currency} {p['price']:g}")
+            if select: kb.append([InlineKeyboardButton(f"Buy {p['name']} - {currency} {p['price']:g}",callback_data=f"c_select_{p['plan_id']}")])
+        kb.append([InlineKeyboardButton("⬅ Back",callback_data="c_home")])
+        await q.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(kb) if select else self.main_menu())
+
+    async def child_callback(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
+        q=update.callback_query; await q.answer(); owner=self.owner(context); action=q.data
+        if action=="c_home": await q.edit_message_text("Choose an option:",reply_markup=self.main_menu()); return
+        if action=="c_plans": await self.show_plans(q,owner,False); return
+        if action in {"c_buy","c_renew"}: await self.show_plans(q,owner,True); return
+        if action.startswith("c_select_"):
+            plan=await get_plan(owner,action.replace("c_select_",""));
+            if not plan: await q.answer("Plan not found",show_alert=True); return
+            context.user_data["selected_child_plan"]=plan
+            s=await get_seller_settings(owner); text=(f"💳 Payment\n\nPlan: {plan['name']}\nAmount: {s.get('currency','INR')} {plan['price']:g}\nDuration: {plan['duration_text']}\n\nUPI Name: {s.get('upi_name') or 'Not Set'}\nUPI ID: {s.get('upi_id') or 'Not Set'}")
+            kb=InlineKeyboardMarkup([[InlineKeyboardButton("📤 Upload Screenshot",callback_data="c_upload")],[InlineKeyboardButton("⬅ Back",callback_data="c_buy")]])
+            if s.get("upi_qr_file_id"): await q.message.reply_photo(s["upi_qr_file_id"],caption=text,reply_markup=kb)
+            else: await q.edit_message_text(text,reply_markup=kb)
             return
-        context.user_data.clear()
-        await update.effective_message.reply_text(
-            "🛠 Seller Admin Panel\n\nChoose an option:",
-            reply_markup=self._admin_menu(),
-        )
-
-    async def _child_menu_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        await query.answer()
-        owner_id = int(context.application.bot_data["seller_owner_id"])
-        action = query.data
-
-        if action in {"child_plans", "child_buy", "child_renew"}:
-            plans = await get_active_seller_plans(owner_id)
-            if not plans:
-                text = "📋 No subscription plans have been added yet."
+        if action=="c_upload": context.user_data["waiting_child_screenshot"]=True; await q.message.reply_text("📷 Send payment screenshot."); return
+        if action=="c_profile":
+            sub=await get_subscription(owner,q.from_user.id)
+            if not sub: text="👤 No active subscription."
             else:
-                settings = await get_seller_settings(owner_id)
-                currency = settings.get("currency", "INR")
-                lines = ["📋 Available Plans\n"]
-                for plan in plans:
-                    lines.append(
-                        f"• {plan.get('name', 'Plan')} — {plan.get('duration_text', '-')} — "
-                        f"{currency} {plan.get('price', 0):g}"
-                    )
-                text = "\n".join(lines)
-        elif action == "child_profile":
-            text = "👤 Your profile will be connected after subscriptions."
-        elif action == "child_referral":
-            text = "🎁 Referral will be connected after subscriptions."
-        elif action == "child_support":
-            settings = await get_seller_settings(owner_id)
-            text = f"📞 Support: {settings.get('support_username') or 'Not set by seller'}"
-        else:
-            text = "This option is being connected."
+                exp=sub.get("expiry_date"); text=f"👤 Profile\n\nPlan: {sub.get('plan')}\nStatus: {'Active' if sub.get('active') else 'Expired'}\nExpiry: {exp}"
+            await q.edit_message_text(text,reply_markup=self.main_menu()); return
+        if action=="c_referral":
+            me=await context.bot.get_me(); await q.edit_message_text(f"🎁 Referral link\nhttps://t.me/{me.username}?start=ref_{q.from_user.id}",reply_markup=self.main_menu()); return
+        if action=="c_support":
+            context.user_data["waiting_support_message"]=True; await q.edit_message_text("📞 Send your message for admin.",reply_markup=self.back("c_home")); return
 
-        await query.edit_message_text(text, reply_markup=self._main_menu())
-
-    async def _seller_admin_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        await query.answer()
-        owner_id = int(context.application.bot_data["seller_owner_id"])
-
-        if query.from_user.id != owner_id:
-            await query.edit_message_text("❌ You are not authorized.")
+    async def admin_callback(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
+        q=update.callback_query; await q.answer(); owner=self.owner(context)
+        if q.from_user.id!=owner: await q.edit_message_text("❌ Not authorized"); return
+        a=q.data
+        if a=="a_home": context.user_data.clear(); await q.edit_message_text("🛠 Seller Admin Panel",reply_markup=self.admin_menu()); return
+        if a=="a_plans": await q.edit_message_text("📦 Plan Management",reply_markup=self.plans_admin_menu()); return
+        if a=="a_plan_add": context.user_data.clear(); context.user_data["wait_plan_add"]=True; await q.edit_message_text("Send: Plan Name | Duration | Price\nExample: Premium | 30d | 199",reply_markup=self.back("a_plans")); return
+        if a=="a_plan_list":
+            plans=await get_plans(owner); lines=["📋 Plans\n"]; kb=[]
+            for p in plans:
+                lines.append(f"{'✅' if p.get('active') else '⏸'} {p['name']} — {p['duration_text']} — ₹{p['price']:g}")
+                kb.append([InlineKeyboardButton(f"✏ {p['name'][:16]}",callback_data=f"a_plan_edit_{p['plan_id']}"),InlineKeyboardButton("🗑",callback_data=f"a_plan_del_{p['plan_id']}")])
+                kb.append([InlineKeyboardButton("⏸ Disable" if p.get("active") else "▶ Enable",callback_data=f"a_plan_toggle_{p['plan_id']}")])
+            kb.append([InlineKeyboardButton("⬅ Back",callback_data="a_plans")]); await q.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(kb)); return
+        if a.startswith("a_plan_edit_"): context.user_data.clear(); context.user_data["wait_plan_edit"]=a.replace("a_plan_edit_",""); await q.edit_message_text("Send new: Plan Name | Duration | Price",reply_markup=self.back("a_plan_list")); return
+        if a.startswith("a_plan_del_"): await delete_plan(owner,a.replace("a_plan_del_","")); await q.edit_message_text("✅ Plan deleted",reply_markup=self.plans_admin_menu()); return
+        if a.startswith("a_plan_toggle_"):
+            pid=a.replace("a_plan_toggle_",""); p=await get_plan(owner,pid); await update_plan(owner,pid,active=not bool(p.get("active"))); await q.edit_message_text("✅ Plan status updated",reply_markup=self.plans_admin_menu()); return
+        if a=="a_channels": await q.edit_message_text("📢 Channels / Groups",reply_markup=self.channels_menu()); return
+        if a=="a_channel_add": context.user_data.clear(); context.user_data["wait_channel"]=True; await q.edit_message_text("Forward a channel/group message.\nIf private group is not detected, send:\n-1001234567890 | Group Name",reply_markup=self.back("a_channels")); return
+        if a=="a_channel_list":
+            channels=await get_channels(owner); lines=["📋 Channels / Groups\n"]; kb=[]
+            for ch in channels:
+                lines.append(f"• {ch.get('title')}\n  {ch.get('chat_id')}")
+                kb.append([InlineKeyboardButton(f"❌ {ch.get('title','Chat')[:18]}",callback_data=f"a_channel_del_{ch['chat_id']}")])
+            kb.append([InlineKeyboardButton("⬅ Back",callback_data="a_channels")]); await q.edit_message_text("\n\n".join(lines),reply_markup=InlineKeyboardMarkup(kb)); return
+        if a.startswith("a_channel_del_"): await remove_channel(owner,int(a.replace("a_channel_del_",""))); await q.edit_message_text("✅ Removed",reply_markup=self.channels_menu()); return
+        if a=="a_payment":
+            s=await get_seller_settings(owner); await q.edit_message_text(f"💳 Payment Settings\n\nUPI Name: {s.get('upi_name') or 'Not Set'}\nUPI ID: {s.get('upi_id') or 'Not Set'}\nQR: {'Added' if s.get('upi_qr_file_id') else 'Not Added'}",reply_markup=self.payment_menu()); return
+        state={"a_set_upi_id":("wait_upi_id","Send UPI ID","a_payment"),"a_set_upi_name":("wait_upi_name","Send UPI Name","a_payment"),"a_set_bot_name":("wait_bot_name","Send Bot Name","a_settings"),"a_set_welcome":("wait_welcome","Send Welcome Message","a_settings"),"a_set_support":("wait_support","Send Support Username","a_settings"),"a_set_currency":("wait_currency","Send Currency","a_settings"),"a_set_timezone":("wait_timezone","Send Timezone","a_settings"),"a_set_reminder":("wait_reminder","Send Reminder Days","a_settings")}
+        if a in state:
+            key,msg,back=state[a]; context.user_data.clear(); context.user_data[key]=True; await q.edit_message_text(msg,reply_markup=self.back(back)); return
+        if a=="a_set_qr": context.user_data.clear(); context.user_data["wait_qr"]=True; await q.edit_message_text("Send QR image",reply_markup=self.back("a_payment")); return
+        if a=="a_settings":
+            s=await get_seller_settings(owner); await q.edit_message_text(f"⚙ Bot Settings\n\nBot Name: {s.get('bot_name')}\nSupport: {s.get('support_username') or 'Not Set'}\nCurrency: {s.get('currency')}\nTimezone: {s.get('timezone')}\nReminder: {s.get('reminder_days')}",reply_markup=self.settings_menu()); return
+        if a=="a_pending":
+            ps=await pending_payments(owner); lines=["📨 Pending Payments\n"]; kb=[]
+            for p in ps:
+                lines.append(f"• {p['user_id']} | ₹{p['amount']:g} | {p['plan']}")
+                kb.append([InlineKeyboardButton(f"View {p['user_id']}",callback_data=f"a_pay_view_{p['payment_id']}")])
+            kb.append([InlineKeyboardButton("⬅ Back",callback_data="a_home")]); await q.edit_message_text("\n".join(lines) if ps else "📨 No pending payments",reply_markup=InlineKeyboardMarkup(kb)); return
+        if a.startswith("a_pay_view_"):
+            p=await get_payment(owner,a.replace("a_pay_view_",""));
+            if not p: await q.edit_message_text("Not found",reply_markup=self.admin_menu()); return
+            kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve",callback_data=f"a_pay_ok_{p['payment_id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"a_pay_no_{p['payment_id']}")],[InlineKeyboardButton("⬅ Back",callback_data="a_pending")]])
+            await q.message.reply_photo(p["screenshot_file_id"],caption=f"Payment\nUser: {p['user_id']}\nPlan: {p['plan']}\nAmount: ₹{p['amount']:g}",reply_markup=kb); return
+        if a.startswith("a_pay_ok_") or a.startswith("a_pay_no_"):
+            approve=a.startswith("a_pay_ok_"); pid=a.replace("a_pay_ok_" if approve else "a_pay_no_",""); p=await get_payment(owner,pid)
+            if not p or not await set_payment_status(owner,pid,"approved" if approve else "rejected",owner): await q.edit_message_text("Already processed or missing"); return
+            if approve:
+                expiry=await activate_subscription(owner,p["user_id"],p["plan"],p["duration_minutes"]); links=[]
+                for ch in await get_channels(owner):
+                    try:
+                        inv=await context.bot.create_chat_invite_link(ch["chat_id"],member_limit=1); links.append(f"{ch.get('title')}: {inv.invite_link}")
+                    except Exception as exc: links.append(f"{ch.get('title')}: invite failed ({exc})")
+                await context.bot.send_message(p["user_id"],f"🎉 Payment approved\nPlan: {p['plan']}\nExpiry: {expiry}\n\n"+"\n".join(links))
+                await q.edit_message_caption("✅ Payment Approved")
+            else:
+                await context.bot.send_message(p["user_id"],"❌ Payment rejected"); await q.edit_message_caption("❌ Payment Rejected")
             return
+        if a=="a_history":
+            ps=await payment_history(owner); text="📜 Payment History\n\n"+"\n".join(f"{'✅' if p['status']=='approved' else '❌'} {p['user_id']} ₹{p['amount']:g} {p['plan']}" for p in ps[:20]); await q.edit_message_text(text,reply_markup=self.back()); return
+        if a=="a_broadcast": context.user_data.clear(); context.user_data["wait_broadcast"]=True; await q.edit_message_text("Send broadcast text",reply_markup=self.back()); return
+        if a=="a_stats":
+            s=await stats(owner); await q.edit_message_text(f"📊 Statistics\n\nUsers: {s['users']}\nPlans: {s['plans']}\nChannels: {s['channels']}\nPending: {s['pending']}\nRevenue: ₹{s['revenue']:g}",reply_markup=self.admin_menu()); return
 
-        action = query.data
-
-        if action == "seller_admin_home":
-            context.user_data.clear()
-            await query.edit_message_text(
-                "🛠 Seller Admin Panel\n\nChoose an option:",
-                reply_markup=self._admin_menu(),
-            )
-            return
-
-        if action == "seller_admin_plans":
-            context.user_data.clear()
-            await query.edit_message_text("📦 Plan Management", reply_markup=self._plans_admin_menu())
-            return
-
-        if action == "seller_plan_add":
-            context.user_data.clear()
-            context.user_data["seller_waiting_plan_add"] = True
-            await query.edit_message_text(
-                "➕ Add Plan\n\nSend:\nPlan Name | Duration | Price\n\nExample:\nPremium | 30d | 199",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⬅ Back", callback_data="seller_admin_plans")
-                ]]),
-            )
-            return
-
-        if action == "seller_plan_list":
-            plans = await get_all_seller_plans(owner_id)
-            if not plans:
-                await query.edit_message_text("📋 No plans added yet.", reply_markup=self._plans_admin_menu())
+    async def text_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
+        owner=self.owner(context); text=update.effective_message.text.strip()
+        if update.effective_user.id==owner:
+            if context.user_data.get("wait_plan_add") or context.user_data.get("wait_plan_edit"):
+                try:
+                    name,dtext,dmins,price=self.parse_plan(text)
+                    pid=context.user_data.get("wait_plan_edit")
+                    if pid: await update_plan(owner,pid,name=name,duration_text=dtext,duration_minutes=dmins,price=price)
+                    else: await create_plan(owner,name,dtext,dmins,price)
+                    context.user_data.clear(); await update.effective_message.reply_text("✅ Plan saved",reply_markup=self.plans_admin_menu())
+                except Exception as exc: await update.effective_message.reply_text(f"❌ {exc}")
                 return
-            lines = ["📋 Your Plans\n"]
-            keyboard = []
-            for plan in plans:
-                status = "✅" if plan.get("active") else "⏸"
-                plan_id = plan["plan_id"]
-                name = plan.get("name", "Plan")
-                lines.append(f"{status} {name} — {plan.get('duration_text', '-')} — ₹{plan.get('price', 0):g}")
-                keyboard.append([
-                    InlineKeyboardButton(f"✏️ Edit {name[:18]}", callback_data=f"seller_plan_edit_{plan_id}"),
-                    InlineKeyboardButton("🗑 Delete", callback_data=f"seller_plan_delete_{plan_id}"),
-                ])
-                keyboard.append([InlineKeyboardButton(
-                    "⏸ Disable" if plan.get("active") else "▶️ Enable",
-                    callback_data=f"seller_plan_toggle_{plan_id}",
-                )])
-            keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="seller_admin_plans")])
-            await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
-            return
-
-        if action.startswith("seller_plan_edit_"):
-            plan_id = action.replace("seller_plan_edit_", "")
-            plan = await get_seller_plan(owner_id, plan_id)
-            if not plan:
-                await query.edit_message_text("❌ Plan not found.", reply_markup=self._plans_admin_menu())
+            if context.user_data.get("wait_channel"):
+                try:
+                    cid,name=[x.strip() for x in text.split("|",1)]; await add_channel(owner,int(cid),name,"group")
+                    context.user_data.clear(); await update.effective_message.reply_text("✅ Channel/group added",reply_markup=self.channels_menu())
+                except Exception: await update.effective_message.reply_text("❌ Use: -1001234567890 | Group Name")
                 return
-            context.user_data.clear()
-            context.user_data["seller_waiting_plan_edit"] = plan_id
-            await query.edit_message_text(
-                "✏️ Send new values:\nPlan Name | Duration | Price",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⬅ Back", callback_data="seller_plan_list")
-                ]]),
-            )
-            return
+            mapping=[("wait_upi_id","upi_id",text,self.payment_menu()),("wait_upi_name","upi_name",text,self.payment_menu()),("wait_bot_name","bot_name",text,self.settings_menu()),("wait_welcome","welcome_message",text,self.settings_menu()),("wait_support","support_username",text if text.startswith("@") else "@"+text,self.settings_menu()),("wait_currency","currency",text.upper(),self.settings_menu())]
+            for state,key,val,kb in mapping:
+                if context.user_data.get(state): await set_seller_setting(owner,key,val); context.user_data.clear(); await update.effective_message.reply_text("✅ Updated",reply_markup=kb); return
+            if context.user_data.get("wait_timezone"):
+                try: ZoneInfo(text)
+                except ZoneInfoNotFoundError: await update.effective_message.reply_text("❌ Invalid timezone"); return
+                await set_seller_setting(owner,"timezone",text); context.user_data.clear(); await update.effective_message.reply_text("✅ Updated",reply_markup=self.settings_menu()); return
+            if context.user_data.get("wait_reminder"):
+                try: days=int(text)
+                except ValueError: await update.effective_message.reply_text("❌ Send number"); return
+                await set_seller_setting(owner,"reminder_days",days); context.user_data.clear(); await update.effective_message.reply_text("✅ Updated",reply_markup=self.settings_menu()); return
+            if context.user_data.get("wait_broadcast"):
+                from database.seller_data import c, USERS
+                ids=await c(USERS).find({"owner_id":owner}).to_list(length=None); ok=0
+                for u in ids:
+                    try: await context.bot.send_message(u["user_id"],text); ok+=1
+                    except Exception: pass
+                context.user_data.clear(); await update.effective_message.reply_text(f"✅ Broadcast sent to {ok} users",reply_markup=self.admin_menu()); return
+        if context.user_data.get("waiting_support_message"):
+            context.user_data.clear(); await context.bot.send_message(owner,f"📩 Support message\nUser: {update.effective_user.id}\n{text}"); await update.effective_message.reply_text("✅ Sent to admin",reply_markup=self.main_menu())
 
-        if action.startswith("seller_plan_delete_"):
-            deleted = await delete_seller_plan(owner_id, action.replace("seller_plan_delete_", ""))
-            await query.edit_message_text(
-                "✅ Plan deleted." if deleted else "❌ Plan not found.",
-                reply_markup=self._plans_admin_menu(),
-            )
-            return
+    async def photo_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
+        owner=self.owner(context)
+        if update.effective_user.id==owner and context.user_data.get("wait_qr"):
+            await set_seller_setting(owner,"upi_qr_file_id",update.effective_message.photo[-1].file_id); context.user_data.clear(); await update.effective_message.reply_text("✅ QR updated",reply_markup=self.payment_menu()); return
+        if context.user_data.get("waiting_child_screenshot"):
+            plan=context.user_data.get("selected_child_plan")
+            if not plan: await update.effective_message.reply_text("Select a plan first"); return
+            p=await create_payment(owner,update.effective_user.id,plan,update.effective_message.photo[-1].file_id); context.user_data.clear()
+            kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve",callback_data=f"a_pay_ok_{p['payment_id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"a_pay_no_{p['payment_id']}")]])
+            await context.bot.send_photo(owner,p["screenshot_file_id"],caption=f"🆕 Payment\nUser: {update.effective_user.id}\nPlan: {p['plan']}\nAmount: ₹{p['amount']:g}",reply_markup=kb)
+            await update.effective_message.reply_text("✅ Payment submitted. Waiting for approval.")
 
-        if action.startswith("seller_plan_toggle_"):
-            plan_id = action.replace("seller_plan_toggle_", "")
-            plan = await get_seller_plan(owner_id, plan_id)
-            if not plan:
-                await query.edit_message_text("❌ Plan not found.", reply_markup=self._plans_admin_menu())
-                return
-            await set_seller_plan_active(owner_id, plan_id, not bool(plan.get("active")))
-            await query.edit_message_text("✅ Plan status updated.", reply_markup=self._plans_admin_menu())
-            return
-
-        if action == "seller_admin_channels":
-            context.user_data.clear()
-            await query.edit_message_text(
-                "📢 Channels / Groups",
-                reply_markup=self._channels_admin_menu(),
-            )
-            return
-
-        if action == "seller_channel_add":
-            context.user_data.clear()
-            context.user_data["seller_waiting_channel"] = True
-            await query.edit_message_text(
-                "📢 Forward any message from your channel/group.\n\n"
-                "⚠ Child bot must be admin there.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⬅ Back", callback_data="seller_admin_channels")
-                ]]),
-            )
-            return
-
-        if action == "seller_channel_list":
-            channels = await get_seller_channels(owner_id)
-            if not channels:
-                await query.edit_message_text(
-                    "📋 No channel/group added yet.",
-                    reply_markup=self._channels_admin_menu(),
-                )
-                return
-
-            lines = ["📋 Added Channels / Groups"]
-            keyboard = []
-            for channel in channels:
-                title = channel.get("title", "Unknown")
-                chat_id = int(channel["chat_id"])
-                chat_type = channel.get("chat_type", "unknown")
-                lines.append(f"• {title}\n  Type: {chat_type}\n  ID: {chat_id}")
-                keyboard.append([InlineKeyboardButton(
-                    f"❌ Remove {title[:18]}",
-                    callback_data=f"seller_channel_remove_{chat_id}",
-                )])
-            keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="seller_admin_channels")])
-            await query.edit_message_text(
-                "\n\n".join(lines),
-                reply_markup=InlineKeyboardMarkup(keyboard),
-            )
-            return
-
-        if action.startswith("seller_channel_remove_"):
-            chat_id = int(action.replace("seller_channel_remove_", ""))
-            removed = await remove_seller_channel(owner_id, chat_id)
-            await query.edit_message_text(
-                "✅ Channel/group removed." if removed else "❌ Channel/group not found.",
-                reply_markup=self._channels_admin_menu(),
-            )
-            return
-
-        if action == "seller_admin_stats":
-            plans = await get_all_seller_plans(owner_id)
-            active_plans = sum(1 for plan in plans if plan.get("active"))
-            await query.edit_message_text(
-                "📊 Seller Statistics\n\n"
-                f"📦 Total Plans: {len(plans)}\n"
-                f"✅ Active Plans: {active_plans}\n"
-                f"📢 Channels/Groups: {await count_seller_channels(owner_id)}\n"
-                f"👥 Users: {await count_seller_users(owner_id)}",
-                reply_markup=self._admin_menu(),
-            )
-            return
-
-        if action == "seller_admin_payment":
-            text = "💳 Payment Settings will be connected in the next phase."
-        elif action == "seller_admin_settings":
-            text = "⚙️ Bot Settings will be connected in the next phase."
-        else:
-            text = "This seller admin option is being connected."
-
-        await query.edit_message_text(text, reply_markup=self._admin_menu())
-
-    async def _seller_admin_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        owner_id = int(context.application.bot_data["seller_owner_id"])
-        if update.effective_user.id != owner_id:
-            return
-
-        if context.user_data.get("seller_waiting_plan_add"):
-            try:
-                name, duration_text, duration_minutes, price = self._parse_plan_input(update.effective_message.text)
-                await create_seller_plan(owner_id, name, duration_text, duration_minutes, price)
-                context.user_data.clear()
-                await update.effective_message.reply_text(
-                    "✅ Plan added successfully!",
-                    reply_markup=self._plans_admin_menu(),
-                )
-            except Exception as exc:
-                await update.effective_message.reply_text(
-                    "❌ Invalid format.\n\nUse:\nPlan Name | Duration | Price\n\n"
-                    f"Error: {exc}"
-                )
-            return
-
-        plan_id = context.user_data.get("seller_waiting_plan_edit")
-        if plan_id:
-            try:
-                name, duration_text, duration_minutes, price = self._parse_plan_input(update.effective_message.text)
-                await update_seller_plan(owner_id, plan_id, name, duration_text, duration_minutes, price)
-                context.user_data.clear()
-                await update.effective_message.reply_text(
-                    "✅ Plan updated successfully!",
-                    reply_markup=self._plans_admin_menu(),
-                )
-            except Exception as exc:
-                await update.effective_message.reply_text(f"❌ Invalid format.\n\nError: {exc}")
-            return
-
-    async def _seller_channel_forward(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        owner_id = int(context.application.bot_data["seller_owner_id"])
-        if update.effective_user.id != owner_id:
-            return
-        if not context.user_data.get("seller_waiting_channel"):
-            return
-
-        message = update.effective_message
-        chat = getattr(message, "forward_from_chat", None)
+    async def forward_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
+        owner=self.owner(context)
+        if update.effective_user.id!=owner or not context.user_data.get("wait_channel"): return
+        m=update.effective_message; chat=getattr(m,"forward_from_chat",None)
         if chat is None:
-            origin = getattr(message, "forward_origin", None)
-            chat = getattr(origin, "chat", None)
+            origin=getattr(m,"forward_origin",None); chat=getattr(origin,"chat",None)
+        if chat is None: await m.reply_text("❌ Could not detect. Send manually: -1001234567890 | Group Name"); return
+        await add_channel(owner,chat.id,chat.title or "Unknown",getattr(chat,"type","unknown")); context.user_data.clear(); await m.reply_text("✅ Channel/group added",reply_markup=self.channels_menu())
 
-        if chat is None:
-            await message.reply_text(
-                "❌ Channel/group detect nahi hua.\n\n"
-                "Channel/group se forwarded message bhejo."
-            )
-            return
+    async def expiry_job(self,context:ContextTypes.DEFAULT_TYPE):
+        owner=self.owner(context)
+        for sub in await expired_subscriptions(owner):
+            uid=sub["user_id"]
+            for ch in await get_channels(owner):
+                try:
+                    await context.bot.ban_chat_member(ch["chat_id"],uid); await context.bot.unban_chat_member(ch["chat_id"],uid,only_if_banned=True)
+                except Exception: pass
+            await mark_expired(owner,uid)
+            try: await context.bot.send_message(uid,"⏰ Subscription expired. Access removed.")
+            except Exception: pass
 
-        record = await add_seller_channel(
-            owner_id=owner_id,
-            chat_id=chat.id,
-            title=chat.title or "Unknown",
-            chat_type=getattr(chat, "type", "unknown"),
-        )
-        context.user_data.clear()
-        await message.reply_text(
-            "✅ Channel/group added successfully!\n\n"
-            f"Title: {record.get('title', 'Unknown')}\n"
-            f"Type: {record.get('chat_type', 'unknown')}\n"
-            f"ID: {record.get('chat_id')}",
-            reply_markup=self._channels_admin_menu(),
-        )
-
-    def _build_child_application(self, token: str, owner_id: int) -> Application:
-        app = Application.builder().token(token).build()
-        app.bot_data["seller_owner_id"] = owner_id
-        app.add_handler(CommandHandler("start", self._child_start))
-        app.add_handler(CommandHandler("admin", self._child_admin))
-        app.add_handler(CallbackQueryHandler(self._child_menu_callback, pattern=r"^child_"))
-        app.add_handler(CallbackQueryHandler(self._seller_admin_callback, pattern=r"^seller_"))
-        app.add_handler(MessageHandler(filters.FORWARDED, self._seller_channel_forward), group=-1)
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._seller_admin_text))
+    def build_app(self,token,owner):
+        app=Application.builder().token(token).build(); app.bot_data["seller_owner_id"]=owner
+        app.add_handler(CommandHandler("start",self.child_start)); app.add_handler(CommandHandler("admin",self.admin))
+        app.add_handler(CallbackQueryHandler(self.child_callback,pattern=r"^c_")); app.add_handler(CallbackQueryHandler(self.admin_callback,pattern=r"^a_"))
+        app.add_handler(MessageHandler(filters.FORWARDED,self.forward_handler),group=-2); app.add_handler(MessageHandler(filters.PHOTO,self.photo_handler),group=-1); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,self.text_handler))
+        if app.job_queue: app.job_queue.run_repeating(self.expiry_job,interval=300,first=60,name=f"seller_expiry_{owner}")
         return app
 
-    async def start_bot(self, owner_id: int) -> bool:
+    async def start_bot(self,owner_id:int)->bool:
         async with self._lock:
-            if owner_id in self._running:
-                return True
-            record = await get_bot(owner_id)
-            if not record or not record.get("active"):
-                return False
-            token = await get_decrypted_bot_token(owner_id)
-            if not token:
-                await set_runtime_status(owner_id, "token_missing", "Encrypted token is missing")
-                return False
-            app: Optional[Application] = None
+            if owner_id in self._running:return True
+            record=await get_bot(owner_id)
+            if not record or not record.get("active"):return False
+            token=await get_decrypted_bot_token(owner_id)
+            if not token: await set_runtime_status(owner_id,"token_missing","Missing encrypted token"); return False
+            app:Optional[Application]=None
             try:
-                await ensure_seller_defaults(owner_id, record.get("bot_name", "Subscription Bot"))
-                app = self._build_child_application(token, owner_id)
-                await app.initialize()
-                await app.start()
-                if app.updater is None:
-                    raise RuntimeError("Updater is unavailable for seller bot")
-                await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-                self._running[owner_id] = RunningSellerBot(
-                    owner_id=owner_id,
-                    bot_id=int(record["bot_id"]),
-                    application=app,
-                )
-                await set_runtime_status(owner_id, "running", None)
-                logger.info("Seller bot started: owner=%s bot=%s", owner_id, record.get("bot_id"))
-                return True
-            except (InvalidToken, Conflict, TelegramError, RuntimeError) as exc:
-                logger.exception("Could not start seller bot for owner %s", owner_id)
-                await set_runtime_status(owner_id, "error", str(exc)[:500])
-                if app is not None:
-                    await self._safe_shutdown_application(app)
-                return False
+                await ensure_seller_defaults(owner_id,record.get("bot_name","Subscription Bot")); app=self.build_app(token,owner_id); await app.initialize(); await app.start(); await app.updater.start_polling(drop_pending_updates=True,allowed_updates=Update.ALL_TYPES)
+                self._running[owner_id]=RunningSellerBot(owner_id,int(record["bot_id"]),app); await set_runtime_status(owner_id,"running",None); return True
             except Exception as exc:
-                logger.exception("Unexpected seller bot start error for owner %s", owner_id)
-                await set_runtime_status(owner_id, "error", str(exc)[:500])
-                if app is not None:
-                    await self._safe_shutdown_application(app)
+                logger.exception("Seller bot start failed owner=%s",owner_id); await set_runtime_status(owner_id,"error",str(exc)[:500])
+                if app: await self._safe_shutdown(app)
                 return False
 
-    async def _safe_shutdown_application(self, app: Application) -> None:
+    async def _safe_shutdown(self,app):
         try:
-            if app.updater and app.updater.running:
-                await app.updater.stop()
-        except Exception:
-            logger.exception("Error stopping seller bot updater")
+            if app.updater and app.updater.running: await app.updater.stop()
+        except Exception: pass
         try:
-            if app.running:
-                await app.stop()
-        except Exception:
-            logger.exception("Error stopping seller bot application")
-        try:
-            await app.shutdown()
-        except Exception:
-            logger.exception("Error shutting down seller bot application")
-
-    async def stop_bot(self, owner_id: int, runtime_status: str = "paused") -> bool:
+            if app.running: await app.stop()
+        except Exception: pass
+        try: await app.shutdown()
+        except Exception: pass
+    async def stop_bot(self,owner_id:int,runtime_status="paused"):
         async with self._lock:
-            running = self._running.pop(owner_id, None)
-            if not running:
-                await set_runtime_status(owner_id, runtime_status, None)
-                return True
-            await self._safe_shutdown_application(running.application)
-            await set_runtime_status(owner_id, runtime_status, None)
-            logger.info("Seller bot stopped: owner=%s", owner_id)
-            return True
+            r=self._running.pop(owner_id,None)
+            if r: await self._safe_shutdown(r.application)
+            await set_runtime_status(owner_id,runtime_status,None); return True
+    async def restart_bot(self,owner_id): await self.stop_bot(owner_id,"restarting"); return await self.start_bot(owner_id)
+    async def restore_active_bots(self):
+        started=failed=0
+        for r in await get_all_active_bots():
+            if await self.start_bot(int(r["owner_id"])):started+=1
+            else:failed+=1
+        return {"started":started,"failed":failed}
+    async def shutdown_all(self):
+        for oid in list(self._running): await self.stop_bot(oid,"service_stopped")
 
-    async def restart_bot(self, owner_id: int) -> bool:
-        await self.stop_bot(owner_id, runtime_status="restarting")
-        return await self.start_bot(owner_id)
-
-    async def restore_active_bots(self) -> dict:
-        records = await get_all_active_bots()
-        started = 0
-        failed = 0
-        for record in records:
-            owner_id = int(record["owner_id"])
-            if await self.start_bot(owner_id):
-                started += 1
-            else:
-                failed += 1
-        logger.info("Seller bot restore complete: started=%s failed=%s", started, failed)
-        return {"started": started, "failed": failed}
-
-    async def shutdown_all(self) -> None:
-        for owner_id in list(self._running.keys()):
-            await self.stop_bot(owner_id, runtime_status="service_stopped")
-
-
-bot_manager = SellerBotManager()
+bot_manager=SellerBotManager()
