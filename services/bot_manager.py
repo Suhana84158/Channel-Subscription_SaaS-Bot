@@ -60,7 +60,106 @@ class SellerBotManager:
         return InlineKeyboardMarkup([[InlineKeyboardButton("🏦 Set UPI ID",callback_data="a_set_upi_id")],[InlineKeyboardButton("👤 Set UPI Name",callback_data="a_set_upi_name")],[InlineKeyboardButton("🖼 Upload QR",callback_data="a_set_qr")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
     @staticmethod
     def settings_menu():
-        return InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Bot Name",callback_data="a_set_bot_name")],[InlineKeyboardButton("💬 Welcome Message",callback_data="a_set_welcome")],[InlineKeyboardButton("📞 Support Username",callback_data="a_set_support")],[InlineKeyboardButton("💵 Currency",callback_data="a_set_currency"),InlineKeyboardButton("🕒 Timezone",callback_data="a_set_timezone")],[InlineKeyboardButton("🔔 Reminder Days",callback_data="a_set_reminder")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Bot Name",callback_data="a_set_bot_name")],[InlineKeyboardButton("💬 Welcome Message",callback_data="a_welcome")],[InlineKeyboardButton("📞 Support Username",callback_data="a_set_support")],[InlineKeyboardButton("💵 Currency",callback_data="a_set_currency"),InlineKeyboardButton("🕒 Timezone",callback_data="a_set_timezone")],[InlineKeyboardButton("🔔 Reminder Days",callback_data="a_set_reminder")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
+
+    @staticmethod
+    def welcome_menu():
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 Edit Text",callback_data="a_welcome_text"),InlineKeyboardButton("🖼 Edit Media",callback_data="a_welcome_media")],
+            [InlineKeyboardButton("🔗 Edit Buttons",callback_data="a_welcome_buttons"),InlineKeyboardButton("👀 Preview",callback_data="a_welcome_preview")],
+            [InlineKeyboardButton("🗑 Remove Text",callback_data="a_welcome_remove_text"),InlineKeyboardButton("🗑 Remove Media",callback_data="a_welcome_remove_media")],
+            [InlineKeyboardButton("🧹 Remove Buttons",callback_data="a_welcome_remove_buttons")],
+            [InlineKeyboardButton("⬅ Back",callback_data="a_settings")],
+        ])
+
+    @staticmethod
+    def welcome_buttons_menu():
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚡ Choose Bot Button",callback_data="a_welcome_quick")],
+            [InlineKeyboardButton("✍ Write Manually",callback_data="a_welcome_manual")],
+            [InlineKeyboardButton("👀 See Current Buttons",callback_data="a_welcome_see_buttons")],
+            [InlineKeyboardButton("🧹 Remove All Buttons",callback_data="a_welcome_remove_buttons")],
+            [InlineKeyboardButton("⬅ Back",callback_data="a_welcome")],
+        ])
+
+    @staticmethod
+    def welcome_quick_menu():
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Plans",callback_data="a_wq_plans"),InlineKeyboardButton("💳 Buy",callback_data="a_wq_buy")],
+            [InlineKeyboardButton("👤 My Profile",callback_data="a_wq_profile"),InlineKeyboardButton("🔄 Renew",callback_data="a_wq_renew")],
+            [InlineKeyboardButton("🎁 Referral",callback_data="a_wq_referral"),InlineKeyboardButton("📞 Support",callback_data="a_wq_support")],
+            [InlineKeyboardButton("🏠 Main Menu",callback_data="a_wq_home")],
+            [InlineKeyboardButton("⬅ Back",callback_data="a_welcome_buttons")],
+        ])
+
+    @staticmethod
+    def personalize(text,user,bot_name="Subscription Bot"):
+        now=datetime.now()
+        values={
+            "{ID}":str(user.id),
+            "{NAME}":user.first_name or "",
+            "{SURNAME}":user.last_name or "",
+            "{NAMESURNAME}":" ".join(x for x in [user.first_name,user.last_name] if x),
+            "{USERNAME}":("@"+user.username) if user.username else "",
+            "{LANG}":user.language_code or "",
+            "{DATE}":now.strftime("%d-%m-%Y"),
+            "{TIME}":now.strftime("%I:%M %p"),
+            "{WEEKDAY}":now.strftime("%A"),
+            "{MENTION}":user.mention_html(),
+            "{BOTNAME}":bot_name,
+        }
+        result=text or ""
+        for key,value in values.items(): result=result.replace(key,value)
+        return result
+
+    @staticmethod
+    def parse_welcome_buttons(text):
+        rows=[]
+        for raw_line in text.splitlines():
+            raw_line=raw_line.strip()
+            if not raw_line: continue
+            row=[]
+            for item in raw_line.split("&&"):
+                item=item.strip()
+                if " - " not in item: raise ValueError("Use: Button title - URL")
+                title,target=[x.strip() for x in item.split(" - ",1)]
+                if not title or not target: raise ValueError("Button title and target required")
+                if target.startswith(("http://","https://","tg://")) or target.startswith("t.me/"):
+                    if target.startswith("t.me/"): target="https://"+target
+                    row.append({"text":title,"type":"url","value":target})
+                elif target.startswith("feature:"):
+                    feature=target.split(":",1)[1].lower()
+                    allowed={"plans":"c_plans","buy":"c_buy","profile":"c_profile","renew":"c_renew","referral":"c_referral","support":"c_support","home":"c_home"}
+                    if feature not in allowed: raise ValueError("Unknown feature button")
+                    row.append({"text":title,"type":"callback","value":allowed[feature]})
+                else:
+                    raise ValueError("Target must be URL or feature:plans/buy/profile/renew/referral/support/home")
+            if row: rows.append(row)
+        if not rows: raise ValueError("No buttons found")
+        return rows
+
+    @staticmethod
+    def build_welcome_keyboard(rows):
+        if not rows: return None
+        keyboard=[]
+        for row in rows:
+            built=[]
+            for item in row:
+                if item.get("type")=="url": built.append(InlineKeyboardButton(item.get("text","Button"),url=item.get("value")))
+                else: built.append(InlineKeyboardButton(item.get("text","Button"),callback_data=item.get("value","c_home")))
+            if built: keyboard.append(built)
+        return InlineKeyboardMarkup(keyboard) if keyboard else None
+
+    async def send_welcome(self,message,context,settings,user):
+        text=self.personalize(settings.get("welcome_message") or "Welcome!",user,settings.get("bot_name","Subscription Bot"))
+        keyboard=self.build_welcome_keyboard(settings.get("welcome_buttons") or []) or self.main_menu()
+        media_type=settings.get("welcome_media_type")
+        file_id=settings.get("welcome_media_file_id")
+        if file_id and media_type=="photo": await message.reply_photo(file_id,caption=text,reply_markup=keyboard,parse_mode="HTML")
+        elif file_id and media_type=="video": await message.reply_video(file_id,caption=text,reply_markup=keyboard,parse_mode="HTML")
+        elif file_id and media_type=="animation": await message.reply_animation(file_id,caption=text,reply_markup=keyboard,parse_mode="HTML")
+        elif file_id and media_type=="document": await message.reply_document(file_id,caption=text,reply_markup=keyboard,parse_mode="HTML")
+        else: await message.reply_text(text,reply_markup=keyboard,parse_mode="HTML",disable_web_page_preview=True)
 
     @staticmethod
     def parse_duration(value:str)->int:
@@ -82,7 +181,7 @@ class SellerBotManager:
     async def child_start(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context); await upsert_user(owner,update.effective_user)
         record=await get_bot(owner); settings=await ensure_seller_defaults(owner,(record or {}).get("bot_name","Subscription Bot"))
-        await update.effective_message.reply_text((settings.get("welcome_message") or "Welcome!")+"\n\nChoose an option:",reply_markup=self.main_menu())
+        await self.send_welcome(update.effective_message,context,settings,update.effective_user)
 
     async def admin(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         if not await self.auth(update,context): await update.effective_message.reply_text("❌ Not authorized"); return
@@ -151,9 +250,49 @@ class SellerBotManager:
                 kb.append([InlineKeyboardButton(f"❌ {ch.get('title','Chat')[:18]}",callback_data=f"a_channel_del_{ch['chat_id']}")])
             kb.append([InlineKeyboardButton("⬅ Back",callback_data="a_channels")]); await q.edit_message_text("\n\n".join(lines),reply_markup=InlineKeyboardMarkup(kb)); return
         if a.startswith("a_channel_del_"): await remove_channel(owner,int(a.replace("a_channel_del_",""))); await q.edit_message_text("✅ Removed",reply_markup=self.channels_menu()); return
+        if a=="a_welcome":
+            s=await get_seller_settings(owner)
+            text=("💬 Welcome Message\n\n"
+                  f"📝 Text: {'✅' if s.get('welcome_message') else '❌'}\n"
+                  f"🖼 Media: {'✅' if s.get('welcome_media_file_id') else '❌'}\n"
+                  f"🔗 Buttons: {sum(len(r) for r in (s.get('welcome_buttons') or []))}")
+            await q.edit_message_text(text,reply_markup=self.welcome_menu()); return
+        if a=="a_welcome_text":
+            context.user_data.clear(); context.user_data["wait_welcome_text"]=True
+            await q.edit_message_text("📝 Send welcome text.\n\nHTML is supported.\nVariables: {ID} {NAME} {SURNAME} {NAMESURNAME} {USERNAME} {LANG} {DATE} {TIME} {WEEKDAY} {MENTION} {BOTNAME}",reply_markup=self.back("a_welcome")); return
+        if a=="a_welcome_media":
+            context.user_data.clear(); context.user_data["wait_welcome_media"]=True
+            await q.edit_message_text("🖼 Send photo, video, GIF or document for welcome media.",reply_markup=self.back("a_welcome")); return
+        if a=="a_welcome_buttons": await q.edit_message_text("🔗 Welcome Buttons",reply_markup=self.welcome_buttons_menu()); return
+        if a=="a_welcome_quick": await q.edit_message_text("⚡ Choose a bot button to add",reply_markup=self.welcome_quick_menu()); return
+        if a.startswith("a_wq_"):
+            feature=a.replace("a_wq_","")
+            config={
+                "plans":("📋 Plans","c_plans"),"buy":("💳 Buy","c_buy"),"profile":("👤 My Profile","c_profile"),
+                "renew":("🔄 Renew","c_renew"),"referral":("🎁 Referral","c_referral"),"support":("📞 Support","c_support"),"home":("🏠 Main Menu","c_home")}
+            title,callback=config[feature]
+            s=await get_seller_settings(owner); rows=s.get("welcome_buttons") or []
+            rows.append([{"text":title,"type":"callback","value":callback}])
+            await set_seller_setting(owner,"welcome_buttons",rows)
+            await q.edit_message_text(f"✅ {title} button added.",reply_markup=self.welcome_buttons_menu()); return
+        if a=="a_welcome_manual":
+            context.user_data.clear(); context.user_data["wait_welcome_buttons"]=True
+            await q.edit_message_text("✍ Send buttons in this format:\n\nSingle button:\nJoin Channel - https://t.me/example\n\nSame row:\nPlans - feature:plans && Buy - feature:buy\n\nNew line = new row.\nFeatures: plans, buy, profile, renew, referral, support, home",reply_markup=self.back("a_welcome_buttons")); return
+        if a=="a_welcome_see_buttons":
+            s=await get_seller_settings(owner); rows=s.get("welcome_buttons") or []
+            lines=["🔗 Current Buttons\n"]
+            for r,row in enumerate(rows,1): lines.append(f"Row {r}: "+" | ".join(x.get("text","Button") for x in row))
+            await q.edit_message_text("\n".join(lines) if rows else "No buttons set.",reply_markup=self.welcome_buttons_menu()); return
+        if a=="a_welcome_remove_text": await set_seller_setting(owner,"welcome_message",""); await q.edit_message_text("✅ Welcome text removed.",reply_markup=self.welcome_menu()); return
+        if a=="a_welcome_remove_media":
+            await set_seller_setting(owner,"welcome_media_type",""); await set_seller_setting(owner,"welcome_media_file_id","")
+            await q.edit_message_text("✅ Welcome media removed.",reply_markup=self.welcome_menu()); return
+        if a=="a_welcome_remove_buttons": await set_seller_setting(owner,"welcome_buttons",[]); await q.edit_message_text("✅ Welcome buttons removed.",reply_markup=self.welcome_menu()); return
+        if a=="a_welcome_preview":
+            s=await get_seller_settings(owner); await self.send_welcome(q.message,context,s,q.from_user); return
         if a=="a_payment":
             s=await get_seller_settings(owner); await q.edit_message_text(f"💳 Payment Settings\n\nUPI Name: {s.get('upi_name') or 'Not Set'}\nUPI ID: {s.get('upi_id') or 'Not Set'}\nQR: {'Added' if s.get('upi_qr_file_id') else 'Not Added'}",reply_markup=self.payment_menu()); return
-        state={"a_set_upi_id":("wait_upi_id","Send UPI ID","a_payment"),"a_set_upi_name":("wait_upi_name","Send UPI Name","a_payment"),"a_set_bot_name":("wait_bot_name","Send Bot Name","a_settings"),"a_set_welcome":("wait_welcome","Send Welcome Message","a_settings"),"a_set_support":("wait_support","Send Support Username","a_settings"),"a_set_currency":("wait_currency","Send Currency","a_settings"),"a_set_timezone":("wait_timezone","Send Timezone","a_settings"),"a_set_reminder":("wait_reminder","Send Reminder Days","a_settings")}
+        state={"a_set_upi_id":("wait_upi_id","Send UPI ID","a_payment"),"a_set_upi_name":("wait_upi_name","Send UPI Name","a_payment"),"a_set_bot_name":("wait_bot_name","Send Bot Name","a_settings"),"a_set_support":("wait_support","Send Support Username","a_settings"),"a_set_currency":("wait_currency","Send Currency","a_settings"),"a_set_timezone":("wait_timezone","Send Timezone","a_settings"),"a_set_reminder":("wait_reminder","Send Reminder Days","a_settings")}
         if a in state:
             key,msg,back=state[a]; context.user_data.clear(); context.user_data[key]=True; await q.edit_message_text(msg,reply_markup=self.back(back)); return
         if a=="a_set_qr": context.user_data.clear(); context.user_data["wait_qr"]=True; await q.edit_message_text("Send QR image",reply_markup=self.back("a_payment")); return
@@ -208,9 +347,17 @@ class SellerBotManager:
                     context.user_data.clear(); await update.effective_message.reply_text("✅ Channel/group added",reply_markup=self.channels_menu())
                 except Exception: await update.effective_message.reply_text("❌ Use: -1001234567890 | Group Name")
                 return
-            mapping=[("wait_upi_id","upi_id",text,self.payment_menu()),("wait_upi_name","upi_name",text,self.payment_menu()),("wait_bot_name","bot_name",text,self.settings_menu()),("wait_welcome","welcome_message",text,self.settings_menu()),("wait_support","support_username",text if text.startswith("@") else "@"+text,self.settings_menu()),("wait_currency","currency",text.upper(),self.settings_menu())]
+            mapping=[("wait_upi_id","upi_id",text,self.payment_menu()),("wait_upi_name","upi_name",text,self.payment_menu()),("wait_bot_name","bot_name",text,self.settings_menu()),("wait_support","support_username",text if text.startswith("@") else "@"+text,self.settings_menu()),("wait_currency","currency",text.upper(),self.settings_menu())]
             for state,key,val,kb in mapping:
                 if context.user_data.get(state): await set_seller_setting(owner,key,val); context.user_data.clear(); await update.effective_message.reply_text("✅ Updated",reply_markup=kb); return
+            if context.user_data.get("wait_welcome_text"):
+                await set_seller_setting(owner,"welcome_message",text); context.user_data.clear()
+                await update.effective_message.reply_text("✅ Welcome text updated.",reply_markup=self.welcome_menu()); return
+            if context.user_data.get("wait_welcome_buttons"):
+                try: rows=self.parse_welcome_buttons(text)
+                except Exception as exc: await update.effective_message.reply_text(f"❌ {exc}"); return
+                await set_seller_setting(owner,"welcome_buttons",rows); context.user_data.clear()
+                await update.effective_message.reply_text("✅ Welcome buttons saved.",reply_markup=self.welcome_buttons_menu()); return
             if context.user_data.get("wait_timezone"):
                 try: ZoneInfo(text)
                 except ZoneInfoNotFoundError: await update.effective_message.reply_text("❌ Invalid timezone"); return
@@ -267,6 +414,20 @@ class SellerBotManager:
 
         raise ApplicationHandlerStop
 
+    async def welcome_media_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
+        owner=self.owner(context)
+        if update.effective_user.id!=owner or not context.user_data.get("wait_welcome_media"): return
+        msg=update.effective_message; media_type=""; file_id=""
+        if msg.photo: media_type="photo"; file_id=msg.photo[-1].file_id
+        elif msg.video: media_type="video"; file_id=msg.video.file_id
+        elif msg.animation: media_type="animation"; file_id=msg.animation.file_id
+        elif msg.document: media_type="document"; file_id=msg.document.file_id
+        if not file_id: await msg.reply_text("❌ Send photo, video, GIF or document."); return
+        await set_seller_setting(owner,"welcome_media_type",media_type)
+        await set_seller_setting(owner,"welcome_media_file_id",file_id)
+        context.user_data.clear(); await msg.reply_text("✅ Welcome media updated.",reply_markup=self.welcome_menu())
+        raise ApplicationHandlerStop
+
     async def photo_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
         if update.effective_user.id==owner and context.user_data.get("wait_qr"):
@@ -306,7 +467,8 @@ class SellerBotManager:
         app.add_handler(CallbackQueryHandler(self.child_callback,pattern=r"^c_")); app.add_handler(CallbackQueryHandler(self.admin_callback,pattern=r"^a_"))
         app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,self.broadcast_message_handler),group=-3)
         app.add_handler(MessageHandler(filters.FORWARDED,self.forward_handler),group=-2)
-        app.add_handler(MessageHandler(filters.PHOTO,self.photo_handler),group=-1)
+        app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.ALL,self.welcome_media_handler),group=-1)
+        app.add_handler(MessageHandler(filters.PHOTO,self.photo_handler),group=0)
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,self.text_handler))
         if app.job_queue: app.job_queue.run_repeating(self.expiry_job,interval=300,first=60,name=f"seller_expiry_{owner}")
         return app
