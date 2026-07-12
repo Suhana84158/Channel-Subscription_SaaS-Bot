@@ -45,6 +45,9 @@ async def ensure_seller_defaults(owner_id: int, bot_name: str = "Subscription Bo
         "currency": "INR",
         "timezone": "Asia/Kolkata",
         "reminder_days": 1,
+        "upi_id": "",
+        "upi_name": "",
+        "upi_qr_file_id": "",
         "created_at": now,
         "updated_at": now,
     }
@@ -70,10 +73,8 @@ async def set_seller_setting(owner_id: int, key: str, value: Any) -> None:
     now = datetime.now(timezone.utc)
     await _collection(SELLER_SETTINGS).update_one(
         {"owner_id": owner_id},
-        {
-            "$set": {key: value, "updated_at": now},
-            "$setOnInsert": {"owner_id": owner_id, "created_at": now},
-        },
+        {"$set": {key: value, "updated_at": now},
+         "$setOnInsert": {"owner_id": owner_id, "created_at": now}},
         upsert=True,
     )
 
@@ -110,13 +111,9 @@ async def get_active_seller_plans(owner_id: int) -> list[dict]:
 async def update_seller_plan(owner_id: int, plan_id: str, name: str, duration_text: str, duration_minutes: int, price: float) -> bool:
     result = await _collection(SELLER_PLANS).update_one(
         {"owner_id": owner_id, "plan_id": plan_id},
-        {"$set": {
-            "name": name.strip(),
-            "duration_text": duration_text.strip().lower(),
-            "duration_minutes": int(duration_minutes),
-            "price": float(price),
-            "updated_at": datetime.now(timezone.utc),
-        }},
+        {"$set": {"name": name.strip(), "duration_text": duration_text.strip().lower(),
+                  "duration_minutes": int(duration_minutes), "price": float(price),
+                  "updated_at": datetime.now(timezone.utc)}},
     )
     return result.matched_count > 0
 
@@ -132,6 +129,33 @@ async def set_seller_plan_active(owner_id: int, plan_id: str, active: bool) -> b
 async def delete_seller_plan(owner_id: int, plan_id: str) -> bool:
     result = await _collection(SELLER_PLANS).delete_one({"owner_id": owner_id, "plan_id": plan_id})
     return result.deleted_count > 0
+
+
+async def add_seller_channel(owner_id: int, chat_id: int, title: str, chat_type: str) -> dict:
+    now = datetime.now(timezone.utc)
+    await _collection(SELLER_CHANNELS).update_one(
+        {"owner_id": owner_id, "chat_id": int(chat_id)},
+        {"$set": {"title": title, "chat_type": chat_type, "active": True, "updated_at": now},
+         "$setOnInsert": {"owner_id": owner_id, "chat_id": int(chat_id), "created_at": now}},
+        upsert=True,
+    )
+    return await _collection(SELLER_CHANNELS).find_one(
+        {"owner_id": owner_id, "chat_id": int(chat_id)}
+    ) or {}
+
+
+async def get_seller_channels(owner_id: int) -> list[dict]:
+    return await _collection(SELLER_CHANNELS).find(
+        {"owner_id": owner_id, "active": True}
+    ).sort("created_at", -1).to_list(length=100)
+
+
+async def remove_seller_channel(owner_id: int, chat_id: int) -> bool:
+    result = await _collection(SELLER_CHANNELS).update_one(
+        {"owner_id": owner_id, "chat_id": int(chat_id)},
+        {"$set": {"active": False, "updated_at": datetime.now(timezone.utc)}},
+    )
+    return result.matched_count > 0
 
 
 async def count_seller_channels(owner_id: int) -> int:
