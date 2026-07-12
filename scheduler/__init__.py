@@ -1,15 +1,22 @@
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from config import TIMEZONE
+import asyncio
 
-scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+from scheduler.expiry_worker import check_expired_users
+from logging_config import get_logger
+
+logger = get_logger(__name__)
+
+
+async def expiry_job():
+    while True:
+        try:
+            await check_expired_users()
+        except Exception as e:
+            logger.exception(e)
+
+        await asyncio.sleep(300)
 
 
 def start_scheduler():
-    if not scheduler.running:
-        scheduler.start()
-
-
-def shutdown_scheduler():
-    if scheduler.running:
-        scheduler.shutdown(wait=False)
+    asyncio.create_task(expiry_job())
+    logger.info("Scheduler started")
