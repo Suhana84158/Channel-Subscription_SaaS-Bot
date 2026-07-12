@@ -5,19 +5,20 @@ from typing import Dict, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import Conflict, InvalidToken, TelegramError
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler,
+    ContextTypes, MessageHandler, filters,
+)
 
-from database.seller_bots import get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status
+from database.seller_bots import (
+    get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status,
+)
 from database.seller_data import (
-    create_seller_plan,
-    delete_seller_plan,
-    ensure_seller_defaults,
-    get_active_seller_plans,
-    get_all_seller_plans,
-    get_seller_plan,
-    get_seller_settings,
-    set_seller_plan_active,
-    update_seller_plan,
+    add_seller_channel, count_seller_channels, count_seller_users,
+    create_seller_plan, delete_seller_plan, ensure_seller_defaults,
+    get_active_seller_plans, get_all_seller_plans, get_seller_channels,
+    get_seller_plan, get_seller_settings, remove_seller_channel,
+    set_seller_plan_active, update_seller_plan,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,9 +42,12 @@ class SellerBotManager:
     @staticmethod
     def _main_menu() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 Plans", callback_data="child_plans"), InlineKeyboardButton("💳 Buy", callback_data="child_buy")],
-            [InlineKeyboardButton("👤 My Profile", callback_data="child_profile"), InlineKeyboardButton("🔄 Renew", callback_data="child_renew")],
-            [InlineKeyboardButton("🎁 Referral", callback_data="child_referral"), InlineKeyboardButton("📞 Support", callback_data="child_support")],
+            [InlineKeyboardButton("📋 Plans", callback_data="child_plans"),
+             InlineKeyboardButton("💳 Buy", callback_data="child_buy")],
+            [InlineKeyboardButton("👤 My Profile", callback_data="child_profile"),
+             InlineKeyboardButton("🔄 Renew", callback_data="child_renew")],
+            [InlineKeyboardButton("🎁 Referral", callback_data="child_referral"),
+             InlineKeyboardButton("📞 Support", callback_data="child_support")],
         ])
 
     @staticmethod
@@ -65,8 +69,16 @@ class SellerBotManager:
         ])
 
     @staticmethod
-    def _parse_duration(duration_text: str) -> int:
-        value = duration_text.strip().lower()
+    def _channels_admin_menu() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add Channel/Group", callback_data="seller_channel_add")],
+            [InlineKeyboardButton("📋 Channel List", callback_data="seller_channel_list")],
+            [InlineKeyboardButton("⬅ Back", callback_data="seller_admin_home")],
+        ])
+
+    @staticmethod
+    def _parse_duration(value: str) -> int:
+        value = value.strip().lower()
         if len(value) < 2:
             raise ValueError("Invalid duration")
         number = int(value[:-1])
@@ -101,7 +113,10 @@ class SellerBotManager:
         fallback_name = record.get("bot_name", "Subscription Bot") if record else "Subscription Bot"
         settings = await ensure_seller_defaults(owner_id, fallback_name)
         welcome = settings.get("welcome_message") or f"👋 Welcome to {fallback_name}!"
-        await update.effective_message.reply_text(f"{welcome}\n\nChoose an option below.", reply_markup=self._main_menu())
+        await update.effective_message.reply_text(
+            f"{welcome}\n\nChoose an option below.",
+            reply_markup=self._main_menu(),
+        )
 
     async def _child_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         owner_id = int(context.application.bot_data["seller_owner_id"])
@@ -109,13 +124,17 @@ class SellerBotManager:
             await update.effective_message.reply_text("❌ You are not authorized.")
             return
         context.user_data.clear()
-        await update.effective_message.reply_text("🛠 Seller Admin Panel\n\nChoose an option:", reply_markup=self._admin_menu())
+        await update.effective_message.reply_text(
+            "🛠 Seller Admin Panel\n\nChoose an option:",
+            reply_markup=self._admin_menu(),
+        )
 
     async def _child_menu_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         await query.answer()
         owner_id = int(context.application.bot_data["seller_owner_id"])
         action = query.data
+
         if action in {"child_plans", "child_buy", "child_renew"}:
             plans = await get_active_seller_plans(owner_id)
             if not plans:
@@ -125,44 +144,58 @@ class SellerBotManager:
                 currency = settings.get("currency", "INR")
                 lines = ["📋 Available Plans\n"]
                 for plan in plans:
-                    lines.append(f"• {plan.get('name', 'Plan')} — {plan.get('duration_text', '-')} — {currency} {plan.get('price', 0):g}")
+                    lines.append(
+                        f"• {plan.get('name', 'Plan')} — {plan.get('duration_text', '-')} — "
+                        f"{currency} {plan.get('price', 0):g}"
+                    )
                 text = "\n".join(lines)
         elif action == "child_profile":
-            text = "👤 Your seller-specific profile will appear here after subscriptions are connected."
+            text = "👤 Your profile will be connected after subscriptions."
         elif action == "child_referral":
-            text = "🎁 Seller-specific referral rewards will be connected after subscriptions."
+            text = "🎁 Referral will be connected after subscriptions."
         elif action == "child_support":
             settings = await get_seller_settings(owner_id)
             text = f"📞 Support: {settings.get('support_username') or 'Not set by seller'}"
         else:
             text = "This option is being connected."
+
         await query.edit_message_text(text, reply_markup=self._main_menu())
 
     async def _seller_admin_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         await query.answer()
         owner_id = int(context.application.bot_data["seller_owner_id"])
+
         if query.from_user.id != owner_id:
             await query.edit_message_text("❌ You are not authorized.")
             return
+
         action = query.data
 
         if action == "seller_admin_home":
             context.user_data.clear()
-            await query.edit_message_text("🛠 Seller Admin Panel\n\nChoose an option:", reply_markup=self._admin_menu())
+            await query.edit_message_text(
+                "🛠 Seller Admin Panel\n\nChoose an option:",
+                reply_markup=self._admin_menu(),
+            )
             return
+
         if action == "seller_admin_plans":
             context.user_data.clear()
             await query.edit_message_text("📦 Plan Management", reply_markup=self._plans_admin_menu())
             return
+
         if action == "seller_plan_add":
             context.user_data.clear()
             context.user_data["seller_waiting_plan_add"] = True
             await query.edit_message_text(
-                "➕ Add Plan\n\nSend in this format:\nPlan Name | Duration | Price\n\nExample:\nPremium | 30d | 199\n\nDuration units:\nm = minutes, h = hours, d = days",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="seller_admin_plans")]]),
+                "➕ Add Plan\n\nSend:\nPlan Name | Duration | Price\n\nExample:\nPremium | 30d | 199",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅ Back", callback_data="seller_admin_plans")
+                ]]),
             )
             return
+
         if action == "seller_plan_list":
             plans = await get_all_seller_plans(owner_id)
             if not plans:
@@ -179,10 +212,14 @@ class SellerBotManager:
                     InlineKeyboardButton(f"✏️ Edit {name[:18]}", callback_data=f"seller_plan_edit_{plan_id}"),
                     InlineKeyboardButton("🗑 Delete", callback_data=f"seller_plan_delete_{plan_id}"),
                 ])
-                keyboard.append([InlineKeyboardButton("⏸ Disable" if plan.get("active") else "▶️ Enable", callback_data=f"seller_plan_toggle_{plan_id}")])
+                keyboard.append([InlineKeyboardButton(
+                    "⏸ Disable" if plan.get("active") else "▶️ Enable",
+                    callback_data=f"seller_plan_toggle_{plan_id}",
+                )])
             keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="seller_admin_plans")])
             await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
             return
+
         if action.startswith("seller_plan_edit_"):
             plan_id = action.replace("seller_plan_edit_", "")
             plan = await get_seller_plan(owner_id, plan_id)
@@ -192,16 +229,21 @@ class SellerBotManager:
             context.user_data.clear()
             context.user_data["seller_waiting_plan_edit"] = plan_id
             await query.edit_message_text(
-                "✏️ Edit Plan\n\nSend new values in this format:\nPlan Name | Duration | Price\n\n"
-                f"Current:\n{plan.get('name')} | {plan.get('duration_text')} | {plan.get('price'):g}",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="seller_plan_list")]]),
+                "✏️ Send new values:\nPlan Name | Duration | Price",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅ Back", callback_data="seller_plan_list")
+                ]]),
             )
             return
+
         if action.startswith("seller_plan_delete_"):
-            plan_id = action.replace("seller_plan_delete_", "")
-            deleted = await delete_seller_plan(owner_id, plan_id)
-            await query.edit_message_text("✅ Plan deleted." if deleted else "❌ Plan not found.", reply_markup=self._plans_admin_menu())
+            deleted = await delete_seller_plan(owner_id, action.replace("seller_plan_delete_", ""))
+            await query.edit_message_text(
+                "✅ Plan deleted." if deleted else "❌ Plan not found.",
+                reply_markup=self._plans_admin_menu(),
+            )
             return
+
         if action.startswith("seller_plan_toggle_"):
             plan_id = action.replace("seller_plan_toggle_", "")
             plan = await get_seller_plan(owner_id, plan_id)
@@ -213,50 +255,152 @@ class SellerBotManager:
             return
 
         if action == "seller_admin_channels":
-            text = "📢 Channel/Group management will be connected next."
-        elif action == "seller_admin_payment":
-            text = "💳 Seller payment settings will be connected next."
-        elif action == "seller_admin_settings":
-            text = "⚙️ Seller bot settings will be connected next."
-        elif action == "seller_admin_stats":
+            context.user_data.clear()
+            await query.edit_message_text(
+                "📢 Channels / Groups",
+                reply_markup=self._channels_admin_menu(),
+            )
+            return
+
+        if action == "seller_channel_add":
+            context.user_data.clear()
+            context.user_data["seller_waiting_channel"] = True
+            await query.edit_message_text(
+                "📢 Forward any message from your channel/group.\n\n"
+                "⚠ Child bot must be admin there.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅ Back", callback_data="seller_admin_channels")
+                ]]),
+            )
+            return
+
+        if action == "seller_channel_list":
+            channels = await get_seller_channels(owner_id)
+            if not channels:
+                await query.edit_message_text(
+                    "📋 No channel/group added yet.",
+                    reply_markup=self._channels_admin_menu(),
+                )
+                return
+
+            lines = ["📋 Added Channels / Groups"]
+            keyboard = []
+            for channel in channels:
+                title = channel.get("title", "Unknown")
+                chat_id = int(channel["chat_id"])
+                chat_type = channel.get("chat_type", "unknown")
+                lines.append(f"• {title}\n  Type: {chat_type}\n  ID: {chat_id}")
+                keyboard.append([InlineKeyboardButton(
+                    f"❌ Remove {title[:18]}",
+                    callback_data=f"seller_channel_remove_{chat_id}",
+                )])
+            keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="seller_admin_channels")])
+            await query.edit_message_text(
+                "\n\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
+
+        if action.startswith("seller_channel_remove_"):
+            chat_id = int(action.replace("seller_channel_remove_", ""))
+            removed = await remove_seller_channel(owner_id, chat_id)
+            await query.edit_message_text(
+                "✅ Channel/group removed." if removed else "❌ Channel/group not found.",
+                reply_markup=self._channels_admin_menu(),
+            )
+            return
+
+        if action == "seller_admin_stats":
             plans = await get_all_seller_plans(owner_id)
-            text = f"📊 Seller Statistics\n\n📦 Total Plans: {len(plans)}\n✅ Active Plans: {sum(1 for p in plans if p.get('active'))}"
+            active_plans = sum(1 for plan in plans if plan.get("active"))
+            await query.edit_message_text(
+                "📊 Seller Statistics\n\n"
+                f"📦 Total Plans: {len(plans)}\n"
+                f"✅ Active Plans: {active_plans}\n"
+                f"📢 Channels/Groups: {await count_seller_channels(owner_id)}\n"
+                f"👥 Users: {await count_seller_users(owner_id)}",
+                reply_markup=self._admin_menu(),
+            )
+            return
+
+        if action == "seller_admin_payment":
+            text = "💳 Payment Settings will be connected in the next phase."
+        elif action == "seller_admin_settings":
+            text = "⚙️ Bot Settings will be connected in the next phase."
         else:
             text = "This seller admin option is being connected."
+
         await query.edit_message_text(text, reply_markup=self._admin_menu())
 
     async def _seller_admin_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         owner_id = int(context.application.bot_data["seller_owner_id"])
         if update.effective_user.id != owner_id:
             return
+
         if context.user_data.get("seller_waiting_plan_add"):
             try:
                 name, duration_text, duration_minutes, price = self._parse_plan_input(update.effective_message.text)
-                plan = await create_seller_plan(owner_id, name, duration_text, duration_minutes, price)
+                await create_seller_plan(owner_id, name, duration_text, duration_minutes, price)
                 context.user_data.clear()
                 await update.effective_message.reply_text(
-                    f"✅ Plan added successfully!\n\nName: {plan['name']}\nDuration: {plan['duration_text']}\nPrice: ₹{plan['price']:g}",
+                    "✅ Plan added successfully!",
                     reply_markup=self._plans_admin_menu(),
                 )
             except Exception as exc:
                 await update.effective_message.reply_text(
-                    "❌ Invalid format.\n\nUse:\nPlan Name | Duration | Price\n\nExample:\nPremium | 30d | 199\n\n"
+                    "❌ Invalid format.\n\nUse:\nPlan Name | Duration | Price\n\n"
                     f"Error: {exc}"
                 )
             return
+
         plan_id = context.user_data.get("seller_waiting_plan_edit")
         if plan_id:
             try:
                 name, duration_text, duration_minutes, price = self._parse_plan_input(update.effective_message.text)
-                updated = await update_seller_plan(owner_id, plan_id, name, duration_text, duration_minutes, price)
+                await update_seller_plan(owner_id, plan_id, name, duration_text, duration_minutes, price)
                 context.user_data.clear()
-                await update.effective_message.reply_text("✅ Plan updated successfully!" if updated else "❌ Plan not found.", reply_markup=self._plans_admin_menu())
-            except Exception as exc:
                 await update.effective_message.reply_text(
-                    "❌ Invalid format.\n\nUse:\nPlan Name | Duration | Price\n\nExample:\nPremium | 30d | 199\n\n"
-                    f"Error: {exc}"
+                    "✅ Plan updated successfully!",
+                    reply_markup=self._plans_admin_menu(),
                 )
+            except Exception as exc:
+                await update.effective_message.reply_text(f"❌ Invalid format.\n\nError: {exc}")
             return
+
+    async def _seller_channel_forward(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        owner_id = int(context.application.bot_data["seller_owner_id"])
+        if update.effective_user.id != owner_id:
+            return
+        if not context.user_data.get("seller_waiting_channel"):
+            return
+
+        message = update.effective_message
+        chat = getattr(message, "forward_from_chat", None)
+        if chat is None:
+            origin = getattr(message, "forward_origin", None)
+            chat = getattr(origin, "chat", None)
+
+        if chat is None:
+            await message.reply_text(
+                "❌ Channel/group detect nahi hua.\n\n"
+                "Channel/group se forwarded message bhejo."
+            )
+            return
+
+        record = await add_seller_channel(
+            owner_id=owner_id,
+            chat_id=chat.id,
+            title=chat.title or "Unknown",
+            chat_type=getattr(chat, "type", "unknown"),
+        )
+        context.user_data.clear()
+        await message.reply_text(
+            "✅ Channel/group added successfully!\n\n"
+            f"Title: {record.get('title', 'Unknown')}\n"
+            f"Type: {record.get('chat_type', 'unknown')}\n"
+            f"ID: {record.get('chat_id')}",
+            reply_markup=self._channels_admin_menu(),
+        )
 
     def _build_child_application(self, token: str, owner_id: int) -> Application:
         app = Application.builder().token(token).build()
@@ -265,6 +409,7 @@ class SellerBotManager:
         app.add_handler(CommandHandler("admin", self._child_admin))
         app.add_handler(CallbackQueryHandler(self._child_menu_callback, pattern=r"^child_"))
         app.add_handler(CallbackQueryHandler(self._seller_admin_callback, pattern=r"^seller_"))
+        app.add_handler(MessageHandler(filters.FORWARDED, self._seller_channel_forward), group=-1)
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._seller_admin_text))
         return app
 
@@ -288,7 +433,11 @@ class SellerBotManager:
                 if app.updater is None:
                     raise RuntimeError("Updater is unavailable for seller bot")
                 await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-                self._running[owner_id] = RunningSellerBot(owner_id, int(record["bot_id"]), app)
+                self._running[owner_id] = RunningSellerBot(
+                    owner_id=owner_id,
+                    bot_id=int(record["bot_id"]),
+                    application=app,
+                )
                 await set_runtime_status(owner_id, "running", None)
                 logger.info("Seller bot started: owner=%s bot=%s", owner_id, record.get("bot_id"))
                 return True
