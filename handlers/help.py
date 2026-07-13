@@ -1,108 +1,85 @@
-from telegram import Update
-from telegram.ext import CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
 from database.admins import is_admin
 from database.seller_bots import get_bot
 
 
-USER_HELP = """🆘 Main Bot Help
+async def build_help(user_id: int):
+    if await is_admin(user_id):
+        return (
+            "🆘 Owner Help & Commands\n\n"
+            "/start - Open owner welcome menu\n"
+            "/dashboard - Open owner dashboard\n"
+            "/owner - Open owner dashboard\n"
+            "/admin - Open full admin panel\n"
+            "/help - Show this guide\n"
+            "/stats - Main bot statistics\n"
+            "/broadcast - Broadcast from main bot\n"
+            "/addadmin USER_ID - Add main admin\n"
+            "/removeadmin USER_ID - Remove main admin\n"
+            "/addchannel - Add main channel/group\n"
+            "/removechannel CHAT_ID - Remove main channel/group\n\n"
+            "Owner controls:\n"
+            "• Main users and subscriptions\n"
+            "• Sellers and their child bots\n"
+            "• Payments, broadcasts and statistics\n"
+            "• Suspend sellers and stop their child bots",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("👑 Owner Dashboard", callback_data="main_owner_dashboard")],
+                [InlineKeyboardButton("🛡 Full Admin Panel", callback_data="admin_home")],
+                [InlineKeyboardButton("⬅ Main Menu", callback_data="main_home")],
+            ]),
+        )
 
-👤 User Commands
-/start - Open the main menu
-/help - Show this help guide
-/seller - Open your seller dashboard
-
-🤖 Connect a Child Bot
-1. Open /seller
-2. Tap Connect Bot
-3. Send your BotFather token
-4. The system verifies and starts the child bot
-
-🏪 Seller Dashboard
-• My Bot - Check bot username, status and runtime
-• Pause Bot - Temporarily stop the child bot
-• Resume Bot - Start it again
-• Replace Token - Connect a different token
-• Remove Bot - Remove the connected child bot
-
-🔐 Safety
-Only send a token created by you. Never share another person's token.
-"""
-
-
-SELLER_HELP = """🏪 Connected Seller Help
-
-/seller - Open Seller Dashboard
-/help - Show this help guide
-
-After connecting your child bot:
-• Open the child bot
-• Send /admin to manage it
-• Send /help in the child bot for complete seller-admin instructions
-
-Main bot controls:
-• My Bot
-• Pause / Resume
-• Replace Token
-• Remove Bot
-"""
-
-
-ADMIN_HELP = """🛠 Main Bot Admin Help
-
-/admin - Open the main admin panel
-/help - Show this help guide
-/seller - Open seller dashboard
-
-Admin Panel Features
-👥 User Management
-Search by User ID or @username. Give, extend or remove subscriptions and ban/unban users.
-
-➕ Add Channel/Group
-Add a destination channel or group. The bot must be an administrator.
-
-📋 Channel List
-View and remove connected channels/groups.
-
-💳 Payment Settings
-Configure UPI information and payment QR.
-
-📨 Pending Payments
-Review screenshots and approve or reject payments.
-
-📜 Payment History
-See processed payments.
-
-📢 Broadcast
-Send announcements to users.
-
-📊 Statistics
-Check users, payments and revenue.
-
-⚙️ Bot Settings
-Manage available configuration.
-
-👮 Admin Commands
-Manage admin-only controls.
-"""
+    record = await get_bot(user_id)
+    return (
+        "🆘 Seller Help & Commands\n\n"
+        "/start - Open seller welcome menu\n"
+        "/dashboard - Open seller dashboard\n"
+        "/seller - Open seller bot controls\n"
+        "/mybots - View and manage your child bot\n"
+        "/help - Show this guide\n\n"
+        "Create a child bot:\n"
+        "1. Create a bot in @BotFather\n"
+        "2. Tap Create / Connect Child Bot\n"
+        "3. Send your own BotFather token\n"
+        "4. Open the child bot and send /admin\n\n"
+        "Inside the child bot:\n"
+        "/start - User welcome page\n"
+        "/admin - Seller admin panel\n"
+        "/help - Child bot user/admin guide\n"
+        "/version - Deployed child-bot version\n\n"
+        "Child admin features include plans, channels/groups, payments, "
+        "welcome editor, broadcast, referrals, user management and statistics.",
+        InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🤖 Manage Child Bot" if record else "➕ Create Child Bot",
+                    callback_data="seller_my_bot" if record else "seller_connect",
+                )
+            ],
+            [InlineKeyboardButton("🏪 Seller Dashboard", callback_data="main_seller_dashboard")],
+            [InlineKeyboardButton("⬅ Main Menu", callback_data="main_home")],
+        ]),
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    text, keyboard = await build_help(update.effective_user.id)
+    await update.effective_message.reply_text(text, reply_markup=keyboard)
 
-    if await is_admin(user_id):
-        text = USER_HELP + "\n━━━━━━━━━━━━━━━━━━━━\n" + ADMIN_HELP
-        await update.effective_message.reply_text(text)
-        return
 
-    seller_bot = await get_bot(user_id)
-    if seller_bot:
-        text = USER_HELP + "\n━━━━━━━━━━━━━━━━━━━━\n" + SELLER_HELP
-    else:
-        text = USER_HELP
-
-    await update.effective_message.reply_text(text)
+async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    text, keyboard = await build_help(query.from_user.id)
+    await query.edit_message_text(text, reply_markup=keyboard)
 
 
 def help_handler():
     return CommandHandler("help", help_command)
+
+
+def help_callback_handler():
+    return CallbackQueryHandler(help_callback, pattern=r"^main_help$")

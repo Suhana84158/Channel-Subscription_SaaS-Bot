@@ -9,13 +9,19 @@ from services.bot_manager import bot_manager
 
 def seller_keyboard(record=None):
     if not record:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("➕ Connect Bot", callback_data="seller_connect")]])
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Create / Connect Child Bot", callback_data="seller_connect")],
+            [InlineKeyboardButton("📖 Setup Guide", callback_data="main_child_setup")],
+            [InlineKeyboardButton("⬅ Main Menu", callback_data="main_home")],
+        ])
     active = bool(record.get("active"))
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🤖 My Bot", callback_data="seller_my_bot")],
         [InlineKeyboardButton("⏸ Pause Bot" if active else "▶️ Resume Bot", callback_data="seller_pause" if active else "seller_resume")],
         [InlineKeyboardButton("🔄 Replace Token", callback_data="seller_replace")],
         [InlineKeyboardButton("🗑 Remove Bot", callback_data="seller_remove")],
+        [InlineKeyboardButton("🏪 Seller Dashboard", callback_data="main_seller_dashboard")],
+        [InlineKeyboardButton("⬅ Main Menu", callback_data="main_home")],
     ])
 
 
