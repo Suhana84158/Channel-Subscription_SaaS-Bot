@@ -12,7 +12,7 @@ from telegram.ext import Application, ApplicationHandlerStop, CallbackQueryHandl
 
 from database.seller_bots import get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status
 from database.seller_data import (
-    activate_subscription, add_channel, create_payment, create_plan, delete_plan,
+    activate_subscription, active_subscriptions, add_channel, create_payment, create_plan, delete_plan,
     ensure_seller_defaults, expired_subscriptions, get_channels, get_payment,
     get_plan, get_plans, get_seller_settings, get_subscription, get_user, mark_expired,
     payment_history, pending_payments, remove_channel, set_payment_status,
@@ -62,7 +62,15 @@ class SellerBotManager:
         return InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add Plan",callback_data="a_plan_add")],[InlineKeyboardButton("📋 View Plans",callback_data="a_plan_list")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
     @staticmethod
     def channels_menu():
-        return InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add Channel/Group",callback_data="a_channel_add")],[InlineKeyboardButton("📋 Channel List",callback_data="a_channel_list")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add Channel/Group",callback_data="a_channel_add")],
+            [InlineKeyboardButton("📋 Channel List",callback_data="a_channel_list")],
+            [InlineKeyboardButton(
+                "🔗 Resend Invite Links to Active Subscribers",
+                callback_data="a_channel_resend",
+            )],
+            [InlineKeyboardButton("⬅ Back",callback_data="a_home")],
+        ])
     @staticmethod
     def payment_menu():
         return InlineKeyboardMarkup([[InlineKeyboardButton("🏦 Set UPI ID",callback_data="a_set_upi_id")],[InlineKeyboardButton("👤 Set UPI Name",callback_data="a_set_upi_name")],[InlineKeyboardButton("🖼 Upload QR",callback_data="a_set_qr")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
@@ -840,6 +848,97 @@ class SellerBotManager:
                 lines.append(f"• {ch.get('title')}\n  {ch.get('chat_id')}")
                 kb.append([InlineKeyboardButton(f"❌ {ch.get('title','Chat')[:18]}",callback_data=f"a_channel_del_{ch['chat_id']}")])
             kb.append([InlineKeyboardButton("⬅ Back",callback_data="a_channels")]); await q.edit_message_text("\n\n".join(lines),reply_markup=InlineKeyboardMarkup(kb)); return
+        if a=="a_channel_resend":
+            channels=await get_channels(owner)
+            if not channels:
+                await q.edit_message_text(
+                    "❌ Pehle kam se kam ek channel/group add karo.",
+                    reply_markup=self.channels_menu(),
+                )
+                return
+            active_count=len(await active_subscriptions(owner))
+            await q.edit_message_text(
+                "🔗 Group/Channel Invite Link Resend\n\n"
+                f"Active subscribers found: {active_count}\n"
+                f"Channels/Groups: {len(channels)}\n\n"
+                "Fresh invite links sabhi active subscribers ko bheje jayenge. "
+                "Expired users ko message nahi jayega.\n\nContinue?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Yes, Resend",callback_data="a_channel_resend_yes")],
+                    [InlineKeyboardButton("❌ No",callback_data="a_channels")],
+                ]),
+            )
+            return
+        if a=="a_channel_resend_yes":
+            await q.edit_message_text("⏳ Invite links resend ho rahe hain...")
+            channels=await get_channels(owner)
+            subscriptions=await active_subscriptions(owner)
+            sent=failed=invite_failed=0
+            now=datetime.now(timezone.utc)
+
+            for sub in subscriptions:
+                user_id=int(sub["user_id"])
+                expiry=sub.get("expiry_date")
+                if expiry and expiry.tzinfo is None:
+                    expiry=expiry.replace(tzinfo=timezone.utc)
+                remaining=expiry-now if expiry else None
+                if not remaining or remaining.total_seconds()<=0:
+                    continue
+                days=remaining.days
+                hours=remaining.seconds//3600
+                minutes=(remaining.seconds%3600)//60
+                link_lines=[]
+                for ch in channels:
+                    try:
+                        invite=await context.bot.create_chat_invite_link(
+                            chat_id=ch["chat_id"],
+                            member_limit=1,
+                        )
+                        link_lines.append(
+                            f"📢 {ch.get('title','Premium Channel')}\n{invite.invite_link}"
+                        )
+                    except Exception as exc:
+                        invite_failed+=1
+                        logger.warning(
+                            "Invite create failed owner=%s chat=%s user=%s: %s",
+                            owner,ch.get("chat_id"),user_id,exc,
+                        )
+
+                if not link_lines:
+                    failed+=1
+                    continue
+
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=(
+                            "📢 Channel/Group Invite Links Updated\n\n"
+                            "Your subscription is still active.\n\n"
+                            f"⏱ Remaining: {days}d {hours}h {minutes}m\n\n"
+                            "Join using the fresh invite link(s):\n\n"
+                            + "\n\n".join(link_lines)
+                        ),
+                        disable_web_page_preview=True,
+                    )
+                    sent+=1
+                except Exception as exc:
+                    failed+=1
+                    logger.warning(
+                        "Invite resend failed owner=%s user=%s: %s",
+                        owner,user_id,exc,
+                    )
+                await asyncio.sleep(0.05)
+
+            await q.edit_message_text(
+                "✅ Invite Link Resend Completed\n\n"
+                f"Active subscribers: {len(subscriptions)}\n"
+                f"Successfully sent: {sent}\n"
+                f"Failed/blocked users: {failed}\n"
+                f"Invite creation failures: {invite_failed}\n\n"
+                "Expired users ko message nahi bheja gaya.",
+                reply_markup=self.channels_menu(),
+            )
+            return
         if a.startswith("a_channel_del_"): await remove_channel(owner,int(a.replace("a_channel_del_",""))); await q.edit_message_text("✅ Removed",reply_markup=self.channels_menu()); return
         if a=="a_welcome":
             s=await ensure_seller_defaults(owner,(await get_bot(owner) or {}).get("bot_name","Subscription Bot"))
