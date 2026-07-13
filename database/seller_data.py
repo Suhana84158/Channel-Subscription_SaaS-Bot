@@ -310,6 +310,15 @@ async def activate_subscription(
     )
     return expiry
 
+async def active_subscriptions(owner_id, limit=5000):
+    now=datetime.now(timezone.utc)
+    return await c(SUBS).find({
+        "owner_id":owner_id,
+        "active":True,
+        "expiry_date":{"$gt":now},
+    }).to_list(length=limit)
+
+
 async def expired_subscriptions(owner_id):
     now=datetime.now(timezone.utc); return await c(SUBS).find({"owner_id":owner_id,"active":True,"expiry_date":{"$lte":now}}).to_list(length=500)
 async def mark_expired(owner_id,user_id): await c(SUBS).update_one({"owner_id":owner_id,"user_id":user_id},{"$set":{"active":False,"updated_at":datetime.now(timezone.utc)}})
