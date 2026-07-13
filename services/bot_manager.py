@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Optional
@@ -13,7 +14,7 @@ from database.seller_bots import get_all_active_bots, get_bot, get_decrypted_bot
 from database.seller_data import (
     activate_subscription, add_channel, create_payment, create_plan, delete_plan,
     ensure_seller_defaults, expired_subscriptions, get_channels, get_payment,
-    get_plan, get_plans, get_seller_settings, get_subscription, mark_expired,
+    get_plan, get_plans, get_seller_settings, get_subscription, get_user, mark_expired,
     payment_history, pending_payments, remove_channel, set_payment_status,
     set_seller_setting, stats, update_plan, upsert_user,
     register_referral, count_all_referrals, count_successful_referrals,
@@ -21,7 +22,8 @@ from database.seller_data import (
 )
 
 logger=logging.getLogger(__name__)
-WELCOME_RUNTIME_VERSION="2026-07-13-hotfix-3"
+WELCOME_RUNTIME_VERSION="2026-07-13-complete-4"
+MAIN_BOT_USERNAME=os.getenv("MAIN_BOT_USERNAME","Local_supplier3_bot").lstrip("@")
 
 @dataclass
 class RunningSellerBot:
@@ -160,6 +162,13 @@ class SellerBotManager:
             user,
             settings.get("bot_name","Subscription Bot"),
         )
+
+        creator_line=(
+            "\n\n🤖 Bot was created by "
+            f'<a href="https://t.me/{MAIN_BOT_USERNAME}">'
+            f"@{MAIN_BOT_USERNAME}</a>"
+        )
+        text=f"{text}{creator_line}"
         keyboard=self.build_welcome_keyboard(settings.get("welcome_buttons") or []) or self.main_menu()
         media_type=settings.get("welcome_media_type")
         file_id=settings.get("welcome_media_file_id")
@@ -346,7 +355,7 @@ class SellerBotManager:
             return
 
         if action=="c_plans":
-            await self.show_plans(q,owner,False)
+            await self.show_plans(q,owner,True)
             return
 
         if action in {"c_buy","c_renew"}:
@@ -406,22 +415,94 @@ class SellerBotManager:
             return
 
         if action=="c_profile":
+            user_record=await get_user(owner,q.from_user.id) or {}
             sub=await get_subscription(owner,q.from_user.id)
+            me=await context.bot.get_me()
 
-            if not sub:
-                text="👤 No active subscription."
-            else:
-                exp=sub.get("expiry_date")
-                text=(
-                    "👤 Profile\n\n"
-                    f"Plan: {sub.get('plan')}\n"
-                    f"Status: {'Active' if sub.get('active') else 'Expired'}\n"
-                    f"Expiry: {exp}"
+            joined=user_record.get("joined_at")
+            joined_text=(
+                joined.strftime("%d %b %Y, %I:%M %p")
+                if joined else "Unknown"
+            )
+
+            referral_link=(
+                f"https://t.me/{me.username}"
+                f"?start=ref_{q.from_user.id}"
+            )
+            total_referrals=await count_all_referrals(
+                owner,
+                q.from_user.id,
+            )
+            successful_referrals=await count_successful_referrals(
+                owner,
+                q.from_user.id,
+            )
+
+            username=(
+                f"@{q.from_user.username}"
+                if q.from_user.username else "Not set"
+            )
+            full_name=" ".join(
+                value for value in [
+                    q.from_user.first_name,
+                    q.from_user.last_name,
+                ] if value
+            ) or "Unknown"
+
+            lines=[
+                "👤 My Profile",
+                "",
+                f"🆔 User ID: {q.from_user.id}",
+                f"👤 Name: {full_name}",
+                f"📝 Username: {username}",
+                f"🌐 Language: {q.from_user.language_code or 'Unknown'}",
+                f"📅 Joined: {joined_text}",
+                f"👥 Total Referrals: {total_referrals}",
+                f"✅ Successful Referrals: {successful_referrals}",
+                "🔗 Referral Link:",
+                referral_link,
+                "",
+                "━━━━━━━━━━━━━━━━━━━━",
+                "📋 Subscription Status",
+            ]
+
+            now=datetime.now(timezone.utc)
+
+            if sub and sub.get("active") and sub.get("expiry_date") and sub["expiry_date"]>now:
+                expiry=sub["expiry_date"]
+                remaining=expiry-now
+                days=remaining.days
+                hours=remaining.seconds//3600
+                minutes=(remaining.seconds%3600)//60
+                start=sub.get("start_date") or sub.get("created_at")
+                start_text=(
+                    start.strftime("%d %b %Y, %I:%M %p")
+                    if start else "Unknown"
                 )
+                expiry_text=expiry.strftime("%d %b %Y, %I:%M %p")
+                lines.extend([
+                    "Status: ✅ Active",
+                    f"Plan: {sub.get('plan') or 'Unknown'}",
+                    f"Amount: {sub.get('amount','—')}",
+                    f"Duration: {sub.get('duration_text') or '—'}",
+                    f"Start Date: {start_text}",
+                    f"Expiry: {expiry_text}",
+                    f"Time Left: {days}d {hours}h {minutes}m",
+                ])
+            else:
+                lines.extend([
+                    "Status: ❌ No Active Subscription",
+                    "Plan: —",
+                    "Amount: —",
+                    "Duration: —",
+                    "Start Date: —",
+                    "Expiry: —",
+                    "Time Left: —",
+                ])
 
             await self.safe_query_message(
                 q,
-                text,
+                "\n".join(lines),
                 back_keyboard,
             )
             return
@@ -698,7 +779,7 @@ class SellerBotManager:
             approve=a.startswith("a_pay_ok_"); pid=a.replace("a_pay_ok_" if approve else "a_pay_no_",""); p=await get_payment(owner,pid)
             if not p or not await set_payment_status(owner,pid,"approved" if approve else "rejected",owner): await q.edit_message_text("Already processed or missing"); return
             if approve:
-                expiry=await activate_subscription(owner,p["user_id"],p["plan"],p["duration_minutes"])
+                expiry=await activate_subscription(owner,p["user_id"],p["plan"],p["duration_minutes"],amount=p.get("amount"),duration_text=p.get("duration_text"))
 
                 referral=await mark_referral_rewarded(owner,p["user_id"])
                 if referral:
