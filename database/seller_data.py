@@ -21,10 +21,35 @@ async def initialize_seller_data_indexes():
 
 async def ensure_seller_defaults(owner_id:int, bot_name="Subscription Bot"):
     now=datetime.now(timezone.utc)
-    await c(SETTINGS).update_one({"owner_id":owner_id},{"$setOnInsert":{
-        "owner_id":owner_id,"bot_name":bot_name,"welcome_message":f"👋 Welcome to {bot_name}!",
-        "support_username":"","currency":"INR","timezone":"Asia/Kolkata","reminder_days":1,
-        "upi_id":"","upi_name":"","upi_qr_file_id":"","welcome_media_type":"","welcome_media_file_id":"","welcome_buttons":[],"created_at":now,"updated_at":now}},upsert=True)
+    defaults={
+        "owner_id":owner_id,
+        "bot_name":bot_name,
+        "welcome_message":f"👋 Welcome to {bot_name}!",
+        "support_username":"",
+        "currency":"INR",
+        "timezone":"Asia/Kolkata",
+        "reminder_days":1,
+        "upi_id":"",
+        "upi_name":"",
+        "upi_qr_file_id":"",
+        "welcome_media_type":"",
+        "welcome_media_file_id":"",
+        "welcome_buttons":[],
+        "created_at":now,
+        "updated_at":now,
+    }
+    await c(SETTINGS).update_one(
+        {"owner_id":owner_id},
+        {"$setOnInsert":defaults},
+        upsert=True,
+    )
+    for key,value in defaults.items():
+        if key in {"owner_id","created_at"}:
+            continue
+        await c(SETTINGS).update_one(
+            {"owner_id":owner_id,key:{"$exists":False}},
+            {"$set":{key:value,"updated_at":now}},
+        )
     return await get_seller_settings(owner_id)
 
 
