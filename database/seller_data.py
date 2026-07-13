@@ -87,9 +87,65 @@ async def remove_channel(owner_id,chat_id): return (await c(CHANNELS).update_one
 
 async def upsert_user(owner_id,user):
     now=datetime.now(timezone.utc)
-    await c(USERS).update_one({"owner_id":owner_id,"user_id":user.id},{"$set":{"first_name":user.first_name,"username":user.username,"updated_at":now},"$setOnInsert":{"owner_id":owner_id,"user_id":user.id,"joined_at":now,"banned":False}},upsert=True)
+    username=user.username or ""
+    await c(USERS).update_one(
+        {"owner_id":owner_id,"user_id":user.id},
+        {
+            "$set":{
+                "first_name":user.first_name,
+                "last_name":user.last_name,
+                "username":username,
+                "username_normalized":username.lower(),
+                "language_code":user.language_code,
+                "updated_at":now,
+            },
+            "$setOnInsert":{
+                "owner_id":owner_id,
+                "user_id":user.id,
+                "joined_at":now,
+                "banned":False,
+                "ban_reason":"",
+            },
+        },
+        upsert=True,
+    )
 async def get_user(owner_id,user_id): return await c(USERS).find_one({"owner_id":owner_id,"user_id":user_id})
 async def count_users(owner_id): return await c(USERS).count_documents({"owner_id":owner_id})
+
+
+async def get_user_by_username(owner_id:int, username:str):
+    normalized=username.strip().lstrip("@").lower()
+    if not normalized:
+        return None
+    return await c(USERS).find_one(
+        {"owner_id":owner_id,"username_normalized":normalized}
+    )
+
+
+async def set_user_ban(owner_id:int, user_id:int, banned:bool, reason:str=""):
+    now=datetime.now(timezone.utc)
+    result=await c(USERS).update_one(
+        {"owner_id":owner_id,"user_id":int(user_id)},
+        {"$set":{
+            "banned":bool(banned),
+            "ban_reason":reason.strip() if banned else "",
+            "updated_at":now,
+        }},
+    )
+    return result.matched_count>0
+
+
+async def remove_subscription(owner_id:int, user_id:int):
+    now=datetime.now(timezone.utc)
+    result=await c(SUBS).update_one(
+        {"owner_id":owner_id,"user_id":int(user_id)},
+        {"$set":{
+            "active":False,
+            "removed_by_admin":True,
+            "updated_at":now,
+        }},
+    )
+    return result.matched_count>0
 
 
 async def create_payment(owner_id,user_id,plan,screenshot_file_id):
