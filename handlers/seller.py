@@ -5,6 +5,7 @@ from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, fil
 from database.seller_bots import delete_bot, get_bot, save_bot, set_bot_active
 from database.sellers import get_or_create_seller
 from database.seller_subscriptions import effective_plan, plan_limit_warning, current_plan_text, get_config, subscription_history, create_plan_request, usage_warning, seller_access_state
+from database.payment_gateways import SUPPORTED_GATEWAYS, get_gateway_config
 from services.bot_manager import bot_manager
 
 
@@ -30,6 +31,7 @@ def seller_keyboard(record=None):
         [InlineKeyboardButton("🔄 Replace Token", callback_data="seller_replace")],
         [InlineKeyboardButton("🗑 Remove Bot", callback_data="seller_remove")],
         [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
+        [InlineKeyboardButton("🌐 Child Bot Payment Gateways", callback_data="pgcfg_seller_home")],
         [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
         [InlineKeyboardButton("🏪 Seller Dashboard", callback_data="main_seller_dashboard")],
         [InlineKeyboardButton("⬅ Main Menu", callback_data="main_home")],
@@ -56,8 +58,24 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cfg=await get_config(); plan=next((p for p in cfg.get("paid_plans",[]) if p.get("plan_id")==plan_id),None)
         if not plan: await q.answer("Plan unavailable",show_alert=True); return
         await create_plan_request(owner_id,plan_id,request_type)
+        gateway_cfg=await get_gateway_config("owner",0,decrypt=True)
+        rows=[]
+        for gateway in SUPPORTED_GATEWAYS:
+            if (gateway_cfg.get("gateways") or {}).get(gateway,{}).get("enabled"):
+                rows.append([InlineKeyboardButton(f"💳 Pay with {gateway.title()}",callback_data=f"pgsp_{gateway}_{request_type}_{plan_id}")])
+        if gateway_cfg.get("manual_enabled",True):
+            rows.append([InlineKeyboardButton("📤 Manual Screenshot Payment",callback_data=f"seller_manual_{request_type}_{plan_id}")])
+        rows.append([InlineKeyboardButton("⬅ Back",callback_data="seller_upgrade_plan")])
+        await q.edit_message_text(
+            f"💳 Choose Payment Method\n\nPlan: {plan.get('name')}\nAmount: ₹{plan.get('price',0):g}\n\nAutomatic gateway payment verify hote hi plan activate hoga.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        ); return
+    if action.startswith("seller_manual_"):
+        _,_,request_type,plan_id=action.split("_",3)
+        cfg=await get_config(); plan=next((p for p in cfg.get("paid_plans",[]) if p.get("plan_id")==plan_id),None)
+        if not plan: await q.answer("Plan unavailable",show_alert=True); return
         context.user_data.clear(); context.user_data["seller_payment_plan"]=plan_id; context.user_data["seller_request_type"]=request_type
-        await q.edit_message_text(f"💳 {request_type.title()} Request\n\nPlan: {plan.get('name')}\nAmount: ₹{plan.get('price',0):g}\nUPI: {cfg.get('payment_upi_id') or 'Contact owner'}\nName: {cfg.get('payment_upi_name') or '-'}\n\nPay and send payment screenshot here.", reply_markup=seller_keyboard(record)); return
+        await q.edit_message_text(f"📤 Manual Payment\n\nPlan: {plan.get('name')}\nAmount: ₹{plan.get('price',0):g}\nUPI: {cfg.get('payment_upi_id') or 'Contact owner'}\nName: {cfg.get('payment_upi_name') or '-'}\n\nPay and send payment screenshot here.", reply_markup=seller_keyboard(record)); return
     if action=="seller_plan_history":
         items=await subscription_history(owner_id,15); lines=["📜 Your Plan History",""]
         for h in items: lines.append(f"• {h.get('action')} | {h.get('new_plan',h.get('target_plan_id','-'))} | {h.get('created_at').strftime('%d-%m-%Y')}")
@@ -110,6 +128,6 @@ async def receive_seller_token(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def seller_handlers():
     return [
-        CallbackQueryHandler(seller_callback,pattern=r"^seller_(connect|replace|my_bot|pause|resume|remove|upgrade_plan|current_plan|plan_history|buy_.*)$"),
+        CallbackQueryHandler(seller_callback,pattern=r"^seller_(connect|replace|my_bot|pause|resume|remove|upgrade_plan|current_plan|plan_history|buy_.*|manual_.*)$"),
         MessageHandler(filters.TEXT & ~filters.COMMAND,receive_seller_token),
     ]

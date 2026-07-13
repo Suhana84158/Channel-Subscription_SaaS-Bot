@@ -38,7 +38,14 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if a=="sub_mgmt_plans":
         await q.edit_message_text("📋 Plan Manage\n\nFree and paid plan limits are dynamic. Paid plans always keep SaaS branding.", reply_markup=back()); return
     if a=="sub_mgmt_payment":
-        await q.edit_message_text(f"💳 Payment Setting\n\nUPI ID: {cfg.get('payment_upi_id') or '-'}\nUPI Name: {cfg.get('payment_upi_name') or '-'}", reply_markup=kb([[InlineKeyboardButton("✏ Set UPI", callback_data="sub_mgmt_payment_edit")],[InlineKeyboardButton("⬅ Back", callback_data="sub_mgmt_home")]])); return
+        await q.edit_message_text(
+            f"💳 Payment Setting\n\nUPI ID: {cfg.get('payment_upi_id') or '-'}\nUPI Name: {cfg.get('payment_upi_name') or '-'}",
+            reply_markup=kb([
+                [InlineKeyboardButton("🌐 Automatic Payment Gateways", callback_data="pgcfg_owner_home")],
+                [InlineKeyboardButton("✏ Set Manual UPI", callback_data="sub_mgmt_payment_edit")],
+                [InlineKeyboardButton("⬅ Back", callback_data="sub_mgmt_home")],
+            ]),
+        ); return
     if a=="sub_mgmt_payment_edit":
         context.user_data.clear(); context.user_data["sub_wait"]="payment"
         await q.edit_message_text("Send: UPI_ID | UPI_NAME", reply_markup=back("sub_mgmt_payment")); return
