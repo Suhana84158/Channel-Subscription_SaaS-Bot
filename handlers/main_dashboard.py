@@ -39,6 +39,7 @@ def owner_dashboard_keyboard():
             InlineKeyboardButton("📋 Channels / Groups", callback_data="admin_channels"),
             InlineKeyboardButton("⚙ Settings", callback_data="admin_bot_settings"),
         ],
+        [InlineKeyboardButton("💼 Subscription Management", callback_data="sub_mgmt_home")],
         [InlineKeyboardButton("🆘 Owner Help", callback_data="main_help")],
         home_button(),
     ])
