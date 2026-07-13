@@ -4,7 +4,16 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, Mes
 
 from database.seller_bots import delete_bot, get_bot, save_bot, set_bot_active
 from database.sellers import get_or_create_seller
+from database.seller_subscriptions import effective_plan, plan_limit_warning, current_plan_text, get_config
 from services.bot_manager import bot_manager
+
+
+def limit_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💎 Upgrade Plan", callback_data="seller_upgrade_plan")],
+        [InlineKeyboardButton("📊 View Current Plan", callback_data="seller_current_plan")],
+        [InlineKeyboardButton("❌ Close", callback_data="main_seller_dashboard")],
+    ])
 
 
 def seller_keyboard(record=None):
@@ -43,7 +52,23 @@ async def seller_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer(); owner_id=q.from_user.id; action=q.data
     record=await get_bot(owner_id)
+    if action=="seller_current_plan":
+        await q.edit_message_text(await current_plan_text(owner_id), reply_markup=seller_keyboard(record)); return
+    if action=="seller_upgrade_plan":
+        cfg=await get_config()
+        plans=[p for p in cfg.get("paid_plans",[]) if p.get("active",True)]
+        lines=["💎 Upgrade Seller Plan", ""]
+        for p in plans:
+            lines.append(f"• {p.get('name','Plan')} — ₹{p.get('price',0)} / {p.get('duration_days',30)} days")
+        lines += ["", "Contact the SaaS owner to activate a plan."]
+        await q.edit_message_text("\n".join(lines), reply_markup=seller_keyboard(record)); return
     if action in {"seller_connect","seller_replace"}:
+        if action=="seller_connect" and not record:
+            plan,_=await effective_plan(owner_id)
+            limit=int(plan.get("bot_limit",1))
+            current=1 if await get_bot(owner_id) else 0
+            if limit>=0 and current>=limit:
+                await q.edit_message_text(await plan_limit_warning(owner_id), reply_markup=limit_keyboard()); return
         context.user_data.clear(); context.user_data["waiting_seller_token"]=True
         await q.edit_message_text("Send your BotFather token.")
         return
@@ -86,6 +111,6 @@ async def receive_seller_token(update: Update, context: ContextTypes.DEFAULT_TYP
 def seller_handlers():
     return [
         CommandHandler("seller",seller_command),
-        CallbackQueryHandler(seller_callback,pattern=r"^seller_(connect|replace|my_bot|pause|resume|remove)$"),
+        CallbackQueryHandler(seller_callback,pattern=r"^seller_(connect|replace|my_bot|pause|resume|remove|upgrade_plan|current_plan)$"),
         MessageHandler(filters.TEXT & ~filters.COMMAND,receive_seller_token),
     ]
