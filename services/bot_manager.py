@@ -6,7 +6,7 @@ from typing import Dict, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import Conflict, InvalidToken, TelegramError
+from telegram.error import BadRequest, Conflict, InvalidToken, TelegramError
 from telegram.ext import Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from database.seller_bots import get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status
@@ -65,10 +65,10 @@ class SellerBotManager:
     @staticmethod
     def welcome_menu():
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📝 Edit Text",callback_data="a_welcome_text"),InlineKeyboardButton("🖼 Edit Media",callback_data="a_welcome_media")],
-            [InlineKeyboardButton("🔗 Edit Buttons",callback_data="a_welcome_buttons"),InlineKeyboardButton("👀 Preview",callback_data="a_welcome_preview")],
-            [InlineKeyboardButton("🗑 Remove Text",callback_data="a_welcome_remove_text"),InlineKeyboardButton("🗑 Remove Media",callback_data="a_welcome_remove_media")],
-            [InlineKeyboardButton("🧹 Remove Buttons",callback_data="a_welcome_remove_buttons")],
+            [InlineKeyboardButton("📝 Edit Text",callback_data="a_welcome_text"),InlineKeyboardButton("🗑 Remove Text",callback_data="a_welcome_remove_text")],
+            [InlineKeyboardButton("🖼 Edit Media",callback_data="a_welcome_media"),InlineKeyboardButton("🗑 Remove Media",callback_data="a_welcome_remove_media")],
+            [InlineKeyboardButton("🔗 Edit Buttons",callback_data="a_welcome_buttons"),InlineKeyboardButton("🗑 Remove Buttons",callback_data="a_welcome_remove_buttons")],
+            [InlineKeyboardButton("👀 Preview",callback_data="a_welcome_preview")],
             [InlineKeyboardButton("⬅ Back",callback_data="a_settings")],
         ])
 
@@ -151,15 +151,52 @@ class SellerBotManager:
         return InlineKeyboardMarkup(keyboard) if keyboard else None
 
     async def send_welcome(self,message,context,settings,user):
-        text=self.personalize(settings.get("welcome_message") or "Welcome!",user,settings.get("bot_name","Subscription Bot"))
+        text=self.personalize(
+            settings.get("welcome_message") or "Welcome!",
+            user,
+            settings.get("bot_name","Subscription Bot"),
+        )
         keyboard=self.build_welcome_keyboard(settings.get("welcome_buttons") or []) or self.main_menu()
         media_type=settings.get("welcome_media_type")
         file_id=settings.get("welcome_media_file_id")
-        if file_id and media_type=="photo": await message.reply_photo(file_id,caption=text,reply_markup=keyboard,parse_mode="HTML")
-        elif file_id and media_type=="video": await message.reply_video(file_id,caption=text,reply_markup=keyboard,parse_mode="HTML")
-        elif file_id and media_type=="animation": await message.reply_animation(file_id,caption=text,reply_markup=keyboard,parse_mode="HTML")
-        elif file_id and media_type=="document": await message.reply_document(file_id,caption=text,reply_markup=keyboard,parse_mode="HTML")
-        else: await message.reply_text(text,reply_markup=keyboard,parse_mode="HTML",disable_web_page_preview=True)
+
+        async def send(parse_mode="HTML"):
+            kwargs={"reply_markup":keyboard}
+            if parse_mode:
+                kwargs["parse_mode"]=parse_mode
+            if file_id and media_type=="photo":
+                return await message.reply_photo(file_id,caption=text,**kwargs)
+            if file_id and media_type=="video":
+                return await message.reply_video(file_id,caption=text,**kwargs)
+            if file_id and media_type=="animation":
+                return await message.reply_animation(file_id,caption=text,**kwargs)
+            if file_id and media_type=="document":
+                return await message.reply_document(file_id,caption=text,**kwargs)
+            return await message.reply_text(
+                text,
+                disable_web_page_preview=True,
+                **kwargs,
+            )
+
+        try:
+            return await send("HTML")
+        except BadRequest as exc:
+            logger.warning("Welcome HTML/media send failed; retrying plain text: %s",exc)
+            try:
+                return await send(None)
+            except BadRequest:
+                # If an old/invalid Telegram file_id is stored, remove media and send text.
+                if file_id:
+                    await set_seller_setting(self.owner(context),"welcome_media_type","")
+                    await set_seller_setting(self.owner(context),"welcome_media_file_id","")
+                    settings["welcome_media_type"]=""
+                    settings["welcome_media_file_id"]=""
+                    return await message.reply_text(
+                        text,
+                        reply_markup=keyboard,
+                        disable_web_page_preview=True,
+                    )
+                raise
 
     @staticmethod
     def parse_duration(value:str)->int:
@@ -251,7 +288,7 @@ class SellerBotManager:
             kb.append([InlineKeyboardButton("⬅ Back",callback_data="a_channels")]); await q.edit_message_text("\n\n".join(lines),reply_markup=InlineKeyboardMarkup(kb)); return
         if a.startswith("a_channel_del_"): await remove_channel(owner,int(a.replace("a_channel_del_",""))); await q.edit_message_text("✅ Removed",reply_markup=self.channels_menu()); return
         if a=="a_welcome":
-            s=await get_seller_settings(owner)
+            s=await ensure_seller_defaults(owner,(await get_bot(owner) or {}).get("bot_name","Subscription Bot"))
             text=("💬 Welcome Message\n\n"
                   f"📝 Text: {'✅' if s.get('welcome_message') else '❌'}\n"
                   f"🖼 Media: {'✅' if s.get('welcome_media_file_id') else '❌'}\n"
@@ -262,7 +299,7 @@ class SellerBotManager:
             await q.edit_message_text("📝 Send welcome text.\n\nHTML is supported.\nVariables: {ID} {NAME} {SURNAME} {NAMESURNAME} {USERNAME} {LANG} {DATE} {TIME} {WEEKDAY} {MENTION} {BOTNAME}",reply_markup=self.back("a_welcome")); return
         if a=="a_welcome_media":
             context.user_data.clear(); context.user_data["wait_welcome_media"]=True
-            await q.edit_message_text("🖼 Send photo, video, GIF or document for welcome media.",reply_markup=self.back("a_welcome")); return
+            await q.edit_message_text("🖼 Send photo, video, GIF or document for welcome media.\n\nThe same media will appear in Preview and on /start.",reply_markup=self.back("a_welcome")); return
         if a=="a_welcome_buttons": await q.edit_message_text("🔗 Welcome Buttons",reply_markup=self.welcome_buttons_menu()); return
         if a=="a_welcome_quick": await q.edit_message_text("⚡ Choose a bot button to add",reply_markup=self.welcome_quick_menu()); return
         if a.startswith("a_wq_"):
@@ -281,7 +318,11 @@ class SellerBotManager:
         if a=="a_welcome_see_buttons":
             s=await get_seller_settings(owner); rows=s.get("welcome_buttons") or []
             lines=["🔗 Current Buttons\n"]
-            for r,row in enumerate(rows,1): lines.append(f"Row {r}: "+" | ".join(x.get("text","Button") for x in row))
+            for r,row in enumerate(rows,1):
+                items=[]
+                for item in row:
+                    items.append(f"{item.get('text','Button')} → {item.get('value','')}")
+                lines.append(f"Row {r}: "+" | ".join(items))
             await q.edit_message_text("\n".join(lines) if rows else "No buttons set.",reply_markup=self.welcome_buttons_menu()); return
         if a=="a_welcome_remove_text": await set_seller_setting(owner,"welcome_message",""); await q.edit_message_text("✅ Welcome text removed.",reply_markup=self.welcome_menu()); return
         if a=="a_welcome_remove_media":
@@ -289,7 +330,14 @@ class SellerBotManager:
             await q.edit_message_text("✅ Welcome media removed.",reply_markup=self.welcome_menu()); return
         if a=="a_welcome_remove_buttons": await set_seller_setting(owner,"welcome_buttons",[]); await q.edit_message_text("✅ Welcome buttons removed.",reply_markup=self.welcome_menu()); return
         if a=="a_welcome_preview":
-            s=await get_seller_settings(owner); await self.send_welcome(q.message,context,s,q.from_user); return
+            s=await ensure_seller_defaults(owner,(await get_bot(owner) or {}).get("bot_name","Subscription Bot"))
+            try:
+                await q.message.reply_text("👀 Preview — users will see the message below:")
+                await self.send_welcome(q.message,context,s,q.from_user)
+            except Exception as exc:
+                logger.exception("Welcome preview failed for owner=%s",owner)
+                await q.message.reply_text(f"❌ Preview failed: {str(exc)[:300]}",reply_markup=self.welcome_menu())
+            return
         if a=="a_payment":
             s=await get_seller_settings(owner); await q.edit_message_text(f"💳 Payment Settings\n\nUPI Name: {s.get('upi_name') or 'Not Set'}\nUPI ID: {s.get('upi_id') or 'Not Set'}\nQR: {'Added' if s.get('upi_qr_file_id') else 'Not Added'}",reply_markup=self.payment_menu()); return
         state={"a_set_upi_id":("wait_upi_id","Send UPI ID","a_payment"),"a_set_upi_name":("wait_upi_name","Send UPI Name","a_payment"),"a_set_bot_name":("wait_bot_name","Send Bot Name","a_settings"),"a_set_support":("wait_support","Send Support Username","a_settings"),"a_set_currency":("wait_currency","Send Currency","a_settings"),"a_set_timezone":("wait_timezone","Send Timezone","a_settings"),"a_set_reminder":("wait_reminder","Send Reminder Days","a_settings")}
@@ -352,12 +400,12 @@ class SellerBotManager:
                 if context.user_data.get(state): await set_seller_setting(owner,key,val); context.user_data.clear(); await update.effective_message.reply_text("✅ Updated",reply_markup=kb); return
             if context.user_data.get("wait_welcome_text"):
                 await set_seller_setting(owner,"welcome_message",text); context.user_data.clear()
-                await update.effective_message.reply_text("✅ Welcome text updated.",reply_markup=self.welcome_menu()); return
+                await update.effective_message.reply_text("✅ Welcome text saved. Use 👀 Preview to check it.",reply_markup=self.welcome_menu()); return
             if context.user_data.get("wait_welcome_buttons"):
                 try: rows=self.parse_welcome_buttons(text)
                 except Exception as exc: await update.effective_message.reply_text(f"❌ {exc}"); return
                 await set_seller_setting(owner,"welcome_buttons",rows); context.user_data.clear()
-                await update.effective_message.reply_text("✅ Welcome buttons saved.",reply_markup=self.welcome_buttons_menu()); return
+                await update.effective_message.reply_text("✅ Welcome buttons saved. Use 👀 Preview to check them.",reply_markup=self.welcome_buttons_menu()); return
             if context.user_data.get("wait_timezone"):
                 try: ZoneInfo(text)
                 except ZoneInfoNotFoundError: await update.effective_message.reply_text("❌ Invalid timezone"); return
@@ -425,7 +473,7 @@ class SellerBotManager:
         if not file_id: await msg.reply_text("❌ Send photo, video, GIF or document."); return
         await set_seller_setting(owner,"welcome_media_type",media_type)
         await set_seller_setting(owner,"welcome_media_file_id",file_id)
-        context.user_data.clear(); await msg.reply_text("✅ Welcome media updated.",reply_markup=self.welcome_menu())
+        context.user_data.clear(); await msg.reply_text("✅ Welcome media saved. Use 👀 Preview to check it.",reply_markup=self.welcome_menu())
         raise ApplicationHandlerStop
 
     async def photo_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
