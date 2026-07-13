@@ -18,11 +18,12 @@ from database.seller_data import (
     payment_history, pending_payments, remove_channel, set_payment_status,
     set_seller_setting, stats, update_plan, upsert_user,
     register_referral, count_all_referrals, count_successful_referrals,
-    mark_referral_rewarded,
+    mark_referral_rewarded, get_user_by_username, set_user_ban,
+    remove_subscription,
 )
 
 logger=logging.getLogger(__name__)
-WELCOME_RUNTIME_VERSION="2026-07-13-support-photo-fix-6"
+WELCOME_RUNTIME_VERSION="2026-07-13-user-management-fix-7"
 MAIN_BOT_USERNAME=os.getenv("MAIN_BOT_USERNAME","Local_supplier3_bot").lstrip("@")
 
 @dataclass
@@ -50,7 +51,7 @@ class SellerBotManager:
             [InlineKeyboardButton("📜 Payment History",callback_data="a_history")],
             [InlineKeyboardButton("⚙️ Bot Settings",callback_data="a_settings")],
             [InlineKeyboardButton("📢 Broadcast",callback_data="a_broadcast")],
-            [InlineKeyboardButton("📊 Statistics",callback_data="a_stats")],
+            [InlineKeyboardButton("👥 User Management",callback_data="a_users")],[InlineKeyboardButton("📊 Statistics",callback_data="a_stats")],
         ])
     @staticmethod
     def back(target="a_home"): return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back",callback_data=target)]])
@@ -212,6 +213,94 @@ class SellerBotManager:
                 raise
 
     @staticmethod
+    def format_dt(value):
+        if not value:
+            return "-"
+        try:
+            return value.astimezone(timezone.utc).strftime("%d-%m-%Y %I:%M:%S %p UTC")
+        except Exception:
+            return str(value)
+
+    async def user_details_text(self,owner,user_id):
+        user=await get_user(owner,int(user_id))
+        sub=await get_subscription(owner,int(user_id))
+
+        if not user:
+            return None,None,None
+
+        username=f"@{user.get('username')}" if user.get("username") else "Not set"
+        name=" ".join(
+            value for value in [user.get("first_name"),user.get("last_name")]
+            if value
+        ) or "Unknown"
+
+        now=datetime.now(timezone.utc)
+        active=bool(
+            sub and sub.get("active") and sub.get("expiry_date")
+            and sub["expiry_date"]>now
+        )
+
+        text=(
+            "👤 User Details\n\n"
+            f"🆔 ID: {user.get('user_id')}\n"
+            f"👤 Name: {name}\n"
+            f"📝 Username: {username}\n"
+            f"🚫 Banned: {'Yes' if user.get('banned') else 'No'}\n"
+            f"📋 Reason: {user.get('ban_reason') or '-'}\n"
+            f"📅 Joined: {self.format_dt(user.get('joined_at'))}\n\n"
+            f"💎 Plan: {(sub or {}).get('plan') or 'No Plan'}\n"
+            f"📅 Expiry: {self.format_dt((sub or {}).get('expiry_date'))}\n"
+            f"📌 Status: {'Active' if active else 'No Subscription'}"
+        )
+        return text,user,sub
+
+    async def show_user_details(self,q,owner,user_id):
+        text,user,sub=await self.user_details_text(owner,user_id)
+
+        if not user:
+            await q.edit_message_text(
+                "❌ User not found.",
+                reply_markup=self.back("a_users"),
+            )
+            return
+
+        banned=bool(user.get("banned"))
+        keyboard=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎁 Give Subscription",callback_data=f"a_user_give_{user_id}")],
+            [InlineKeyboardButton("⌛ Extend Subscription",callback_data=f"a_user_extend_{user_id}")],
+            [InlineKeyboardButton("❌ Remove Subscription",callback_data=f"a_user_remove_{user_id}")],
+            [InlineKeyboardButton(
+                "✅ Unban User" if banned else "🚫 Ban User",
+                callback_data=f"a_user_unban_{user_id}" if banned else f"a_user_ban_{user_id}",
+            )],
+            [InlineKeyboardButton("⬅ Back",callback_data="a_users")],
+        ])
+
+        await q.edit_message_text(text,reply_markup=keyboard)
+
+    async def show_admin_plan_selector(self,q,owner,user_id,mode):
+        plans=await get_plans(owner,True)
+
+        if not plans:
+            await q.edit_message_text(
+                "❌ No active plans available.",
+                reply_markup=self.back(f"a_user_view_{user_id}"),
+            )
+            return
+
+        title="🎁 Choose plan to give" if mode=="give" else "⌛ Choose plan duration to extend"
+        kb=[]
+
+        for plan in plans:
+            kb.append([InlineKeyboardButton(
+                f"{plan['name']} — {plan['duration_text']} — ₹{plan['price']:g}",
+                callback_data=f"a_user_apply_{mode}_{user_id}_{plan['plan_id']}",
+            )])
+
+        kb.append([InlineKeyboardButton("⬅ Back",callback_data=f"a_user_view_{user_id}")])
+        await q.edit_message_text(title,reply_markup=InlineKeyboardMarkup(kb))
+
+    @staticmethod
     def parse_duration(value:str)->int:
         value=value.strip().lower(); n=int(value[:-1]); unit=value[-1]
         if n<=0: raise ValueError("Duration must be positive")
@@ -257,6 +346,15 @@ class SellerBotManager:
 
         try:
             await upsert_user(owner,update.effective_user)
+            user_record=await get_user(owner,update.effective_user.id)
+
+            if user_record and user_record.get("banned"):
+                await update.effective_message.reply_text(
+                    "🚫 You are banned from using this bot.\n"
+                    f"Reason: {user_record.get('ban_reason') or 'Not specified'}"
+                )
+                return
+
             if context.args:
                 arg=context.args[0]
                 if arg.startswith("ref_"):
@@ -265,6 +363,7 @@ class SellerBotManager:
                         await register_referral(owner,referrer_id,update.effective_user.id)
                     except (TypeError,ValueError):
                         pass
+
             record=await get_bot(owner)
             settings=await ensure_seller_defaults(
                 owner,
@@ -816,6 +915,101 @@ class SellerBotManager:
         if a=="a_history":
             ps=await payment_history(owner); text="📜 Payment History\n\n"+"\n".join(f"{'✅' if p['status']=='approved' else '❌'} {p['user_id']} ₹{p['amount']:g} {p['plan']}" for p in ps[:20]); await q.edit_message_text(text,reply_markup=self.back()); return
         if a=="a_broadcast": context.user_data.clear(); context.user_data["wait_broadcast"]=True; await q.edit_message_text("📢 Send any one message to broadcast.\n\nSupported: text, photo with caption, video, document, audio, voice, GIF, sticker and forwarded messages.",reply_markup=self.back()); return
+        if a=="a_users":
+            context.user_data.clear()
+            context.user_data["wait_user_search"]=True
+            await q.edit_message_text(
+                "👥 User Management\n\nSend User ID or @username to search.",
+                reply_markup=self.back("a_home"),
+            )
+            return
+
+        if a.startswith("a_user_view_"):
+            await self.show_user_details(q,owner,int(a.replace("a_user_view_","")))
+            return
+
+        if a.startswith("a_user_give_"):
+            await self.show_admin_plan_selector(
+                q,owner,int(a.replace("a_user_give_","")),"give"
+            )
+            return
+
+        if a.startswith("a_user_extend_"):
+            await self.show_admin_plan_selector(
+                q,owner,int(a.replace("a_user_extend_","")),"extend"
+            )
+            return
+
+        if a.startswith("a_user_apply_"):
+            parts=a.split("_",5)
+            if len(parts)!=6:
+                await q.edit_message_text("❌ Invalid action.")
+                return
+
+            mode=parts[3]
+            user_id=int(parts[4])
+            plan_id=parts[5]
+            plan=await get_plan(owner,plan_id)
+
+            if not plan:
+                await q.edit_message_text(
+                    "❌ Plan not found.",
+                    reply_markup=self.back(f"a_user_view_{user_id}"),
+                )
+                return
+
+            await activate_subscription(
+                owner,user_id,plan["name"],plan["duration_minutes"],
+                amount=plan.get("price"),
+                duration_text=plan.get("duration_text"),
+            )
+
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    "🎉 Subscription activated by admin.\n"
+                    f"Plan: {plan['name']}\n"
+                    f"Duration: {plan['duration_text']}",
+                )
+            except Exception:
+                pass
+
+            await self.show_user_details(q,owner,user_id)
+            return
+
+        if a.startswith("a_user_remove_"):
+            user_id=int(a.replace("a_user_remove_",""))
+            await remove_subscription(owner,user_id)
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    "❌ Your subscription was removed by admin.",
+                )
+            except Exception:
+                pass
+            await self.show_user_details(q,owner,user_id)
+            return
+
+        if a.startswith("a_user_ban_"):
+            user_id=int(a.replace("a_user_ban_",""))
+            context.user_data.clear()
+            context.user_data["wait_user_ban_reason"]=user_id
+            await q.edit_message_text(
+                "🚫 Send ban reason.",
+                reply_markup=self.back(f"a_user_view_{user_id}"),
+            )
+            return
+
+        if a.startswith("a_user_unban_"):
+            user_id=int(a.replace("a_user_unban_",""))
+            await set_user_ban(owner,user_id,False,"")
+            try:
+                await context.bot.send_message(user_id,"✅ You have been unbanned.")
+            except Exception:
+                pass
+            await self.show_user_details(q,owner,user_id)
+            return
+
         if a=="a_stats":
             s=await stats(owner); await q.edit_message_text(f"📊 Statistics\n\nUsers: {s['users']}\nPlans: {s['plans']}\nChannels: {s['channels']}\nPending: {s['pending']}\nRevenue: ₹{s['revenue']:g}",reply_markup=self.admin_menu()); return
 
@@ -848,6 +1042,66 @@ class SellerBotManager:
                 except Exception as exc: await update.effective_message.reply_text(f"❌ {exc}"); return
                 await set_seller_setting(owner,"welcome_buttons",rows); context.user_data.clear()
                 await update.effective_message.reply_text("✅ Welcome buttons saved. Use 👀 Preview to check them.",reply_markup=self.welcome_buttons_menu()); return
+            if context.user_data.get("wait_user_search"):
+                query=text.strip()
+                user=None
+
+                if query.startswith("@"):
+                    user=await get_user_by_username(owner,query)
+                else:
+                    try:
+                        user=await get_user(owner,int(query))
+                    except ValueError:
+                        user=await get_user_by_username(owner,query)
+
+                if not user:
+                    await update.effective_message.reply_text(
+                        "❌ User not found. Send a valid User ID or @username.",
+                        reply_markup=self.back("a_home"),
+                    )
+                    return
+
+                context.user_data.clear()
+
+                class FakeQuery:
+                    def __init__(self,message):
+                        self.message=message
+                    async def edit_message_text(self,text,reply_markup=None,**kwargs):
+                        return await self.message.reply_text(text,reply_markup=reply_markup)
+
+                await self.show_user_details(
+                    FakeQuery(update.effective_message),
+                    owner,
+                    int(user["user_id"]),
+                )
+                return
+
+            if context.user_data.get("wait_user_ban_reason"):
+                user_id=int(context.user_data["wait_user_ban_reason"])
+                await set_user_ban(owner,user_id,True,text)
+                context.user_data.clear()
+
+                try:
+                    await context.bot.send_message(
+                        user_id,
+                        f"🚫 You have been banned.\nReason: {text}",
+                    )
+                except Exception:
+                    pass
+
+                class FakeQuery:
+                    def __init__(self,message):
+                        self.message=message
+                    async def edit_message_text(self,text,reply_markup=None,**kwargs):
+                        return await self.message.reply_text(text,reply_markup=reply_markup)
+
+                await self.show_user_details(
+                    FakeQuery(update.effective_message),
+                    owner,
+                    user_id,
+                )
+                return
+
             if context.user_data.get("wait_timezone"):
                 try: ZoneInfo(text)
                 except ZoneInfoNotFoundError: await update.effective_message.reply_text("❌ Invalid timezone"); return
