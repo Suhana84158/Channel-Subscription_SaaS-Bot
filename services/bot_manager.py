@@ -19,7 +19,7 @@ from database.seller_data import (
 )
 
 logger=logging.getLogger(__name__)
-WELCOME_RUNTIME_VERSION="2026-07-13-hotfix-2"
+WELCOME_RUNTIME_VERSION="2026-07-13-hotfix-3"
 
 @dataclass
 class RunningSellerBot:
@@ -277,12 +277,13 @@ class SellerBotManager:
         plans=await get_plans(owner,True)
         settings=await get_seller_settings(owner)
         currency=settings.get("currency","INR")
+        back_keyboard=self.back("c_home")
 
         if not plans:
             await self.safe_query_message(
                 q,
                 "📋 No plans available.",
-                self.main_menu(),
+                back_keyboard,
             )
             return
 
@@ -294,6 +295,7 @@ class SellerBotManager:
                 f"• {p['name']} — {p['duration_text']} — "
                 f"{currency} {p['price']:g}"
             )
+
             if select:
                 kb.append([
                     InlineKeyboardButton(
@@ -309,7 +311,7 @@ class SellerBotManager:
         await self.safe_query_message(
             q,
             "\n".join(lines),
-            InlineKeyboardMarkup(kb) if select else self.main_menu(),
+            InlineKeyboardMarkup(kb),
         )
 
     async def child_callback(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
@@ -317,12 +319,19 @@ class SellerBotManager:
         await q.answer()
         owner=self.owner(context)
         action=q.data
+        back_keyboard=self.back("c_home")
 
         if action=="c_home":
-            await self.safe_query_message(
-                q,
-                "Choose an option:",
-                self.main_menu(),
+            record=await get_bot(owner)
+            settings=await ensure_seller_defaults(
+                owner,
+                (record or {}).get("bot_name","Subscription Bot"),
+            )
+            await self.send_welcome(
+                q.message,
+                context,
+                settings,
+                q.from_user,
             )
             return
 
@@ -336,6 +345,7 @@ class SellerBotManager:
 
         if action.startswith("c_select_"):
             plan=await get_plan(owner,action.replace("c_select_",""))
+
             if not plan:
                 await q.answer("Plan not found",show_alert=True)
                 return
@@ -353,14 +363,18 @@ class SellerBotManager:
             )
 
             kb=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "📤 Upload Screenshot",
-                    callback_data="c_upload",
-                )],
-                [InlineKeyboardButton(
-                    "⬅ Back",
-                    callback_data="c_buy",
-                )],
+                [
+                    InlineKeyboardButton(
+                        "📤 Upload Screenshot",
+                        callback_data="c_upload",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅ Back",
+                        callback_data="c_buy",
+                    )
+                ],
             ])
 
             if s.get("upi_qr_file_id"):
@@ -375,7 +389,10 @@ class SellerBotManager:
 
         if action=="c_upload":
             context.user_data["waiting_child_screenshot"]=True
-            await q.message.reply_text("📷 Send payment screenshot.")
+            await q.message.reply_text(
+                "📷 Send payment screenshot.",
+                reply_markup=back_keyboard,
+            )
             return
 
         if action=="c_profile":
@@ -392,29 +409,38 @@ class SellerBotManager:
                     f"Expiry: {exp}"
                 )
 
-            await self.safe_query_message(q,text,self.main_menu())
+            await self.safe_query_message(
+                q,
+                text,
+                back_keyboard,
+            )
             return
 
         if action=="c_referral":
             me=await context.bot.get_me()
+
             await self.safe_query_message(
                 q,
                 "🎁 Referral link\n"
                 f"https://t.me/{me.username}?start=ref_{q.from_user.id}",
-                self.main_menu(),
+                back_keyboard,
             )
             return
 
         if action=="c_support":
             context.user_data["waiting_support_message"]=True
+
             await self.safe_query_message(
                 q,
                 "📞 Send your message for admin.",
-                self.back("c_home"),
+                back_keyboard,
             )
             return
 
-        await q.answer("Button action not found",show_alert=True)
+        await q.answer(
+            "Button action not found",
+            show_alert=True,
+        )
 
     async def admin_callback(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         q=update.callback_query; await q.answer(); owner=self.owner(context)
