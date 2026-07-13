@@ -23,7 +23,7 @@ from database.seller_data import (
 )
 
 logger=logging.getLogger(__name__)
-WELCOME_RUNTIME_VERSION="2026-07-13-user-management-fix-7"
+WELCOME_RUNTIME_VERSION="2026-07-13-payment-profile-fix-9"
 MAIN_BOT_USERNAME=os.getenv("MAIN_BOT_USERNAME","Local_supplier3_bot").lstrip("@")
 
 @dataclass
@@ -300,6 +300,60 @@ class SellerBotManager:
         kb.append([InlineKeyboardButton("⬅ Back",callback_data=f"a_user_view_{user_id}")])
         await q.edit_message_text(title,reply_markup=InlineKeyboardMarkup(kb))
 
+    async def payment_details_caption(
+        self,
+        owner,
+        payment,
+        status=None,
+        processed_by=None,
+    ):
+        user=await get_user(owner,int(payment["user_id"])) or {}
+
+        name=" ".join(
+            value for value in [
+                user.get("first_name"),
+                user.get("last_name"),
+            ] if value
+        ) or "Unknown"
+
+        username=(
+            f"@{user.get('username')}"
+            if user.get("username")
+            else "Not set"
+        )
+
+        created=payment.get("created_at")
+        created_text=self.format_dt(created)
+        current_status=status or payment.get("status","pending")
+
+        status_icon={
+            "pending":"🟡",
+            "approved":"✅",
+            "rejected":"❌",
+        }.get(current_status,"ℹ️")
+
+        lines=[
+            f"{status_icon} Payment {current_status.title()}",
+            "",
+            f"🧾 Payment ID: {payment.get('payment_id')}",
+            f"🆔 User ID: {payment.get('user_id')}",
+            f"👤 Name: {name}",
+            f"📝 Username: {username}",
+            f"📦 Plan: {payment.get('plan')}",
+            f"⏳ Duration: {payment.get('duration_text') or '-'}",
+            f"💰 Amount: ₹{payment.get('amount',0):g}",
+            f"📅 Submitted: {created_text}",
+            f"📌 Status: {current_status.title()}",
+        ]
+
+        if processed_by:
+            lines.extend([
+                f"👮 Processed By: {processed_by}",
+                f"🕒 Processed At: {self.format_dt(datetime.now(timezone.utc))}",
+            ])
+
+        return "\n".join(lines)
+
     @staticmethod
     def parse_duration(value:str)->int:
         value=value.strip().lower(); n=int(value[:-1]); unit=value[-1]
@@ -514,96 +568,136 @@ class SellerBotManager:
             return
 
         if action=="c_profile":
-            user_record=await get_user(owner,q.from_user.id) or {}
-            sub=await get_subscription(owner,q.from_user.id)
-            me=await context.bot.get_me()
+            try:
+                user_record=await get_user(owner,q.from_user.id) or {}
+                sub=await get_subscription(owner,q.from_user.id)
+                me=await context.bot.get_me()
 
-            joined=user_record.get("joined_at")
-            joined_text=(
-                joined.strftime("%d %b %Y, %I:%M %p")
-                if joined else "Unknown"
-            )
+                def aware_utc(value):
+                    if not value:
+                        return None
+                    if value.tzinfo is None:
+                        return value.replace(tzinfo=timezone.utc)
+                    return value.astimezone(timezone.utc)
 
-            referral_link=(
-                f"https://t.me/{me.username}"
-                f"?start=ref_{q.from_user.id}"
-            )
-            total_referrals=await count_all_referrals(
-                owner,
-                q.from_user.id,
-            )
-            successful_referrals=await count_successful_referrals(
-                owner,
-                q.from_user.id,
-            )
-
-            username=(
-                f"@{q.from_user.username}"
-                if q.from_user.username else "Not set"
-            )
-            full_name=" ".join(
-                value for value in [
-                    q.from_user.first_name,
-                    q.from_user.last_name,
-                ] if value
-            ) or "Unknown"
-
-            lines=[
-                "👤 My Profile",
-                "",
-                f"🆔 User ID: {q.from_user.id}",
-                f"👤 Name: {full_name}",
-                f"📝 Username: {username}",
-                f"🌐 Language: {q.from_user.language_code or 'Unknown'}",
-                f"📅 Joined: {joined_text}",
-                f"👥 Total Referrals: {total_referrals}",
-                f"✅ Successful Referrals: {successful_referrals}",
-                "🔗 Referral Link:",
-                referral_link,
-                "",
-                "━━━━━━━━━━━━━━━━━━━━",
-                "📋 Subscription Status",
-            ]
-
-            now=datetime.now(timezone.utc)
-
-            if sub and sub.get("active") and sub.get("expiry_date") and sub["expiry_date"]>now:
-                expiry=sub["expiry_date"]
-                remaining=expiry-now
-                days=remaining.days
-                hours=remaining.seconds//3600
-                minutes=(remaining.seconds%3600)//60
-                start=sub.get("start_date") or sub.get("created_at")
-                start_text=(
-                    start.strftime("%d %b %Y, %I:%M %p")
-                    if start else "Unknown"
+                joined=aware_utc(user_record.get("joined_at"))
+                joined_text=(
+                    joined.strftime("%d %b %Y, %I:%M %p UTC")
+                    if joined else "Unknown"
                 )
-                expiry_text=expiry.strftime("%d %b %Y, %I:%M %p")
-                lines.extend([
-                    "Status: ✅ Active",
-                    f"Plan: {sub.get('plan') or 'Unknown'}",
-                    f"Amount: {sub.get('amount','—')}",
-                    f"Duration: {sub.get('duration_text') or '—'}",
-                    f"Start Date: {start_text}",
-                    f"Expiry: {expiry_text}",
-                    f"Time Left: {days}d {hours}h {minutes}m",
-                ])
-            else:
-                lines.extend([
-                    "Status: ❌ No Active Subscription",
-                    "Plan: —",
-                    "Amount: —",
-                    "Duration: —",
-                    "Start Date: —",
-                    "Expiry: —",
-                    "Time Left: —",
-                ])
 
-            await self.safe_query_message(
-                q,
-                "\n".join(lines),
-                back_keyboard,
-            )
+                referral_link=(
+                    f"https://t.me/{me.username}"
+                    f"?start=ref_{q.from_user.id}"
+                )
+
+                total_referrals=await count_all_referrals(
+                    owner,
+                    q.from_user.id,
+                )
+                successful_referrals=await count_successful_referrals(
+                    owner,
+                    q.from_user.id,
+                )
+
+                username=(
+                    f"@{q.from_user.username}"
+                    if q.from_user.username else "Not set"
+                )
+                full_name=" ".join(
+                    value for value in [
+                        q.from_user.first_name,
+                        q.from_user.last_name,
+                    ] if value
+                ) or "Unknown"
+
+                lines=[
+                    "👤 My Profile",
+                    "",
+                    f"🆔 User ID: {q.from_user.id}",
+                    f"👤 Name: {full_name}",
+                    f"📝 Username: {username}",
+                    f"🌐 Language: {q.from_user.language_code or 'Unknown'}",
+                    f"📅 Joined: {joined_text}",
+                    f"👥 Total Referrals: {total_referrals}",
+                    f"✅ Successful Referrals: {successful_referrals}",
+                    "",
+                    "🔗 Referral Link:",
+                    referral_link,
+                    "",
+                    "━━━━━━━━━━━━━━━━━━━━",
+                    "📋 Subscription Details",
+                ]
+
+                now=datetime.now(timezone.utc)
+                expiry=aware_utc((sub or {}).get("expiry_date"))
+                active=bool(
+                    sub
+                    and sub.get("active")
+                    and expiry
+                    and expiry>now
+                )
+
+                if active:
+                    remaining=expiry-now
+                    days=max(remaining.days,0)
+                    hours=remaining.seconds//3600
+                    minutes=(remaining.seconds%3600)//60
+
+                    start=aware_utc(
+                        sub.get("start_date")
+                        or sub.get("created_at")
+                    )
+                    start_text=(
+                        start.strftime("%d %b %Y, %I:%M %p UTC")
+                        if start else "Unknown"
+                    )
+                    expiry_text=expiry.strftime(
+                        "%d %b %Y, %I:%M %p UTC"
+                    )
+
+                    amount=sub.get("amount")
+                    amount_text=(
+                        f"₹{amount:g}"
+                        if isinstance(amount,(int,float))
+                        else str(amount or "—")
+                    )
+
+                    lines.extend([
+                        "📌 Status: ✅ Active",
+                        f"💎 Plan: {sub.get('plan') or 'Unknown'}",
+                        f"💰 Amount: {amount_text}",
+                        f"⏳ Duration: {sub.get('duration_text') or '—'}",
+                        f"📅 Start Date: {start_text}",
+                        f"📅 Expiry: {expiry_text}",
+                        f"⏱ Time Left: {days}d {hours}h {minutes}m",
+                    ])
+                else:
+                    lines.extend([
+                        "📌 Status: ❌ No Active Subscription",
+                        f"💎 Last Plan: {(sub or {}).get('plan') or '—'}",
+                        f"💰 Amount: {(sub or {}).get('amount') or '—'}",
+                        f"⏳ Duration: {(sub or {}).get('duration_text') or '—'}",
+                        f"📅 Expiry: {self.format_dt(expiry)}",
+                    ])
+
+                await self.safe_query_message(
+                    q,
+                    "\n".join(lines),
+                    back_keyboard,
+                )
+
+            except Exception as exc:
+                logger.exception(
+                    "Profile failed owner=%s user=%s",
+                    owner,
+                    q.from_user.id,
+                )
+                await q.message.reply_text(
+                    "❌ Profile could not be loaded.\n"
+                    f"Error: {str(exc)[:250]}",
+                    reply_markup=back_keyboard,
+                )
             return
 
         if action=="c_referral":
@@ -873,7 +967,17 @@ class SellerBotManager:
             p=await get_payment(owner,a.replace("a_pay_view_",""));
             if not p: await q.edit_message_text("Not found",reply_markup=self.admin_menu()); return
             kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve",callback_data=f"a_pay_ok_{p['payment_id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"a_pay_no_{p['payment_id']}")],[InlineKeyboardButton("⬅ Back",callback_data="a_pending")]])
-            await q.message.reply_photo(p["screenshot_file_id"],caption=f"Payment\nUser: {p['user_id']}\nPlan: {p['plan']}\nAmount: ₹{p['amount']:g}",reply_markup=kb); return
+            caption=await self.payment_details_caption(
+                owner,
+                p,
+                status=p.get("status","pending"),
+            )
+            await q.message.reply_photo(
+                p["screenshot_file_id"],
+                caption=caption,
+                reply_markup=kb,
+            )
+            return
         if a.startswith("a_pay_ok_") or a.startswith("a_pay_no_"):
             approve=a.startswith("a_pay_ok_"); pid=a.replace("a_pay_ok_" if approve else "a_pay_no_",""); p=await get_payment(owner,pid)
             if not p or not await set_payment_status(owner,pid,"approved" if approve else "rejected",owner): await q.edit_message_text("Already processed or missing"); return
@@ -908,9 +1012,31 @@ class SellerBotManager:
                         inv=await context.bot.create_chat_invite_link(ch["chat_id"],member_limit=1); links.append(f"{ch.get('title')}: {inv.invite_link}")
                     except Exception as exc: links.append(f"{ch.get('title')}: invite failed ({exc})")
                 await context.bot.send_message(p["user_id"],f"🎉 Payment approved\nPlan: {p['plan']}\nExpiry: {expiry}\n\n"+"\n".join(links))
-                await q.edit_message_caption("✅ Payment Approved")
+                approved_caption=await self.payment_details_caption(
+                    owner,
+                    p,
+                    status="approved",
+                    processed_by=owner,
+                )
+                await q.edit_message_caption(
+                    caption=approved_caption,
+                    reply_markup=None,
+                )
             else:
-                await context.bot.send_message(p["user_id"],"❌ Payment rejected"); await q.edit_message_caption("❌ Payment Rejected")
+                await context.bot.send_message(
+                    p["user_id"],
+                    "❌ Payment rejected",
+                )
+                rejected_caption=await self.payment_details_caption(
+                    owner,
+                    p,
+                    status="rejected",
+                    processed_by=owner,
+                )
+                await q.edit_message_caption(
+                    caption=rejected_caption,
+                    reply_markup=None,
+                )
             return
         if a=="a_history":
             ps=await payment_history(owner); text="📜 Payment History\n\n"+"\n".join(f"{'✅' if p['status']=='approved' else '❌'} {p['user_id']} ₹{p['amount']:g} {p['plan']}" for p in ps[:20]); await q.edit_message_text(text,reply_markup=self.back()); return
@@ -1269,9 +1395,35 @@ class SellerBotManager:
             plan=context.user_data.get("selected_child_plan")
             if not plan: await update.effective_message.reply_text("Select a plan first"); return
             p=await create_payment(owner,update.effective_user.id,plan,update.effective_message.photo[-1].file_id); context.user_data.clear()
-            kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve",callback_data=f"a_pay_ok_{p['payment_id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"a_pay_no_{p['payment_id']}")]])
-            await context.bot.send_photo(owner,p["screenshot_file_id"],caption=f"🆕 Payment\nUser: {update.effective_user.id}\nPlan: {p['plan']}\nAmount: ₹{p['amount']:g}",reply_markup=kb)
-            await update.effective_message.reply_text("✅ Payment submitted. Waiting for approval.")
+            kb=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "✅ Approve",
+                        callback_data=f"a_pay_ok_{p['payment_id']}",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Reject",
+                        callback_data=f"a_pay_no_{p['payment_id']}",
+                    ),
+                ]
+            ])
+
+            caption=await self.payment_details_caption(
+                owner,
+                p,
+                status="pending",
+            )
+
+            await context.bot.send_photo(
+                owner,
+                p["screenshot_file_id"],
+                caption=caption,
+                reply_markup=kb,
+            )
+
+            await update.effective_message.reply_text(
+                "✅ Payment submitted. Waiting for approval."
+            )
 
     async def forward_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
