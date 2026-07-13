@@ -103,12 +103,56 @@ async def set_payment_status(owner_id,payment_id,status,admin_id):
 
 
 async def get_subscription(owner_id,user_id): return await c(SUBS).find_one({"owner_id":owner_id,"user_id":user_id})
-async def activate_subscription(owner_id,user_id,plan_name,duration_minutes):
-    now=datetime.now(timezone.utc); current=await get_subscription(owner_id,user_id)
-    base=current.get("expiry_date") if current and current.get("active") and current.get("expiry_date") and current["expiry_date"]>now else now
+async def activate_subscription(
+    owner_id,
+    user_id,
+    plan_name,
+    duration_minutes,
+    amount=None,
+    duration_text=None,
+):
+    now=datetime.now(timezone.utc)
+    current=await get_subscription(owner_id,user_id)
+
+    base=(
+        current.get("expiry_date")
+        if current
+        and current.get("active")
+        and current.get("expiry_date")
+        and current["expiry_date"]>now
+        else now
+    )
     expiry=base+timedelta(minutes=int(duration_minutes))
-    await c(SUBS).update_one({"owner_id":owner_id,"user_id":user_id},{"$set":{"plan":plan_name,"active":True,"expiry_date":expiry,"updated_at":now},"$setOnInsert":{"owner_id":owner_id,"user_id":user_id,"created_at":now}},upsert=True)
+
+    values={
+        "plan":plan_name,
+        "active":True,
+        "expiry_date":expiry,
+        "updated_at":now,
+    }
+
+    if amount is not None:
+        values["amount"]=amount
+    if duration_text is not None:
+        values["duration_text"]=duration_text
+
+    if not current or not current.get("active") or not current.get("expiry_date") or current["expiry_date"]<=now:
+        values["start_date"]=now
+
+    await c(SUBS).update_one(
+        {"owner_id":owner_id,"user_id":user_id},
+        {
+            "$set":values,
+            "$setOnInsert":{
+                "owner_id":owner_id,
+                "user_id":user_id,
+                "created_at":now,
+            },
+        },
+        upsert=True,
+    )
     return expiry
+
 async def expired_subscriptions(owner_id):
     now=datetime.now(timezone.utc); return await c(SUBS).find({"owner_id":owner_id,"active":True,"expiry_date":{"$lte":now}}).to_list(length=500)
 async def mark_expired(owner_id,user_id): await c(SUBS).update_one({"owner_id":owner_id,"user_id":user_id},{"$set":{"active":False,"updated_at":datetime.now(timezone.utc)}})
