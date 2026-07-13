@@ -22,7 +22,7 @@ from database.seller_data import (
 )
 
 logger=logging.getLogger(__name__)
-WELCOME_RUNTIME_VERSION="2026-07-13-complete-4"
+WELCOME_RUNTIME_VERSION="2026-07-13-support-fix-5"
 MAIN_BOT_USERNAME=os.getenv("MAIN_BOT_USERNAME","Local_supplier3_bot").lstrip("@")
 
 @dataclass
@@ -879,7 +879,34 @@ class SellerBotManager:
                 except ValueError: await update.effective_message.reply_text("❌ Send number"); return
                 await set_seller_setting(owner,"reminder_days",days); context.user_data.clear(); await update.effective_message.reply_text("✅ Updated",reply_markup=self.settings_menu()); return
         if context.user_data.get("waiting_support_message"):
-            context.user_data.clear(); await context.bot.send_message(owner,f"📩 Support message\nUser: {update.effective_user.id}\n{text}"); await update.effective_message.reply_text("✅ Sent to admin",reply_markup=self.main_menu())
+            context.user_data.clear()
+
+            await context.bot.send_message(
+                owner,
+                "📩 Support message\n"
+                f"User ID: {update.effective_user.id}\n"
+                f"Name: {update.effective_user.full_name}\n"
+                f"Username: @{update.effective_user.username if update.effective_user.username else 'Not set'}\n\n"
+                f"{text}",
+            )
+
+            await update.effective_message.reply_text(
+                "✅ Sent to admin"
+            )
+
+            record=await get_bot(owner)
+            settings=await ensure_seller_defaults(
+                owner,
+                (record or {}).get("bot_name","Subscription Bot"),
+            )
+
+            await self.send_welcome(
+                update.effective_message,
+                context,
+                settings,
+                update.effective_user,
+            )
+            return
 
     async def broadcast_message_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
