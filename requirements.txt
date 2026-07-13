@@ -7,3 +7,5 @@ aiohttp==3.12.14
 Flask==3.1.1
 gunicorn==23.0.0
 cryptography==44.0.2
+paytmchecksum==1.7.0
+pycryptodome==3.23.0

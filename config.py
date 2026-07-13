@@ -123,6 +123,13 @@ SECRET_KEY = os.getenv(
     "CHANGE_ME"
 )
 
+
+# ==========================================
+# Public Web URL / Payment Gateways
+# ==========================================
+
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+
 # ==========================================
 # Logging
 # ==========================================
