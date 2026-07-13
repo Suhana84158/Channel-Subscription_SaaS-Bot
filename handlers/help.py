@@ -35,7 +35,6 @@ async def build_help(user_id: int):
         "🆘 Seller Help & Commands\n\n"
         "/start - Open seller welcome menu\n"
         "/dashboard - Open seller dashboard\n"
-        "/seller - Open seller bot controls\n"
         "/mybots - View and manage your child bot\n"
         "/help - Show this guide\n\n"
         "Create a child bot:\n"

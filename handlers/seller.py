@@ -1,6 +1,6 @@
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import InvalidToken, TelegramError
-from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from database.seller_bots import delete_bot, get_bot, save_bot, set_bot_active
 from database.sellers import get_or_create_seller
@@ -34,21 +34,6 @@ def seller_keyboard(record=None):
         [InlineKeyboardButton("🏪 Seller Dashboard", callback_data="main_seller_dashboard")],
         [InlineKeyboardButton("⬅ Main Menu", callback_data="main_home")],
     ])
-
-
-async def seller_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await get_or_create_seller(update.effective_user)
-    record = await get_bot(update.effective_user.id)
-    text = "🏪 Seller Dashboard\n\n"
-    if record:
-        text += (
-            f"Bot: @{record.get('bot_username','-')}\n"
-            f"Status: {'✅ Active' if record.get('active') else '⏸ Paused'}\n"
-            f"Runtime: {record.get('runtime_status','unknown')}"
-        )
-    else:
-        text += "No child bot connected yet."
-    await update.effective_message.reply_text(text, reply_markup=seller_keyboard(record))
 
 
 async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -125,7 +110,6 @@ async def receive_seller_token(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def seller_handlers():
     return [
-        CommandHandler("seller",seller_command),
         CallbackQueryHandler(seller_callback,pattern=r"^seller_(connect|replace|my_bot|pause|resume|remove|upgrade_plan|current_plan|plan_history|buy_.*)$"),
         MessageHandler(filters.TEXT & ~filters.COMMAND,receive_seller_token),
     ]

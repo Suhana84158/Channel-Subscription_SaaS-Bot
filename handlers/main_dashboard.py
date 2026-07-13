@@ -55,23 +55,33 @@ def owner_dashboard_keyboard():
 
 
 def seller_dashboard_keyboard(record=None):
+    """Single seller control centre used by /dashboard."""
     rows = []
 
     if record:
+        active = bool(record.get("active"))
         rows.extend([
-            [InlineKeyboardButton("🤖 My Child Bot", callback_data="seller_my_bot")],
+            [InlineKeyboardButton("🤖 My Bot", callback_data="seller_my_bot")],
             [
                 InlineKeyboardButton(
-                    "⏸ Pause Bot" if record.get("active") else "▶ Resume Bot",
-                    callback_data="seller_pause" if record.get("active") else "seller_resume",
+                    "⏸ Pause Bot" if active else "▶️ Resume Bot",
+                    callback_data="seller_pause" if active else "seller_resume",
                 )
             ],
-            [InlineKeyboardButton("🔄 Replace Bot Token", callback_data="seller_replace")],
-            [InlineKeyboardButton("🗑 Remove Child Bot", callback_data="seller_remove")],
+            [InlineKeyboardButton("🔄 Replace Token", callback_data="seller_replace")],
+            [InlineKeyboardButton("🗑 Remove Bot", callback_data="seller_remove")],
+            [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
+            [InlineKeyboardButton("📊 View Current Plan", callback_data="seller_current_plan")],
+            [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
         ])
     else:
         rows.append([
             InlineKeyboardButton("➕ Create / Connect Child Bot", callback_data="seller_connect")
+        ])
+        rows.extend([
+            [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
+            [InlineKeyboardButton("📊 View Current Plan", callback_data="seller_current_plan")],
+            [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
         ])
 
     rows.extend([
