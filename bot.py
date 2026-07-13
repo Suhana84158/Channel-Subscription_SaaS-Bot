@@ -12,6 +12,7 @@ from database.admins import initialize_admins
 from database.settings import initialize_default_settings
 from database.seller_bots import initialize_seller_bot_indexes
 from database.seller_data import initialize_seller_data_indexes
+from database.seller_subscriptions import initialize_seller_subscription_indexes
 
 from handlers.start import start_command, start_callback_handler
 from handlers.help import help_handler, help_callback_handler
@@ -29,6 +30,7 @@ from handlers.admin import admin_handlers, receive_upi_qr
 from handlers.payment_approval import payment_approval_handlers
 from handlers.support import support_callback, support_reply_handler
 from handlers.seller import seller_handlers
+from handlers.seller_subscription_management import handlers as seller_subscription_management_handlers
 from services.bot_manager import bot_manager
 
 logger = logging.getLogger(__name__)
@@ -42,6 +44,7 @@ async def post_init(application: Application):
     await initialize_default_settings()
     await initialize_seller_bot_indexes()
     await initialize_seller_data_indexes()
+    await initialize_seller_subscription_indexes()
 
     start_scheduler()
     restored = await bot_manager.restore_active_bots()
@@ -74,6 +77,8 @@ def register_handlers(application: Application):
     application.add_handler(start_callback_handler())
     for handler in main_dashboard_handlers():
         application.add_handler(handler)
+    for handler in seller_subscription_management_handlers():
+        application.add_handler(handler, group=-5)
     application.add_handler(plans_handler())
     application.add_handler(profile_callback())
     application.add_handler(payment_handler())
