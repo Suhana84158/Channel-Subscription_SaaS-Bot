@@ -184,3 +184,65 @@ async def effective_plan(owner_id: int):
 async def limit_for(owner_id: int, key: str, default=0):
     plan, _ = await effective_plan(owner_id)
     return plan.get(key, default)
+
+
+def _limit_text(value):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return "Unlimited" if value < 0 else f"{value:,}"
+
+
+async def plan_limit_warning(owner_id: int):
+    plan, _ = await effective_plan(owner_id)
+    name = str(plan.get("name") or "Free").strip()
+    return (
+        f"⚠️ {name} Plan Limit Reached\n\n"
+        f"Your {name} plan supports:\n\n"
+        f"• {_limit_text(plan.get('bot_limit', 1))} Child Bot"
+        f"{'s' if int(plan.get('bot_limit', 1) or 0) != 1 else ''}\n"
+        f"• {_limit_text(plan.get('active_subscriber_limit', 25))} Active Subscribers\n"
+        f"• {_limit_text(plan.get('channel_limit', 1))} Channel/Group"
+        f"{'s' if int(plan.get('channel_limit', 1) or 0) != 1 else ''}\n"
+        f"• {_limit_text(plan.get('plan_limit', 2))} Subscription Plans\n\n"
+        "Upgrade your seller plan to continue."
+    )
+
+
+async def seller_usage(owner_id: int):
+    from database.seller_bots import get_bot
+    from database.seller_data import active_subscriptions, get_channels, get_plans
+    bot_count = 1 if await get_bot(owner_id) else 0
+    return {
+        "bot_count": bot_count,
+        "active_subscriber_count": len(await active_subscriptions(owner_id)),
+        "channel_count": len(await get_channels(owner_id)),
+        "plan_count": len(await get_plans(owner_id)),
+    }
+
+
+async def current_plan_text(owner_id: int):
+    plan, assignment = await effective_plan(owner_id)
+    usage = await seller_usage(owner_id)
+    def row(label, used, key):
+        return f"{label}: {used:,} / {_limit_text(plan.get(key, 0))}"
+    status = "✅ Within plan limits"
+    checks = [
+        (usage['bot_count'], plan.get('bot_limit', 1)),
+        (usage['active_subscriber_count'], plan.get('active_subscriber_limit', 25)),
+        (usage['channel_count'], plan.get('channel_limit', 1)),
+        (usage['plan_count'], plan.get('plan_limit', 2)),
+    ]
+    if any(int(limit) >= 0 and used >= int(limit) for used, limit in checks):
+        status = "⚠️ One or more plan limits reached"
+    return (
+        "📊 Current Seller Plan\n\n"
+        f"Plan: {plan.get('name', 'Free')}\n\n"
+        "Usage\n\n"
+        f"{row('🤖 Child Bots', usage['bot_count'], 'bot_limit')}\n"
+        f"{row('👥 Active Subscribers', usage['active_subscriber_count'], 'active_subscriber_limit')}\n"
+        f"{row('📢 Channels/Groups', usage['channel_count'], 'channel_limit')}\n"
+        f"{row('📦 Subscription Plans', usage['plan_count'], 'plan_limit')}\n\n"
+        f"Status: {status}"
+    )
