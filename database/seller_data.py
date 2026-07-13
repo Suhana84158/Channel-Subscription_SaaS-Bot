@@ -17,6 +17,8 @@ async def initialize_seller_data_indexes():
     await c(PAYMENTS).create_index([("owner_id",1),("status",1),("created_at",-1)])
     await c(SUBS).create_index([("owner_id",1),("user_id",1)], unique=True)
     await c(SUBS).create_index([("owner_id",1),("active",1),("expiry_date",1)])
+    await c(REFERRALS).create_index([("owner_id",1),("referred_user_id",1)], unique=True)
+    await c(REFERRALS).create_index([("owner_id",1),("referrer_user_id",1),("rewarded",1)])
 
 
 async def ensure_seller_defaults(owner_id:int, bot_name="Subscription Bot"):
@@ -35,6 +37,7 @@ async def ensure_seller_defaults(owner_id:int, bot_name="Subscription Bot"):
         "welcome_media_type":"",
         "welcome_media_file_id":"",
         "welcome_buttons":[],
+        "referral_reward_days":7,
         "created_at":now,
         "updated_at":now,
     }
@@ -55,7 +58,7 @@ async def ensure_seller_defaults(owner_id:int, bot_name="Subscription Bot"):
 
 async def get_seller_settings(owner_id:int): return await c(SETTINGS).find_one({"owner_id":owner_id}) or {}
 async def set_seller_setting(owner_id:int,key:str,value):
-    allowed={"bot_name","welcome_message","support_username","currency","timezone","reminder_days","upi_id","upi_name","upi_qr_file_id","welcome_media_type","welcome_media_file_id","welcome_buttons"}
+    allowed={"bot_name","welcome_message","support_username","currency","timezone","reminder_days","upi_id","upi_name","upi_qr_file_id","welcome_media_type","welcome_media_file_id","welcome_buttons","referral_reward_days"}
     if key not in allowed: raise ValueError("Unsupported setting")
     now=datetime.now(timezone.utc)
     await c(SETTINGS).update_one({"owner_id":owner_id},{"$set":{key:value,"updated_at":now},"$setOnInsert":{"owner_id":owner_id,"created_at":now}},upsert=True)
@@ -109,6 +112,67 @@ async def activate_subscription(owner_id,user_id,plan_name,duration_minutes):
 async def expired_subscriptions(owner_id):
     now=datetime.now(timezone.utc); return await c(SUBS).find({"owner_id":owner_id,"active":True,"expiry_date":{"$lte":now}}).to_list(length=500)
 async def mark_expired(owner_id,user_id): await c(SUBS).update_one({"owner_id":owner_id,"user_id":user_id},{"$set":{"active":False,"updated_at":datetime.now(timezone.utc)}})
+
+
+async def register_referral(owner_id:int, referrer_user_id:int, referred_user_id:int):
+    if not referrer_user_id or not referred_user_id or referrer_user_id == referred_user_id:
+        return {"created":False,"reason":"invalid"}
+
+    existing = await c(REFERRALS).find_one(
+        {"owner_id":owner_id,"referred_user_id":referred_user_id}
+    )
+    if existing:
+        return {"created":False,"reason":"already_registered","record":existing}
+
+    now = datetime.now(timezone.utc)
+    doc = {
+        "owner_id":owner_id,
+        "referrer_user_id":int(referrer_user_id),
+        "referred_user_id":int(referred_user_id),
+        "rewarded":False,
+        "created_at":now,
+        "updated_at":now,
+    }
+    await c(REFERRALS).insert_one(doc)
+    return {"created":True,"record":doc}
+
+
+async def count_successful_referrals(owner_id:int, referrer_user_id:int):
+    return await c(REFERRALS).count_documents(
+        {
+            "owner_id":owner_id,
+            "referrer_user_id":int(referrer_user_id),
+            "rewarded":True,
+        }
+    )
+
+
+async def count_all_referrals(owner_id:int, referrer_user_id:int):
+    return await c(REFERRALS).count_documents(
+        {
+            "owner_id":owner_id,
+            "referrer_user_id":int(referrer_user_id),
+        }
+    )
+
+
+async def mark_referral_rewarded(owner_id:int, referred_user_id:int):
+    now = datetime.now(timezone.utc)
+    return await c(REFERRALS).find_one_and_update(
+        {
+            "owner_id":owner_id,
+            "referred_user_id":int(referred_user_id),
+            "rewarded":False,
+        },
+        {
+            "$set":{
+                "rewarded":True,
+                "rewarded_at":now,
+                "updated_at":now,
+            }
+        },
+        return_document=True,
+    )
 
 
 async def stats(owner_id):
