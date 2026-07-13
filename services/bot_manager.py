@@ -22,7 +22,7 @@ from database.seller_data import (
 )
 
 logger=logging.getLogger(__name__)
-WELCOME_RUNTIME_VERSION="2026-07-13-support-fix-5"
+WELCOME_RUNTIME_VERSION="2026-07-13-support-photo-fix-6"
 MAIN_BOT_USERNAME=os.getenv("MAIN_BOT_USERNAME","Local_supplier3_bot").lstrip("@")
 
 @dataclass
@@ -969,6 +969,46 @@ class SellerBotManager:
 
     async def photo_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
+
+        if context.user_data.get("waiting_support_message"):
+            context.user_data.clear()
+
+            caption=update.effective_message.caption or ""
+            user=update.effective_user
+            admin_caption=(
+                "📩 Support photo\n"
+                f"User ID: {user.id}\n"
+                f"Name: {user.full_name}\n"
+                f"Username: @{user.username if user.username else 'Not set'}"
+            )
+
+            if caption:
+                admin_caption+=f"\n\n{caption}"
+
+            await context.bot.send_photo(
+                chat_id=owner,
+                photo=update.effective_message.photo[-1].file_id,
+                caption=admin_caption,
+            )
+
+            await update.effective_message.reply_text(
+                "✅ Photo sent to admin"
+            )
+
+            record=await get_bot(owner)
+            settings=await ensure_seller_defaults(
+                owner,
+                (record or {}).get("bot_name","Subscription Bot"),
+            )
+
+            await self.send_welcome(
+                update.effective_message,
+                context,
+                settings,
+                update.effective_user,
+            )
+            return
+
         if update.effective_user.id==owner and context.user_data.get("wait_qr"):
             await set_seller_setting(owner,"upi_qr_file_id",update.effective_message.photo[-1].file_id); context.user_data.clear(); await update.effective_message.reply_text("✅ QR updated",reply_markup=self.payment_menu()); return
         if context.user_data.get("waiting_child_screenshot"):
