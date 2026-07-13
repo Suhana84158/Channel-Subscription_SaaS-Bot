@@ -16,6 +16,8 @@ from database.seller_data import (
     ensure_seller_defaults, expired_subscriptions, get_channels, get_payment,
     get_plan, get_plans, get_seller_settings, get_subscription, get_user, mark_expired,
     payment_history, pending_payments, remove_channel, set_payment_status,
+    claim_payment_for_processing, finalize_processed_payment,
+    release_processing_payment,
     set_seller_setting, stats, update_plan, upsert_user,
     register_referral, count_all_referrals, count_successful_referrals,
     mark_referral_rewarded, get_user_by_username, set_user_ban,
@@ -23,7 +25,7 @@ from database.seller_data import (
 )
 
 logger=logging.getLogger(__name__)
-WELCOME_RUNTIME_VERSION="2026-07-13-help-command-fix-11"
+WELCOME_RUNTIME_VERSION="2026-07-13-renewal-safe-fix-12"
 MAIN_BOT_USERNAME=os.getenv("MAIN_BOT_USERNAME","Local_supplier3_bot").lstrip("@")
 
 @dataclass
@@ -1040,50 +1042,57 @@ class SellerBotManager:
             )
             return
         if a.startswith("a_pay_ok_") or a.startswith("a_pay_no_"):
-            approve=a.startswith("a_pay_ok_"); pid=a.replace("a_pay_ok_" if approve else "a_pay_no_",""); p=await get_payment(owner,pid)
-            if not p or not await set_payment_status(owner,pid,"approved" if approve else "rejected",owner): await q.edit_message_text("Already processed or missing"); return
-            if approve:
-                expiry=await activate_subscription(owner,p["user_id"],p["plan"],p["duration_minutes"],amount=p.get("amount"),duration_text=p.get("duration_text"))
+            approve=a.startswith("a_pay_ok_")
+            pid=a.replace(
+                "a_pay_ok_" if approve else "a_pay_no_",
+                "",
+                1,
+            )
+            p=await get_payment(owner,pid)
 
-                referral=await mark_referral_rewarded(owner,p["user_id"])
-                if referral:
-                    settings=await get_seller_settings(owner)
-                    reward_days=int(settings.get("referral_reward_days",7) or 0)
-                    referrer_id=int(referral["referrer_user_id"])
+            if not p:
+                await q.answer(
+                    "Payment not found",
+                    show_alert=True,
+                )
+                return
 
-                    if reward_days > 0:
-                        await activate_subscription(
-                            owner,
-                            referrer_id,
-                            "Referral Reward",
-                            reward_days * 1440,
-                        )
-                        try:
-                            await context.bot.send_message(
-                                referrer_id,
-                                "🎉 Referral Reward Added!\n"
-                                f"You received {reward_days} free day(s).",
-                            )
-                        except Exception:
-                            pass
+            current_status=p.get("status","pending")
 
-                links=[]
-                for ch in await get_channels(owner):
-                    try:
-                        inv=await context.bot.create_chat_invite_link(ch["chat_id"],member_limit=1); links.append(f"{ch.get('title')}: {inv.invite_link}")
-                    except Exception as exc: links.append(f"{ch.get('title')}: invite failed ({exc})")
-                await context.bot.send_message(p["user_id"],f"🎉 Payment approved\nPlan: {p['plan']}\nExpiry: {expiry}\n\n"+"\n".join(links))
-                approved_caption=await self.payment_details_caption(
+            if current_status in {"approved","rejected"}:
+                final_caption=await self.payment_details_caption(
                     owner,
                     p,
-                    status="approved",
-                    processed_by=owner,
+                    status=current_status,
+                    processed_by=p.get("admin_id"),
                 )
-                await q.edit_message_caption(
-                    caption=approved_caption,
-                    reply_markup=None,
+                try:
+                    await q.edit_message_caption(
+                        caption=final_caption,
+                        reply_markup=None,
+                    )
+                except BadRequest:
+                    pass
+                await q.answer(
+                    f"Already {current_status}",
+                    show_alert=True,
                 )
-            else:
+                return
+
+            if not approve:
+                changed=await set_payment_status(
+                    owner,
+                    pid,
+                    "rejected",
+                    owner,
+                )
+                if not changed:
+                    await q.answer(
+                        "Payment is already being processed",
+                        show_alert=True,
+                    )
+                    return
+
                 await context.bot.send_message(
                     p["user_id"],
                     "❌ Payment rejected",
@@ -1098,7 +1107,159 @@ class SellerBotManager:
                     caption=rejected_caption,
                     reply_markup=None,
                 )
+                return
+
+            claimed=await claim_payment_for_processing(
+                owner,
+                pid,
+                owner,
+            )
+            if not claimed:
+                latest=await get_payment(owner,pid)
+                latest_status=(latest or {}).get("status","unknown")
+                await q.answer(
+                    f"Payment status: {latest_status}",
+                    show_alert=True,
+                )
+                return
+
+            try:
+                expiry=await activate_subscription(
+                    owner,
+                    p["user_id"],
+                    p["plan"],
+                    p["duration_minutes"],
+                    amount=p.get("amount"),
+                    duration_text=p.get("duration_text"),
+                )
+
+                referral=await mark_referral_rewarded(
+                    owner,
+                    p["user_id"],
+                )
+                if referral:
+                    settings=await get_seller_settings(owner)
+                    reward_days=int(
+                        settings.get("referral_reward_days",7) or 0
+                    )
+                    referrer_id=int(referral["referrer_user_id"])
+
+                    if reward_days>0:
+                        await activate_subscription(
+                            owner,
+                            referrer_id,
+                            "Referral Reward",
+                            reward_days*1440,
+                            amount=0,
+                            duration_text=f"{reward_days}d",
+                        )
+                        try:
+                            await context.bot.send_message(
+                                referrer_id,
+                                "🎉 Referral Reward Added!\n"
+                                f"You received {reward_days} free day(s).",
+                            )
+                        except Exception:
+                            pass
+
+                links=[]
+                for ch in await get_channels(owner):
+                    try:
+                        inv=await context.bot.create_chat_invite_link(
+                            ch["chat_id"],
+                            member_limit=1,
+                        )
+                        links.append(
+                            f"{ch.get('title')}: {inv.invite_link}"
+                        )
+                    except Exception as exc:
+                        links.append(
+                            f"{ch.get('title')}: invite failed ({exc})"
+                        )
+
+                finalized=await finalize_processed_payment(
+                    owner,
+                    pid,
+                    "approved",
+                    owner,
+                )
+                if not finalized:
+                    raise RuntimeError(
+                        "Could not finalize payment status"
+                    )
+
+                expiry_text=self.format_dt(expiry)
+                await context.bot.send_message(
+                    p["user_id"],
+                    "🎉 Payment approved\n"
+                    f"Plan: {p['plan']}\n"
+                    f"Added validity: {p.get('duration_text') or '-'}\n"
+                    f"New expiry: {expiry_text}\n\n"
+                    + "\n".join(links),
+                )
+
+                approved_caption=await self.payment_details_caption(
+                    owner,
+                    p,
+                    status="approved",
+                    processed_by=owner,
+                )
+                approved_caption+=(
+                    "\n"
+                    f"📅 New Expiry: {expiry_text}\n"
+                    "➕ Remaining validity was preserved and "
+                    "the new plan duration was added."
+                )
+
+                await q.edit_message_caption(
+                    caption=approved_caption,
+                    reply_markup=None,
+                )
+
+            except Exception as exc:
+                logger.exception(
+                    "Payment approval failed owner=%s payment=%s",
+                    owner,
+                    pid,
+                )
+                await release_processing_payment(
+                    owner,
+                    pid,
+                    str(exc),
+                )
+                await q.answer(
+                    "Approval failed. Payment is still pending; "
+                    "you can press Approve again.",
+                    show_alert=True,
+                )
+                try:
+                    await q.edit_message_caption(
+                        caption=(
+                            await self.payment_details_caption(
+                                owner,
+                                p,
+                                status="pending",
+                            )
+                            + "\n\n⚠️ Last approval attempt failed. "
+                            "Payment was kept pending safely."
+                        ),
+                        reply_markup=InlineKeyboardMarkup([
+                            [
+                                InlineKeyboardButton(
+                                    "✅ Approve",
+                                    callback_data=f"a_pay_ok_{pid}",
+                                ),
+                                InlineKeyboardButton(
+                                    "❌ Reject",
+                                    callback_data=f"a_pay_no_{pid}",
+                                ),
+                            ]
+                        ]),
+                    )
+                except Exception:
+                    pass
             return
+
         if a=="a_history":
             ps=await payment_history(owner); text="📜 Payment History\n\n"+"\n".join(f"{'✅' if p['status']=='approved' else '❌'} {p['user_id']} ₹{p['amount']:g} {p['plan']}" for p in ps[:20]); await q.edit_message_text(text,reply_markup=self.back()); return
         if a=="a_broadcast": context.user_data.clear(); context.user_data["wait_broadcast"]=True; await q.edit_message_text("📢 Send any one message to broadcast.\n\nSupported: text, photo with caption, video, document, audio, voice, GIF, sticker and forwarded messages.",reply_markup=self.back()); return
