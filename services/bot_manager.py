@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Dict, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -19,6 +19,7 @@ from database.seller_data import (
 )
 
 logger=logging.getLogger(__name__)
+WELCOME_RUNTIME_VERSION="2026-07-13-hotfix-2"
 
 @dataclass
 class RunningSellerBot:
@@ -94,7 +95,8 @@ class SellerBotManager:
 
     @staticmethod
     def personalize(text,user,bot_name="Subscription Bot"):
-        now=datetime.now()
+        from datetime import datetime as _datetime
+        now=_datetime.now()
         values={
             "{ID}":str(user.id),
             "{NAME}":user.first_name or "",
@@ -215,50 +217,204 @@ class SellerBotManager:
     def owner(self,context): return int(context.application.bot_data["seller_owner_id"])
     async def auth(self,update,context): return update.effective_user.id==self.owner(context)
 
+    async def safe_query_message(self,q,text,reply_markup=None):
+        """Edit text messages; reply with a new message when the button is on media."""
+        try:
+            return await q.edit_message_text(
+                text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+        except BadRequest as exc:
+            error=str(exc).lower()
+            if (
+                "there is no text in the message to edit" in error
+                or "message can't be edited" in error
+                or "message is not modified" in error
+            ):
+                if "message is not modified" in error:
+                    return None
+                return await q.message.reply_text(
+                    text,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                )
+            raise
+
     async def child_start(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
-        owner=self.owner(context); await upsert_user(owner,update.effective_user)
-        record=await get_bot(owner); settings=await ensure_seller_defaults(owner,(record or {}).get("bot_name","Subscription Bot"))
-        await self.send_welcome(update.effective_message,context,settings,update.effective_user)
+        owner=self.owner(context)
+
+        try:
+            await upsert_user(owner,update.effective_user)
+            record=await get_bot(owner)
+            settings=await ensure_seller_defaults(
+                owner,
+                (record or {}).get("bot_name","Subscription Bot"),
+            )
+            await self.send_welcome(
+                update.effective_message,
+                context,
+                settings,
+                update.effective_user,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Child /start failed owner=%s runtime=%s",
+                owner,
+                WELCOME_RUNTIME_VERSION,
+            )
+            await update.effective_message.reply_text(
+                "❌ Welcome message could not be sent.\n"
+                f"Runtime: {WELCOME_RUNTIME_VERSION}\n"
+                f"Error: {str(exc)[:250]}"
+            )
 
     async def admin(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         if not await self.auth(update,context): await update.effective_message.reply_text("❌ Not authorized"); return
         context.user_data.clear(); await update.effective_message.reply_text("🛠 Seller Admin Panel",reply_markup=self.admin_menu())
 
     async def show_plans(self,q,owner,select=False):
-        plans=await get_plans(owner,True); settings=await get_seller_settings(owner); currency=settings.get("currency","INR")
-        if not plans: await q.edit_message_text("📋 No plans available.",reply_markup=self.main_menu()); return
-        kb=[]; lines=["📋 Available Plans\n"]
+        plans=await get_plans(owner,True)
+        settings=await get_seller_settings(owner)
+        currency=settings.get("currency","INR")
+
+        if not plans:
+            await self.safe_query_message(
+                q,
+                "📋 No plans available.",
+                self.main_menu(),
+            )
+            return
+
+        kb=[]
+        lines=["📋 Available Plans\n"]
+
         for p in plans:
-            lines.append(f"• {p['name']} — {p['duration_text']} — {currency} {p['price']:g}")
-            if select: kb.append([InlineKeyboardButton(f"Buy {p['name']} - {currency} {p['price']:g}",callback_data=f"c_select_{p['plan_id']}")])
-        kb.append([InlineKeyboardButton("⬅ Back",callback_data="c_home")])
-        await q.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(kb) if select else self.main_menu())
+            lines.append(
+                f"• {p['name']} — {p['duration_text']} — "
+                f"{currency} {p['price']:g}"
+            )
+            if select:
+                kb.append([
+                    InlineKeyboardButton(
+                        f"Buy {p['name']} - {currency} {p['price']:g}",
+                        callback_data=f"c_select_{p['plan_id']}",
+                    )
+                ])
+
+        kb.append([
+            InlineKeyboardButton("⬅ Back",callback_data="c_home")
+        ])
+
+        await self.safe_query_message(
+            q,
+            "\n".join(lines),
+            InlineKeyboardMarkup(kb) if select else self.main_menu(),
+        )
 
     async def child_callback(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
-        q=update.callback_query; await q.answer(); owner=self.owner(context); action=q.data
-        if action=="c_home": await q.edit_message_text("Choose an option:",reply_markup=self.main_menu()); return
-        if action=="c_plans": await self.show_plans(q,owner,False); return
-        if action in {"c_buy","c_renew"}: await self.show_plans(q,owner,True); return
-        if action.startswith("c_select_"):
-            plan=await get_plan(owner,action.replace("c_select_",""));
-            if not plan: await q.answer("Plan not found",show_alert=True); return
-            context.user_data["selected_child_plan"]=plan
-            s=await get_seller_settings(owner); text=(f"💳 Payment\n\nPlan: {plan['name']}\nAmount: {s.get('currency','INR')} {plan['price']:g}\nDuration: {plan['duration_text']}\n\nUPI Name: {s.get('upi_name') or 'Not Set'}\nUPI ID: {s.get('upi_id') or 'Not Set'}")
-            kb=InlineKeyboardMarkup([[InlineKeyboardButton("📤 Upload Screenshot",callback_data="c_upload")],[InlineKeyboardButton("⬅ Back",callback_data="c_buy")]])
-            if s.get("upi_qr_file_id"): await q.message.reply_photo(s["upi_qr_file_id"],caption=text,reply_markup=kb)
-            else: await q.edit_message_text(text,reply_markup=kb)
+        q=update.callback_query
+        await q.answer()
+        owner=self.owner(context)
+        action=q.data
+
+        if action=="c_home":
+            await self.safe_query_message(
+                q,
+                "Choose an option:",
+                self.main_menu(),
+            )
             return
-        if action=="c_upload": context.user_data["waiting_child_screenshot"]=True; await q.message.reply_text("📷 Send payment screenshot."); return
+
+        if action=="c_plans":
+            await self.show_plans(q,owner,False)
+            return
+
+        if action in {"c_buy","c_renew"}:
+            await self.show_plans(q,owner,True)
+            return
+
+        if action.startswith("c_select_"):
+            plan=await get_plan(owner,action.replace("c_select_",""))
+            if not plan:
+                await q.answer("Plan not found",show_alert=True)
+                return
+
+            context.user_data["selected_child_plan"]=plan
+            s=await get_seller_settings(owner)
+
+            text=(
+                "💳 Payment\n\n"
+                f"Plan: {plan['name']}\n"
+                f"Amount: {s.get('currency','INR')} {plan['price']:g}\n"
+                f"Duration: {plan['duration_text']}\n\n"
+                f"UPI Name: {s.get('upi_name') or 'Not Set'}\n"
+                f"UPI ID: {s.get('upi_id') or 'Not Set'}"
+            )
+
+            kb=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "📤 Upload Screenshot",
+                    callback_data="c_upload",
+                )],
+                [InlineKeyboardButton(
+                    "⬅ Back",
+                    callback_data="c_buy",
+                )],
+            ])
+
+            if s.get("upi_qr_file_id"):
+                await q.message.reply_photo(
+                    s["upi_qr_file_id"],
+                    caption=text,
+                    reply_markup=kb,
+                )
+            else:
+                await self.safe_query_message(q,text,kb)
+            return
+
+        if action=="c_upload":
+            context.user_data["waiting_child_screenshot"]=True
+            await q.message.reply_text("📷 Send payment screenshot.")
+            return
+
         if action=="c_profile":
             sub=await get_subscription(owner,q.from_user.id)
-            if not sub: text="👤 No active subscription."
+
+            if not sub:
+                text="👤 No active subscription."
             else:
-                exp=sub.get("expiry_date"); text=f"👤 Profile\n\nPlan: {sub.get('plan')}\nStatus: {'Active' if sub.get('active') else 'Expired'}\nExpiry: {exp}"
-            await q.edit_message_text(text,reply_markup=self.main_menu()); return
+                exp=sub.get("expiry_date")
+                text=(
+                    "👤 Profile\n\n"
+                    f"Plan: {sub.get('plan')}\n"
+                    f"Status: {'Active' if sub.get('active') else 'Expired'}\n"
+                    f"Expiry: {exp}"
+                )
+
+            await self.safe_query_message(q,text,self.main_menu())
+            return
+
         if action=="c_referral":
-            me=await context.bot.get_me(); await q.edit_message_text(f"🎁 Referral link\nhttps://t.me/{me.username}?start=ref_{q.from_user.id}",reply_markup=self.main_menu()); return
+            me=await context.bot.get_me()
+            await self.safe_query_message(
+                q,
+                "🎁 Referral link\n"
+                f"https://t.me/{me.username}?start=ref_{q.from_user.id}",
+                self.main_menu(),
+            )
+            return
+
         if action=="c_support":
-            context.user_data["waiting_support_message"]=True; await q.edit_message_text("📞 Send your message for admin.",reply_markup=self.back("c_home")); return
+            context.user_data["waiting_support_message"]=True
+            await self.safe_query_message(
+                q,
+                "📞 Send your message for admin.",
+                self.back("c_home"),
+            )
+            return
+
+        await q.answer("Button action not found",show_alert=True)
 
     async def admin_callback(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         q=update.callback_query; await q.answer(); owner=self.owner(context)
@@ -308,22 +464,142 @@ class SellerBotManager:
                 "plans":("📋 Plans","c_plans"),"buy":("💳 Buy","c_buy"),"profile":("👤 My Profile","c_profile"),
                 "renew":("🔄 Renew","c_renew"),"referral":("🎁 Referral","c_referral"),"support":("📞 Support","c_support"),"home":("🏠 Main Menu","c_home")}
             title,callback=config[feature]
-            s=await get_seller_settings(owner); rows=s.get("welcome_buttons") or []
-            rows.append([{"text":title,"type":"callback","value":callback}])
-            await set_seller_setting(owner,"welcome_buttons",rows)
-            await q.edit_message_text(f"✅ {title} button added.",reply_markup=self.welcome_buttons_menu()); return
+            s=await get_seller_settings(owner)
+            rows=s.get("welcome_buttons") or []
+
+            already_exists=any(
+                item.get("type")=="callback"
+                and item.get("value")==callback
+                for row in rows
+                for item in row
+            )
+
+            if already_exists:
+                await q.edit_message_text(
+                    f"ℹ️ {title} button already exists.",
+                    reply_markup=self.welcome_buttons_menu(),
+                )
+                return
+
+            rows.append([
+                {
+                    "text":title,
+                    "type":"callback",
+                    "value":callback,
+                }
+            ])
+
+            await set_seller_setting(
+                owner,
+                "welcome_buttons",
+                rows,
+            )
+
+            await q.edit_message_text(
+                f"✅ {title} button added.",
+                reply_markup=self.welcome_buttons_menu(),
+            )
+            return
         if a=="a_welcome_manual":
             context.user_data.clear(); context.user_data["wait_welcome_buttons"]=True
             await q.edit_message_text("✍ Send buttons in this format:\n\nSingle button:\nJoin Channel - https://t.me/example\n\nSame row:\nPlans - feature:plans && Buy - feature:buy\n\nNew line = new row.\nFeatures: plans, buy, profile, renew, referral, support, home",reply_markup=self.back("a_welcome_buttons")); return
         if a=="a_welcome_see_buttons":
-            s=await get_seller_settings(owner); rows=s.get("welcome_buttons") or []
+            s=await get_seller_settings(owner)
+            rows=s.get("welcome_buttons") or []
+
+            if not rows:
+                await q.edit_message_text(
+                    "No buttons set.",
+                    reply_markup=self.welcome_buttons_menu(),
+                )
+                return
+
             lines=["🔗 Current Buttons\n"]
-            for r,row in enumerate(rows,1):
-                items=[]
-                for item in row:
-                    items.append(f"{item.get('text','Button')} → {item.get('value','')}")
-                lines.append(f"Row {r}: "+" | ".join(items))
-            await q.edit_message_text("\n".join(lines) if rows else "No buttons set.",reply_markup=self.welcome_buttons_menu()); return
+            kb=[]
+
+            for row_index,row in enumerate(rows):
+                names=[]
+
+                for button_index,item in enumerate(row):
+                    name=item.get("text","Button")
+                    names.append(name)
+                    kb.append([
+                        InlineKeyboardButton(
+                            f"🗑 Delete: {name[:28]}",
+                            callback_data=(
+                                f"a_welcome_delbtn_"
+                                f"{row_index}_{button_index}"
+                            ),
+                        )
+                    ])
+
+                lines.append(
+                    f"Row {row_index + 1}: "
+                    + " | ".join(names)
+                )
+
+            kb.append([
+                InlineKeyboardButton(
+                    "➕ Add More",
+                    callback_data="a_welcome_buttons",
+                )
+            ])
+            kb.append([
+                InlineKeyboardButton(
+                    "⬅ Back",
+                    callback_data="a_welcome_buttons",
+                )
+            ])
+
+            await q.edit_message_text(
+                "\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+            return
+
+        if a.startswith("a_welcome_delbtn_"):
+            try:
+                position=a.replace(
+                    "a_welcome_delbtn_",
+                    "",
+                )
+                row_index,button_index=[
+                    int(value)
+                    for value in position.split("_",1)
+                ]
+
+                s=await get_seller_settings(owner)
+                rows=s.get("welcome_buttons") or []
+
+                if row_index>=len(rows) or button_index>=len(rows[row_index]):
+                    raise IndexError
+
+                deleted_name=rows[row_index][button_index].get(
+                    "text",
+                    "Button",
+                )
+
+                del rows[row_index][button_index]
+
+                if not rows[row_index]:
+                    del rows[row_index]
+
+                await set_seller_setting(
+                    owner,
+                    "welcome_buttons",
+                    rows,
+                )
+
+                await q.edit_message_text(
+                    f"✅ {deleted_name} button deleted.",
+                    reply_markup=self.welcome_buttons_menu(),
+                )
+            except (ValueError,IndexError):
+                await q.edit_message_text(
+                    "❌ Button not found. Open Current Buttons again.",
+                    reply_markup=self.welcome_buttons_menu(),
+                )
+            return
         if a=="a_welcome_remove_text": await set_seller_setting(owner,"welcome_message",""); await q.edit_message_text("✅ Welcome text removed.",reply_markup=self.welcome_menu()); return
         if a=="a_welcome_remove_media":
             await set_seller_setting(owner,"welcome_media_type",""); await set_seller_setting(owner,"welcome_media_file_id","")
@@ -511,7 +787,16 @@ class SellerBotManager:
 
     def build_app(self,token,owner):
         app=Application.builder().token(token).build(); app.bot_data["seller_owner_id"]=owner
-        app.add_handler(CommandHandler("start",self.child_start)); app.add_handler(CommandHandler("admin",self.admin))
+        app.add_handler(CommandHandler("start",self.child_start))
+        app.add_handler(CommandHandler("admin",self.admin))
+        app.add_handler(
+            CommandHandler(
+                "version",
+                lambda update,context: update.effective_message.reply_text(
+                    f"Runtime: {WELCOME_RUNTIME_VERSION}"
+                ),
+            )
+        )
         app.add_handler(CallbackQueryHandler(self.child_callback,pattern=r"^c_")); app.add_handler(CallbackQueryHandler(self.admin_callback,pattern=r"^a_"))
         app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,self.broadcast_message_handler),group=-3)
         app.add_handler(MessageHandler(filters.FORWARDED,self.forward_handler),group=-2)
