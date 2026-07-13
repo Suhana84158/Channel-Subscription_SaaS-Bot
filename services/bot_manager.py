@@ -10,7 +10,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Conflict, InvalidToken, TelegramError
 from telegram.ext import Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from database.seller_subscriptions import effective_plan
+from database.seller_subscriptions import effective_plan, plan_limit_warning, current_plan_text, get_config
 from database.seller_bots import get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status
 from database.seller_data import (
     activate_subscription, active_subscriptions, add_channel, create_payment, create_plan, delete_plan,
@@ -58,6 +58,14 @@ class SellerBotManager:
         ])
     @staticmethod
     def back(target="a_home"): return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back",callback_data=target)]])
+    @staticmethod
+    def limit_keyboard(back_target="a_home"):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("💎 Upgrade Plan", callback_data="seller_upgrade_plan")],
+            [InlineKeyboardButton("📊 View Current Plan", callback_data="seller_current_plan")],
+            [InlineKeyboardButton("❌ Close", callback_data=back_target)],
+        ])
+
     @staticmethod
     def plans_admin_menu():
         return InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add Plan",callback_data="a_plan_add")],[InlineKeyboardButton("📋 View Plans",callback_data="a_plan_list")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
@@ -563,6 +571,18 @@ class SellerBotManager:
         await q.answer()
         owner=self.owner(context)
         action=q.data
+        if action=="seller_current_plan":
+            await q.edit_message_text(await current_plan_text(owner), reply_markup=self.back("a_home")); return
+        if action=="seller_upgrade_plan":
+            cfg=await get_config()
+            plans=[p for p in cfg.get("paid_plans",[]) if p.get("active",True)]
+            if not plans:
+                await q.edit_message_text("No paid seller plans are available right now.", reply_markup=self.back("a_home")); return
+            lines=["💎 Upgrade Seller Plan", ""]
+            for p in plans:
+                lines.append(f"• {p.get('name','Plan')} — ₹{p.get('price',0)} / {p.get('duration_days',30)} days")
+            lines += ["", "Contact the SaaS owner to activate a plan."]
+            await q.edit_message_text("\n".join(lines), reply_markup=self.back("a_home")); return
         back_keyboard=self.back("c_home")
 
         if action=="c_home":
@@ -834,7 +854,7 @@ class SellerBotManager:
             existing=len(await get_plans(owner))
             limit=int(plan_cfg.get("plan_limit",2))
             if limit>=0 and existing>=limit:
-                await q.edit_message_text(f"⚠️ Plan limit reached ({limit}). Upgrade seller subscription to add more plans.",reply_markup=self.back("a_plans")); return
+                await q.edit_message_text(await plan_limit_warning(owner), reply_markup=self.limit_keyboard("a_plans")); return
             context.user_data.clear(); context.user_data["wait_plan_add"]=True; await q.edit_message_text("Send: Plan Name | Duration | Price\nExample: Premium | 30d | 199",reply_markup=self.back("a_plans")); return
         if a=="a_plan_list":
             plans=await get_plans(owner); lines=["📋 Plans\n"]; kb=[]
@@ -853,7 +873,7 @@ class SellerBotManager:
             existing=len(await get_channels(owner))
             limit=int(plan_cfg.get("channel_limit",1))
             if limit>=0 and existing>=limit:
-                await q.edit_message_text(f"⚠️ Channel/group limit reached ({limit}). Upgrade seller subscription to add more.",reply_markup=self.back("a_channels")); return
+                await q.edit_message_text(await plan_limit_warning(owner), reply_markup=self.limit_keyboard("a_channels")); return
             context.user_data.clear(); context.user_data["wait_channel"]=True; await q.edit_message_text("Forward a channel/group message.\nIf private group is not detected, send:\n-1001234567890 | Group Name",reply_markup=self.back("a_channels")); return
         if a=="a_channel_list":
             channels=await get_channels(owner); lines=["📋 Channels / Groups\n"]; kb=[]
@@ -1242,7 +1262,8 @@ class SellerBotManager:
                 sub_limit=int(plan_cfg.get("active_subscriber_limit",25))
                 if not already_active and sub_limit>=0 and len(active_now)>=sub_limit:
                     await release_processing_payment(owner,pid,"seller subscriber limit reached")
-                    await q.answer(f"Active subscriber limit reached ({sub_limit})",show_alert=True)
+                    await q.answer("Seller plan limit reached",show_alert=True)
+                    await context.bot.send_message(owner, await plan_limit_warning(owner), reply_markup=self.limit_keyboard("a_pending"))
                     return
                 expiry=await activate_subscription(
                     owner,
@@ -1431,7 +1452,7 @@ class SellerBotManager:
             already_active=any(int(x.get("user_id"))==user_id for x in active_now)
             sub_limit=int(plan_cfg.get("active_subscriber_limit",25))
             if not already_active and sub_limit>=0 and len(active_now)>=sub_limit:
-                await q.edit_message_text(f"⚠️ Active subscriber limit reached ({sub_limit}). Upgrade seller subscription.",reply_markup=self.back(f"a_user_view_{user_id}")); return
+                await q.edit_message_text(await plan_limit_warning(owner), reply_markup=self.limit_keyboard(f"a_user_view_{user_id}")); return
             await activate_subscription(
                 owner,user_id,plan["name"],plan["duration_minutes"],
                 amount=plan.get("price"),
