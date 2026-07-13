@@ -5,6 +5,7 @@ from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, fil
 
 from config import ADMIN_IDS
 from database.admins import is_admin
+from database.platform_features import reserve_payment_fingerprint, audit
 from database.seller_subscriptions import (
     assign_plan_with_history, create_plan_request, create_seller_payment,
     current_plan_text, decide_seller_payment, delete_paid_plan, get_config,
@@ -129,7 +130,14 @@ async def receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def seller_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     plan_id=context.user_data.get("seller_payment_plan")
     if not plan_id: return
-    doc=await create_seller_payment(update.effective_user.id,plan_id,update.effective_message.photo[-1].file_id,context.user_data.get("seller_request_type","upgrade"))
+    photo=update.effective_message.photo[-1]
+    fingerprint=getattr(photo,"file_unique_id","")
+    if not await reserve_payment_fingerprint("seller",0,fingerprint,update.effective_user.id):
+        context.user_data.clear()
+        await update.effective_message.reply_text("⚠️ This payment screenshot was already submitted. Please send a new genuine payment proof.")
+        return
+    doc=await create_seller_payment(update.effective_user.id,plan_id,photo.file_id,context.user_data.get("seller_request_type","upgrade"))
+    await audit("seller_plan_payment_submitted",update.effective_user.id,update.effective_user.id,{"payment_id":doc.get("payment_id")})
     context.user_data.clear()
     await update.effective_message.reply_text(f"✅ Payment submitted. ID: {doc['payment_id']}\nOwner approval pending.")
     for aid in ADMIN_IDS:

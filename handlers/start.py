@@ -10,7 +10,6 @@ from database.users import get_or_create_user
 def owner_welcome_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👑 Owner Dashboard", callback_data="main_owner_dashboard")],
-        [InlineKeyboardButton("🛡 Owner Admin Panel", callback_data="admin_home")],
         [
             InlineKeyboardButton("👥 Users", callback_data="admin_users"),
             InlineKeyboardButton("🏪 Sellers", callback_data="main_owner_sellers"),

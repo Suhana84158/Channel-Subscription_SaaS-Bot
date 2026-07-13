@@ -64,7 +64,7 @@ async def show_pending_payments(update: Update, context: ContextTypes.DEFAULT_TY
         ])
 
     keyboard.append([
-        InlineKeyboardButton("⬅ Back", callback_data="admin_panel")
+        InlineKeyboardButton("⬅ Back", callback_data="main_owner_dashboard")
     ])
 
     await query.edit_message_text(
@@ -104,7 +104,7 @@ async def show_payment_history(update: Update, context: ContextTypes.DEFAULT_TYP
         [
             InlineKeyboardButton(
                 "⬅ Back",
-                callback_data="admin_panel",
+                callback_data="main_owner_dashboard",
             )
         ]
     ])

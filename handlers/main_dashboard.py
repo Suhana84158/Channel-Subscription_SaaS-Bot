@@ -40,6 +40,15 @@ def owner_dashboard_keyboard():
             InlineKeyboardButton("⚙ Settings", callback_data="admin_bot_settings"),
         ],
         [InlineKeyboardButton("💼 Subscription Management", callback_data="sub_mgmt_home")],
+        [
+            InlineKeyboardButton("🧰 Seller Management+", callback_data="owner_seller_management_plus"),
+            InlineKeyboardButton("🩺 Health Monitoring", callback_data="owner_health"),
+        ],
+        [
+            InlineKeyboardButton("💾 Backup & Export", callback_data="owner_backup_export"),
+            InlineKeyboardButton("🧾 Audit Logs", callback_data="owner_audit"),
+        ],
+        [InlineKeyboardButton("📜 Terms & Policy", callback_data="owner_terms_policy")],
         [InlineKeyboardButton("🆘 Owner Help", callback_data="main_help")],
         home_button(),
     ])
