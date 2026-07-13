@@ -23,7 +23,7 @@ from database.seller_data import (
 )
 
 logger=logging.getLogger(__name__)
-WELCOME_RUNTIME_VERSION="2026-07-13-expiry-message-fix-10"
+WELCOME_RUNTIME_VERSION="2026-07-13-help-command-fix-11"
 MAIN_BOT_USERNAME=os.getenv("MAIN_BOT_USERNAME","Local_supplier3_bot").lstrip("@")
 
 @dataclass
@@ -440,6 +440,67 @@ class SellerBotManager:
                 f"Runtime: {WELCOME_RUNTIME_VERSION}\n"
                 f"Error: {str(exc)[:250]}"
             )
+
+    async def help_command(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
+        owner=self.owner(context)
+        is_owner=update.effective_user.id==owner
+
+        user_text=(
+            "🆘 Child Bot Help\n\n"
+            "👤 User Commands\n"
+            "/start - Open the welcome menu\n"
+            "/help - Show this help guide\n"
+            "/version - Check deployed bot version\n\n"
+            "📋 Plans\n"
+            "See all available plans and tap Buy to choose one.\n\n"
+            "💳 Buy / 🔄 Renew\n"
+            "Choose a plan, check UPI details, pay, then upload the payment screenshot.\n\n"
+            "👤 My Profile\n"
+            "See your user ID, referral details, plan, start date, expiry and remaining time.\n\n"
+            "🎁 Referral\n"
+            "Open your referral link and share it. Free reward days are added after a referred user completes an approved payment.\n\n"
+            "📞 Support\n"
+            "Send text or a photo to the seller/admin. After sending, the welcome menu opens again.\n\n"
+            "⏰ Expiry\n"
+            "When your plan expires, access is removed automatically. Use Renew Plan to continue."
+        )
+
+        if not is_owner:
+            await update.effective_message.reply_text(user_text)
+            return
+
+        admin_text=(
+            user_text
+            + "\n\n━━━━━━━━━━━━━━━━━━━━\n"
+            "🛠 Seller Admin Help\n\n"
+            "/admin - Open the seller admin panel\n\n"
+            "📦 Manage Plans\n"
+            "Add: Plan Name | Duration | Price\n"
+            "Example: Premium | 30d | 199\n"
+            "You can view, edit, enable, disable and delete plans.\n\n"
+            "📢 Channels / Groups\n"
+            "Forward a message from the channel/group, or send:\n"
+            "-1001234567890 | Group Name\n"
+            "The child bot must be admin with invite and ban permissions.\n\n"
+            "💳 Payment Settings\n"
+            "Set UPI ID, UPI name and QR image.\n\n"
+            "📨 Pending Payments\n"
+            "Open a screenshot and Approve or Reject it. Payment ID and user details remain visible after processing.\n\n"
+            "👥 User Management\n"
+            "Search by User ID or @username. Give, extend or remove subscriptions, and ban/unban users.\n\n"
+            "💬 Welcome Message\n"
+            "Edit text, media and buttons, then use Preview.\n"
+            "Button format:\n"
+            "Plans - feature:plans && Buy - feature:buy\n"
+            "Channel - https://t.me/example\n\n"
+            "📢 Broadcast\n"
+            "Send one text, photo, video, document, audio, voice, GIF, sticker or forwarded message.\n\n"
+            "🎁 Referral Settings\n"
+            "Set free reward days for each successful referral.\n\n"
+            "📊 Statistics\n"
+            "See users, plans, channels, pending payments and revenue."
+        )
+        await update.effective_message.reply_text(admin_text)
 
     async def admin(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         if not await self.auth(update,context): await update.effective_message.reply_text("❌ Not authorized"); return
@@ -1485,6 +1546,7 @@ class SellerBotManager:
     def build_app(self,token,owner):
         app=Application.builder().token(token).build(); app.bot_data["seller_owner_id"]=owner
         app.add_handler(CommandHandler("start",self.child_start))
+        app.add_handler(CommandHandler("help",self.help_command))
         app.add_handler(CommandHandler("admin",self.admin))
         app.add_handler(
             CommandHandler(
