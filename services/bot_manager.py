@@ -23,7 +23,7 @@ from database.seller_data import (
 )
 
 logger=logging.getLogger(__name__)
-WELCOME_RUNTIME_VERSION="2026-07-13-payment-profile-fix-9"
+WELCOME_RUNTIME_VERSION="2026-07-13-expiry-message-fix-10"
 MAIN_BOT_USERNAME=os.getenv("MAIN_BOT_USERNAME","Local_supplier3_bot").lstrip("@")
 
 @dataclass
@@ -1436,15 +1436,51 @@ class SellerBotManager:
 
     async def expiry_job(self,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
+
         for sub in await expired_subscriptions(owner):
             uid=sub["user_id"]
+
             for ch in await get_channels(owner):
                 try:
-                    await context.bot.ban_chat_member(ch["chat_id"],uid); await context.bot.unban_chat_member(ch["chat_id"],uid,only_if_banned=True)
-                except Exception: pass
+                    await context.bot.ban_chat_member(
+                        ch["chat_id"],
+                        uid,
+                    )
+                    await context.bot.unban_chat_member(
+                        ch["chat_id"],
+                        uid,
+                        only_if_banned=True,
+                    )
+                except Exception:
+                    pass
+
             await mark_expired(owner,uid)
-            try: await context.bot.send_message(uid,"⏰ Subscription expired. Access removed.")
-            except Exception: pass
+
+            keyboard=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔄 Renew Plan",
+                        callback_data="c_renew",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "👤 My Profile",
+                        callback_data="c_profile",
+                    )
+                ],
+            ])
+
+            try:
+                await context.bot.send_message(
+                    uid,
+                    "⏰ Your subscription has expired.\n\n"
+                    "Access to premium channel/group has been removed.\n\n"
+                    "Use 🔄 Renew Plan to continue.",
+                    reply_markup=keyboard,
+                )
+            except Exception:
+                pass
 
     def build_app(self,token,owner):
         app=Application.builder().token(token).build(); app.bot_data["seller_owner_id"]=owner
