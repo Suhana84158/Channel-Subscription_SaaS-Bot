@@ -4,7 +4,7 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, Mes
 
 from database.seller_bots import delete_bot, get_bot, save_bot, set_bot_active
 from database.sellers import get_or_create_seller
-from database.seller_subscriptions import effective_plan, plan_limit_warning, current_plan_text, get_config
+from database.seller_subscriptions import effective_plan, plan_limit_warning, current_plan_text, get_config, subscription_history, create_plan_request, usage_warning, seller_access_state
 from services.bot_manager import bot_manager
 
 
@@ -29,6 +29,8 @@ def seller_keyboard(record=None):
         [InlineKeyboardButton("⏸ Pause Bot" if active else "▶️ Resume Bot", callback_data="seller_pause" if active else "seller_resume")],
         [InlineKeyboardButton("🔄 Replace Token", callback_data="seller_replace")],
         [InlineKeyboardButton("🗑 Remove Bot", callback_data="seller_remove")],
+        [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
+        [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
         [InlineKeyboardButton("🏪 Seller Dashboard", callback_data="main_seller_dashboard")],
         [InlineKeyboardButton("⬅ Main Menu", callback_data="main_home")],
     ])
@@ -55,13 +57,26 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action=="seller_current_plan":
         await q.edit_message_text(await current_plan_text(owner_id), reply_markup=seller_keyboard(record)); return
     if action=="seller_upgrade_plan":
-        cfg=await get_config()
-        plans=[p for p in cfg.get("paid_plans",[]) if p.get("active",True)]
-        lines=["💎 Upgrade Seller Plan", ""]
+        cfg=await get_config(); plans=[p for p in cfg.get("paid_plans",[]) if p.get("active",True)]
+        rows=[]; lines=["💎 Buy / Change Seller Plan", ""]
+        current,_=await effective_plan(owner_id)
         for p in plans:
-            lines.append(f"• {p.get('name','Plan')} — ₹{p.get('price',0)} / {p.get('duration_days',30)} days")
-        lines += ["", "Contact the SaaS owner to activate a plan."]
-        await q.edit_message_text("\n".join(lines), reply_markup=seller_keyboard(record)); return
+            lines.append(f"• {p.get('name','Plan')} — ₹{p.get('price',0):g} / {p.get('duration_days',30)} days")
+            typ="upgrade" if float(p.get("price",0)) >= float(current.get("price",0)) else "downgrade"
+            rows.append([InlineKeyboardButton(f"Select {p.get('name')}", callback_data=f"seller_buy_{typ}_{p.get('plan_id')}")])
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data="main_seller_dashboard")])
+        await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows)); return
+    if action.startswith("seller_buy_"):
+        _,_,request_type,plan_id=action.split("_",3)
+        cfg=await get_config(); plan=next((p for p in cfg.get("paid_plans",[]) if p.get("plan_id")==plan_id),None)
+        if not plan: await q.answer("Plan unavailable",show_alert=True); return
+        await create_plan_request(owner_id,plan_id,request_type)
+        context.user_data.clear(); context.user_data["seller_payment_plan"]=plan_id; context.user_data["seller_request_type"]=request_type
+        await q.edit_message_text(f"💳 {request_type.title()} Request\n\nPlan: {plan.get('name')}\nAmount: ₹{plan.get('price',0):g}\nUPI: {cfg.get('payment_upi_id') or 'Contact owner'}\nName: {cfg.get('payment_upi_name') or '-'}\n\nPay and send payment screenshot here.", reply_markup=seller_keyboard(record)); return
+    if action=="seller_plan_history":
+        items=await subscription_history(owner_id,15); lines=["📜 Your Plan History",""]
+        for h in items: lines.append(f"• {h.get('action')} | {h.get('new_plan',h.get('target_plan_id','-'))} | {h.get('created_at').strftime('%d-%m-%Y')}")
+        await q.edit_message_text("\n".join(lines),reply_markup=seller_keyboard(record)); return
     if action in {"seller_connect","seller_replace"}:
         if action=="seller_connect" and not record:
             plan,_=await effective_plan(owner_id)
@@ -111,6 +126,6 @@ async def receive_seller_token(update: Update, context: ContextTypes.DEFAULT_TYP
 def seller_handlers():
     return [
         CommandHandler("seller",seller_command),
-        CallbackQueryHandler(seller_callback,pattern=r"^seller_(connect|replace|my_bot|pause|resume|remove|upgrade_plan|current_plan)$"),
+        CallbackQueryHandler(seller_callback,pattern=r"^seller_(connect|replace|my_bot|pause|resume|remove|upgrade_plan|current_plan|plan_history|buy_.*)$"),
         MessageHandler(filters.TEXT & ~filters.COMMAND,receive_seller_token),
     ]
