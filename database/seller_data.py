@@ -155,7 +155,91 @@ async def get_payment(owner_id,payment_id): return await c(PAYMENTS).find_one({"
 async def pending_payments(owner_id): return await c(PAYMENTS).find({"owner_id":owner_id,"status":"pending"}).sort("created_at",-1).to_list(length=50)
 async def payment_history(owner_id): return await c(PAYMENTS).find({"owner_id":owner_id,"status":{"$in":["approved","rejected"]}}).sort("updated_at",-1).to_list(length=50)
 async def set_payment_status(owner_id,payment_id,status,admin_id):
-    r=await c(PAYMENTS).update_one({"owner_id":owner_id,"payment_id":payment_id,"status":"pending"},{"$set":{"status":status,"admin_id":admin_id,"updated_at":datetime.now(timezone.utc)}}); return r.modified_count>0
+    now=datetime.now(timezone.utc)
+    r=await c(PAYMENTS).update_one(
+        {
+            "owner_id":owner_id,
+            "payment_id":payment_id,
+            "status":{"$in":["pending","processing"]},
+        },
+        {
+            "$set":{
+                "status":status,
+                "admin_id":admin_id,
+                "processed_at":now,
+                "updated_at":now,
+            }
+        },
+    )
+    return r.modified_count>0
+
+
+async def claim_payment_for_processing(owner_id,payment_id,admin_id):
+    now=datetime.now(timezone.utc)
+    r=await c(PAYMENTS).update_one(
+        {
+            "owner_id":owner_id,
+            "payment_id":payment_id,
+            "status":"pending",
+        },
+        {
+            "$set":{
+                "status":"processing",
+                "processing_admin_id":admin_id,
+                "processing_started_at":now,
+                "updated_at":now,
+            }
+        },
+    )
+    return r.modified_count>0
+
+
+async def finalize_processed_payment(owner_id,payment_id,status,admin_id):
+    now=datetime.now(timezone.utc)
+    r=await c(PAYMENTS).update_one(
+        {
+            "owner_id":owner_id,
+            "payment_id":payment_id,
+            "status":"processing",
+        },
+        {
+            "$set":{
+                "status":status,
+                "admin_id":admin_id,
+                "processed_at":now,
+                "updated_at":now,
+            },
+            "$unset":{
+                "processing_admin_id":"",
+                "processing_started_at":"",
+                "processing_error":"",
+            },
+        },
+    )
+    return r.modified_count>0
+
+
+async def release_processing_payment(owner_id,payment_id,error_message=""):
+    now=datetime.now(timezone.utc)
+    r=await c(PAYMENTS).update_one(
+        {
+            "owner_id":owner_id,
+            "payment_id":payment_id,
+            "status":"processing",
+        },
+        {
+            "$set":{
+                "status":"pending",
+                "processing_error":str(error_message)[:500],
+                "updated_at":now,
+            },
+            "$unset":{
+                "processing_admin_id":"",
+                "processing_started_at":"",
+            },
+        },
+    )
+    return r.modified_count>0
 
 
 async def get_subscription(owner_id,user_id): return await c(SUBS).find_one({"owner_id":owner_id,"user_id":user_id})
@@ -170,29 +254,46 @@ async def activate_subscription(
     now=datetime.now(timezone.utc)
     current=await get_subscription(owner_id,user_id)
 
-    base=(
-        current.get("expiry_date")
-        if current
-        and current.get("active")
-        and current.get("expiry_date")
-        and current["expiry_date"]>now
-        else now
-    )
-    expiry=base+timedelta(minutes=int(duration_minutes))
+    current_expiry=(current or {}).get("expiry_date")
+    if current_expiry and current_expiry.tzinfo is None:
+        current_expiry=current_expiry.replace(tzinfo=timezone.utc)
+    elif current_expiry:
+        current_expiry=current_expiry.astimezone(timezone.utc)
+
+    # Renewal always starts from the remaining expiry when it is still active.
+    # This prevents any already-paid remaining validity from being lost.
+    if current and current.get("active") and current_expiry and current_expiry>now:
+        base=current_expiry
+    else:
+        base=now
+
+    added_minutes=int(duration_minutes)
+    expiry=base+timedelta(minutes=added_minutes)
+
+    previous_total_minutes=int((current or {}).get("total_duration_minutes") or 0)
+    previous_total_paid=float((current or {}).get("total_paid") or 0)
+    payment_amount=float(amount or 0)
 
     values={
         "plan":plan_name,
         "active":True,
         "expiry_date":expiry,
+        "last_renewed_at":now,
+        "last_added_minutes":added_minutes,
+        "total_duration_minutes":previous_total_minutes+added_minutes,
+        "total_paid":previous_total_paid+payment_amount,
+        "removed_by_admin":False,
         "updated_at":now,
     }
 
     if amount is not None:
         values["amount"]=amount
+        values["last_payment_amount"]=amount
     if duration_text is not None:
         values["duration_text"]=duration_text
+        values["last_duration_text"]=duration_text
 
-    if not current or not current.get("active") or not current.get("expiry_date") or current["expiry_date"]<=now:
+    if not current or not current.get("active") or not current_expiry or current_expiry<=now:
         values["start_date"]=now
 
     await c(SUBS).update_one(
