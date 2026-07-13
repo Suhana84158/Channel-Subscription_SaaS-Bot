@@ -5,7 +5,7 @@ from telegram.ext import Application, MessageHandler, filters
 from config import BOT_TOKEN
 from logging_config import setup_logging
 from keep_alive import keep_alive
-from scheduler import start_scheduler
+from scheduler import start_scheduler, add_cron_job
 
 from database.mongo import connect_database
 from database.admins import initialize_admins
@@ -32,6 +32,7 @@ from handlers.support import support_callback, support_reply_handler
 from handlers.seller import seller_handlers
 from handlers.seller_subscription_management import handlers as seller_subscription_management_handlers
 from services.bot_manager import bot_manager
+from scheduler_jobs.seller_subscriptions import run_seller_subscription_reminders
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ async def post_init(application: Application):
     await initialize_seller_subscription_indexes()
 
     start_scheduler()
+    add_cron_job(lambda: run_seller_subscription_reminders(application.bot), "seller_subscription_reminders", hour=9, minute=0)
     restored = await bot_manager.restore_active_bots()
     logger.info("Seller bots restored: %s", restored)
 
