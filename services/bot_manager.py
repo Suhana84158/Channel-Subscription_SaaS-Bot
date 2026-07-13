@@ -12,6 +12,7 @@ from telegram.ext import Application, ApplicationHandlerStop, CallbackQueryHandl
 
 from database.seller_subscriptions import effective_plan, plan_limit_warning, current_plan_text, get_config, seller_access_state, usage_warning
 from database.seller_bots import get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status
+from database.platform_features import (reserve_payment_fingerprint, create_invoice, save_failed_delivery, get_failed_deliveries, resolve_failed_delivery, create_coupon, list_coupons, save_scheduled_broadcast, set_scheduled_status, audit, get_policy)
 from database.seller_data import (
     activate_subscription, active_subscriptions, add_channel, create_payment, create_plan, delete_plan,
     ensure_seller_defaults, expired_subscriptions, get_channels, get_payment,
@@ -53,7 +54,9 @@ class SellerBotManager:
             [InlineKeyboardButton("📨 Pending Payments",callback_data="a_pending")],
             [InlineKeyboardButton("📜 Payment History",callback_data="a_history")],
             [InlineKeyboardButton("⚙️ Bot Settings",callback_data="a_settings")],
-            [InlineKeyboardButton("📢 Broadcast",callback_data="a_broadcast")],
+            [InlineKeyboardButton("📢 Broadcast",callback_data="a_broadcast"), InlineKeyboardButton("🗓 Scheduled",callback_data="a_broadcast_schedule")],
+            [InlineKeyboardButton("🎟 Coupons",callback_data="a_coupons"), InlineKeyboardButton("🔁 Retry Failed",callback_data="a_retry_failed")],
+            [InlineKeyboardButton("📜 Terms & Policy",callback_data="a_terms")],
             [InlineKeyboardButton("👥 User Management",callback_data="a_users")],[InlineKeyboardButton("📊 Statistics",callback_data="a_stats")],
         ])
     @staticmethod
@@ -956,6 +959,7 @@ class SellerBotManager:
                     sent+=1
                 except Exception as exc:
                     failed+=1
+                    await save_failed_delivery(owner,user_id,"invite_resend",{"channels":[c.get("chat_id") for c in channels]},str(exc))
                     logger.warning(
                         "Invite resend failed owner=%s user=%s: %s",
                         owner,user_id,exc,
@@ -969,9 +973,28 @@ class SellerBotManager:
                 f"Failed/blocked users: {failed}\n"
                 f"Invite creation failures: {invite_failed}\n\n"
                 "Expired users ko message nahi bheja gaya.",
-                reply_markup=self.channels_menu(),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔁 Retry Failed Users", callback_data="a_retry_failed")],
+                    [InlineKeyboardButton("⬅ Back", callback_data="a_channels")],
+                ]),
             )
             return
+        if a=="a_retry_failed":
+            failed_docs=await get_failed_deliveries(owner,"invite_resend")
+            sent=still_failed=0
+            channels=await get_channels(owner)
+            for item in failed_docs:
+                uid=int(item.get("user_id"))
+                try:
+                    links=[]
+                    for ch in channels:
+                        inv=await context.bot.create_chat_invite_link(ch["chat_id"],member_limit=1)
+                        links.append(f"{ch.get('title','Channel')}: {inv.invite_link}")
+                    await context.bot.send_message(uid,"🔁 Fresh invite link(s):\n\n"+"\n".join(links),disable_web_page_preview=True)
+                    await resolve_failed_delivery(item["_id"]); sent+=1
+                except Exception:
+                    still_failed+=1
+            await q.edit_message_text(f"🔁 Retry completed\n\nSent: {sent}\nStill failed: {still_failed}",reply_markup=self.admin_menu()); return
         if a.startswith("a_channel_del_"): await remove_channel(owner,int(a.replace("a_channel_del_",""))); await q.edit_message_text("✅ Removed",reply_markup=self.channels_menu()); return
         if a=="a_welcome":
             s=await ensure_seller_defaults(owner,(await get_bot(owner) or {}).get("bot_name","Subscription Bot"))
@@ -1330,12 +1353,15 @@ class SellerBotManager:
                     )
 
                 expiry_text=self.format_dt(expiry)
+                invoice=await create_invoice(owner,p["user_id"],p,(await get_seller_settings(owner)).get("bot_name","Seller"))
+                await audit("child_payment_approved",owner,owner,{"payment_id":pid,"invoice_no":invoice["invoice_no"]})
                 await context.bot.send_message(
                     p["user_id"],
                     "🎉 Payment approved\n"
                     f"Plan: {p['plan']}\n"
                     f"Added validity: {p.get('duration_text') or '-'}\n"
-                    f"New expiry: {expiry_text}\n\n"
+                    f"New expiry: {expiry_text}\n"
+                    f"Receipt/Invoice: {invoice['invoice_no']}\n\n"
                     + "\n".join(links),
                 )
 
@@ -1403,6 +1429,20 @@ class SellerBotManager:
 
         if a=="a_history":
             ps=await payment_history(owner); text="📜 Payment History\n\n"+"\n".join(f"{'✅' if p['status']=='approved' else '❌'} {p['user_id']} ₹{p['amount']:g} {p['plan']}" for p in ps[:20]); await q.edit_message_text(text,reply_markup=self.back()); return
+        if a=="a_broadcast_schedule":
+            context.user_data.clear(); context.user_data["wait_scheduled_broadcast"]=True
+            await q.edit_message_text("🗓 Send a message with first line in this format:\nYYYY-MM-DD HH:MM\n\nWrite the broadcast text after the first line. Time uses your configured timezone.",reply_markup=self.back()); return
+        if a=="a_coupons":
+            coupons=await list_coupons(owner)
+            lines=["🎟 Coupon System\n", "Create: CODE | percent/fixed | VALUE | USAGE_LIMIT"]
+            for cpn in coupons[:20]: lines.append(f"• {cpn['code']} — {cpn['value']:g} {cpn['discount_type']} — {cpn['used_count']}/{cpn['usage_limit']}")
+            context.user_data.clear(); context.user_data["wait_coupon_create"]=True
+            await q.edit_message_text("\n".join(lines),reply_markup=self.back()); return
+        if a=="a_terms":
+            parts=[]
+            for key in ("terms","privacy","refund","support"):
+                policy=await get_policy(key); parts.append(f"{key.title()}:\n{policy.get('text')}")
+            await q.edit_message_text("📜 Terms & Policy\n\n"+"\n\n".join(parts),reply_markup=self.admin_menu()); return
         if a=="a_broadcast": context.user_data.clear(); context.user_data["wait_broadcast"]=True; await q.edit_message_text("📢 Send any one message to broadcast.\n\nSupported: text, photo with caption, video, document, audio, voice, GIF, sticker and forwarded messages.",reply_markup=self.back()); return
         if a=="a_users":
             context.user_data.clear()
@@ -1511,6 +1551,15 @@ class SellerBotManager:
     async def text_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context); text=update.effective_message.text.strip()
         if update.effective_user.id==owner:
+            if context.user_data.get("wait_coupon_create"):
+                try:
+                    code,ctype,value,limit=[x.strip() for x in text.split("|",3)]
+                    if ctype not in {"percent","fixed"}: raise ValueError("type")
+                    await create_coupon(owner,code,ctype,float(value),int(limit))
+                    context.user_data.clear(); await update.effective_message.reply_text("✅ Coupon saved",reply_markup=self.admin_menu())
+                except Exception:
+                    await update.effective_message.reply_text("❌ Use: SAVE20 | percent | 20 | 100")
+                return
             if context.user_data.get("wait_plan_add") or context.user_data.get("wait_plan_edit"):
                 try:
                     name,dtext,dmins,price=self.parse_plan(text)
@@ -1663,6 +1712,23 @@ class SellerBotManager:
         if update.effective_user.id!=owner:
             return
 
+        if context.user_data.get("wait_scheduled_broadcast"):
+            raw=(update.effective_message.text or update.effective_message.caption or "").strip()
+            lines=raw.splitlines()
+            try:
+                run_local=datetime.strptime(lines[0].strip(),"%Y-%m-%d %H:%M")
+                settings=await get_seller_settings(owner)
+                zone=ZoneInfo(settings.get("timezone","Asia/Kolkata"))
+                run_at=run_local.replace(tzinfo=zone).astimezone(timezone.utc)
+                if run_at<=datetime.now(timezone.utc): raise ValueError("past")
+            except Exception:
+                await update.effective_message.reply_text("❌ First line must be a future time: YYYY-MM-DD HH:MM")
+                return
+            job=await save_scheduled_broadcast(owner,run_at,update.effective_chat.id,update.effective_message.message_id)
+            context.application.job_queue.run_once(self.scheduled_broadcast_job,when=run_at,data=job,name=f"scheduled_{job['job_id']}")
+            context.user_data.clear(); await update.effective_message.reply_text(f"✅ Broadcast scheduled for {run_local:%d-%m-%Y %I:%M %p}",reply_markup=self.admin_menu())
+            raise ApplicationHandlerStop
+
         if not context.user_data.get("wait_broadcast"):
             return
 
@@ -1701,6 +1767,24 @@ class SellerBotManager:
         )
 
         raise ApplicationHandlerStop
+
+    async def scheduled_broadcast_job(self,context:ContextTypes.DEFAULT_TYPE):
+        job=context.job.data
+        owner=int(job["owner_id"])
+        from database.seller_data import c, USERS
+        users=await c(USERS).find({"owner_id":owner},{"user_id":1}).to_list(length=None)
+        success=failed=0
+        for user in users:
+            uid=user.get("user_id")
+            if not uid or uid==owner: continue
+            try:
+                await context.bot.copy_message(uid,job["from_chat_id"],job["message_id"]); success+=1
+            except Exception as exc:
+                failed+=1; await save_failed_delivery(owner,uid,"scheduled_broadcast",{"job_id":job["job_id"]},str(exc))
+            await asyncio.sleep(0.05)
+        await set_scheduled_status(job["job_id"],"completed",{"success":success,"failed":failed})
+        try: await context.bot.send_message(owner,f"✅ Scheduled broadcast completed\nSuccess: {success}\nFailed: {failed}")
+        except Exception: pass
 
     async def welcome_media_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
@@ -1763,7 +1847,12 @@ class SellerBotManager:
         if context.user_data.get("waiting_child_screenshot"):
             plan=context.user_data.get("selected_child_plan")
             if not plan: await update.effective_message.reply_text("Select a plan first"); return
-            p=await create_payment(owner,update.effective_user.id,plan,update.effective_message.photo[-1].file_id); context.user_data.clear()
+            photo=update.effective_message.photo[-1]
+            unique=getattr(photo,"file_unique_id","")
+            if not await reserve_payment_fingerprint("child",owner,unique,update.effective_user.id):
+                context.user_data.clear(); await update.effective_message.reply_text("⚠️ This payment screenshot was already submitted. Send a new genuine payment proof."); return
+            p=await create_payment(owner,update.effective_user.id,plan,photo.file_id); context.user_data.clear()
+            await audit("child_payment_submitted",update.effective_user.id,owner,{"payment_id":p.get("payment_id")})
             kb=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
