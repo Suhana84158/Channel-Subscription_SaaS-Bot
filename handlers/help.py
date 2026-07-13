@@ -12,7 +12,6 @@ async def build_help(user_id: int):
             "/start - Open owner welcome menu\n"
             "/dashboard - Open owner dashboard\n"
             "/owner - Open owner dashboard\n"
-            "/admin - Open full admin panel\n"
             "/help - Show this guide\n"
             "/stats - Main bot statistics\n"
             "/broadcast - Broadcast from main bot\n"
@@ -27,7 +26,6 @@ async def build_help(user_id: int):
             "• Suspend sellers and stop their child bots",
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("👑 Owner Dashboard", callback_data="main_owner_dashboard")],
-                [InlineKeyboardButton("🛡 Full Admin Panel", callback_data="admin_home")],
                 [InlineKeyboardButton("⬅ Main Menu", callback_data="main_home")],
             ]),
         )

@@ -62,7 +62,7 @@ def admin_keyboard():
 
 def back_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅ Back", callback_data="admin_home")]
+        [InlineKeyboardButton("⬅ Owner Dashboard", callback_data="main_owner_dashboard")]
     ])
 
 
@@ -185,13 +185,16 @@ async def show_user_details(query, user):
 
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Keep /admin backward-compatible, but open the Owner Dashboard."""
     if not await is_admin(update.effective_user.id):
         await update.message.reply_text("❌ You are not authorized.")
         return
 
+    from handlers.main_dashboard import owner_dashboard_keyboard, owner_dashboard_text
+
     await update.message.reply_text(
-        "🛠 Admin Panel\n\nChoose an option:",
-        reply_markup=admin_keyboard(),
+        await owner_dashboard_text(),
+        reply_markup=owner_dashboard_keyboard(),
     )
 
 async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -309,7 +312,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             ])
 
-        keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="admin_home")])
+        keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="main_owner_dashboard")])
 
         await query.edit_message_text(
             text,
@@ -342,7 +345,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✏ Set UPI ID", callback_data="set_upi_id")],
             [InlineKeyboardButton("👤 Set UPI Name", callback_data="set_upi_name")],
             [InlineKeyboardButton("🖼 Upload QR", callback_data="set_upi_qr")],
-            [InlineKeyboardButton("⬅ Back", callback_data="admin_home")],
+            [InlineKeyboardButton("⬅ Back", callback_data="main_owner_dashboard")],
         ])
 
         await query.edit_message_text(text, reply_markup=keyboard)
@@ -443,7 +446,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [
                 InlineKeyboardButton(
                     "⬅ Back",
-                    callback_data="admin_home",
+                    callback_data="main_owner_dashboard",
                 )
             ],
         ])
@@ -541,12 +544,13 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_keyboard(),
         )
 
-    elif query.data in ["admin_back", "admin_home"]:
+    elif query.data in ["admin_back", "admin_home", "admin_panel"]:
         context.user_data.clear()
+        from handlers.main_dashboard import owner_dashboard_keyboard, owner_dashboard_text
 
         await query.edit_message_text(
-            "🛠 Admin Panel\n\nChoose an option:",
-            reply_markup=admin_keyboard(),
+            await owner_dashboard_text(),
+            reply_markup=owner_dashboard_keyboard(),
         )
 
 async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
