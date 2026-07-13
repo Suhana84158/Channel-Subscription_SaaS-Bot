@@ -1,0 +1,218 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from pymongo import ReturnDocument
+
+from database.mongo import get_database
+from utils.crypto import decrypt_secret, encrypt_secret
+
+CONFIGS = "payment_gateway_configs"
+TRANSACTIONS = "gateway_transactions"
+EVENTS = "gateway_webhook_events"
+
+SUPPORTED_GATEWAYS = ("razorpay", "cashfree", "phonepe", "paytm")
+SECRET_FIELDS = {
+    "razorpay": {"key_secret", "webhook_secret"},
+    "cashfree": {"client_secret"},
+    "phonepe": {"client_secret", "webhook_password"},
+    "paytm": {"merchant_key"},
+}
+
+
+def _configs():
+    return get_database()[CONFIGS]
+
+
+def _transactions():
+    return get_database()[TRANSACTIONS]
+
+
+def _events():
+    return get_database()[EVENTS]
+
+
+async def initialize_payment_gateway_indexes():
+    await _configs().create_index([("scope", 1), ("owner_id", 1)], unique=True)
+    await _transactions().create_index("transaction_id", unique=True)
+    await _transactions().create_index([("gateway", 1), ("gateway_order_id", 1)])
+    await _transactions().create_index([("scope", 1), ("owner_id", 1), ("created_at", -1)])
+    await _transactions().create_index([("status", 1), ("updated_at", -1)])
+    await _events().create_index([("gateway", 1), ("event_key", 1)], unique=True)
+
+
+async def get_gateway_config(scope: str, owner_id: int = 0, decrypt: bool = False) -> dict:
+    doc = await _configs().find_one({"scope": scope, "owner_id": int(owner_id)}) or {
+        "scope": scope,
+        "owner_id": int(owner_id),
+        "default_gateway": "manual",
+        "manual_enabled": True,
+        "gateways": {},
+    }
+    if not decrypt:
+        return doc
+    result = dict(doc)
+    gateways = {}
+    for name, cfg in (doc.get("gateways") or {}).items():
+        item = dict(cfg)
+        for key in SECRET_FIELDS.get(name, set()):
+            value = item.get(key)
+            if value:
+                try:
+                    item[key] = decrypt_secret(value)
+                except Exception:
+                    item[key] = ""
+        gateways[name] = item
+    result["gateways"] = gateways
+    return result
+
+
+async def save_gateway_config(
+    scope: str,
+    owner_id: int,
+    gateway: str,
+    values: dict,
+) -> dict:
+    gateway = gateway.lower().strip()
+    if gateway not in SUPPORTED_GATEWAYS:
+        raise ValueError("Unsupported gateway")
+    current = await get_gateway_config(scope, owner_id, decrypt=True)
+    item = dict((current.get("gateways") or {}).get(gateway) or {})
+    for key, value in values.items():
+        if isinstance(value, str):
+            value = value.strip()
+        item[key] = value
+    encrypted = dict(item)
+    for key in SECRET_FIELDS.get(gateway, set()):
+        if encrypted.get(key):
+            encrypted[key] = encrypt_secret(str(encrypted[key]))
+    now = datetime.now(timezone.utc)
+    await _configs().update_one(
+        {"scope": scope, "owner_id": int(owner_id)},
+        {
+            "$set": {
+                f"gateways.{gateway}": encrypted,
+                "updated_at": now,
+            },
+            "$setOnInsert": {
+                "scope": scope,
+                "owner_id": int(owner_id),
+                "default_gateway": "manual",
+                "manual_enabled": True,
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+    return await get_gateway_config(scope, owner_id, decrypt=True)
+
+
+async def set_gateway_preferences(
+    scope: str,
+    owner_id: int,
+    *,
+    default_gateway: str | None = None,
+    manual_enabled: bool | None = None,
+):
+    updates = {"updated_at": datetime.now(timezone.utc)}
+    if default_gateway is not None:
+        if default_gateway != "manual" and default_gateway not in SUPPORTED_GATEWAYS:
+            raise ValueError("Unsupported default gateway")
+        updates["default_gateway"] = default_gateway
+    if manual_enabled is not None:
+        updates["manual_enabled"] = bool(manual_enabled)
+    await _configs().update_one(
+        {"scope": scope, "owner_id": int(owner_id)},
+        {"$set": updates, "$setOnInsert": {"scope": scope, "owner_id": int(owner_id), "created_at": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+    return await get_gateway_config(scope, owner_id, decrypt=True)
+
+
+async def enabled_gateways(scope: str, owner_id: int = 0) -> list[str]:
+    cfg = await get_gateway_config(scope, owner_id, decrypt=True)
+    return [name for name in SUPPORTED_GATEWAYS if (cfg.get("gateways") or {}).get(name, {}).get("enabled")]
+
+
+async def create_gateway_transaction(
+    *,
+    scope: str,
+    owner_id: int,
+    payer_user_id: int,
+    gateway: str,
+    amount: float,
+    currency: str,
+    purpose: str,
+    reference_id: str,
+    metadata: dict,
+) -> dict:
+    now = datetime.now(timezone.utc)
+    doc = {
+        "transaction_id": "gtw_" + uuid4().hex[:20],
+        "scope": scope,
+        "owner_id": int(owner_id),
+        "payer_user_id": int(payer_user_id),
+        "gateway": gateway,
+        "amount": float(amount),
+        "currency": currency.upper(),
+        "purpose": purpose,
+        "reference_id": str(reference_id),
+        "metadata": metadata or {},
+        "status": "created",
+        "created_at": now,
+        "updated_at": now,
+    }
+    await _transactions().insert_one(doc)
+    return doc
+
+
+async def update_gateway_transaction(transaction_id: str, **values) -> dict | None:
+    values["updated_at"] = datetime.now(timezone.utc)
+    return await _transactions().find_one_and_update(
+        {"transaction_id": transaction_id},
+        {"$set": values},
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+async def get_gateway_transaction(transaction_id: str) -> dict | None:
+    return await _transactions().find_one({"transaction_id": transaction_id})
+
+
+async def get_transaction_by_gateway_order(gateway: str, gateway_order_id: str) -> dict | None:
+    return await _transactions().find_one({"gateway": gateway, "gateway_order_id": str(gateway_order_id)})
+
+
+async def claim_transaction_success(transaction_id: str, gateway_payment_id: str, raw_event: dict | None = None) -> dict | None:
+    now = datetime.now(timezone.utc)
+    return await _transactions().find_one_and_update(
+        {"transaction_id": transaction_id, "status": {"$nin": ["paid", "fulfilled"]}},
+        {"$set": {"status": "paid", "gateway_payment_id": str(gateway_payment_id or ""), "paid_at": now, "raw_success": raw_event or {}, "updated_at": now}},
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+async def mark_transaction_fulfilled(transaction_id: str, details: dict | None = None) -> dict | None:
+    return await update_gateway_transaction(transaction_id, status="fulfilled", fulfilled_at=datetime.now(timezone.utc), fulfillment=details or {})
+
+
+async def mark_transaction_failed(transaction_id: str, reason: str = "", raw_event: dict | None = None):
+    return await update_gateway_transaction(transaction_id, status="failed", failure_reason=reason[:500], raw_failure=raw_event or {})
+
+
+async def reserve_webhook_event(gateway: str, event_key: str, payload: dict | None = None) -> bool:
+    try:
+        await _events().insert_one({
+            "gateway": gateway,
+            "event_key": str(event_key),
+            "payload": payload or {},
+            "created_at": datetime.now(timezone.utc),
+        })
+        return True
+    except Exception:
+        return False
+
+
+async def gateway_history(scope: str, owner_id: int, limit: int = 50) -> list[dict]:
+    return await _transactions().find({"scope": scope, "owner_id": int(owner_id)}).sort("created_at", -1).to_list(length=limit)
