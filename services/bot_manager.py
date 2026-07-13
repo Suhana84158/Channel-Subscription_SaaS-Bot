@@ -16,6 +16,8 @@ from database.seller_data import (
     get_plan, get_plans, get_seller_settings, get_subscription, mark_expired,
     payment_history, pending_payments, remove_channel, set_payment_status,
     set_seller_setting, stats, update_plan, upsert_user,
+    register_referral, count_all_referrals, count_successful_referrals,
+    mark_referral_rewarded,
 )
 
 logger=logging.getLogger(__name__)
@@ -61,7 +63,7 @@ class SellerBotManager:
         return InlineKeyboardMarkup([[InlineKeyboardButton("🏦 Set UPI ID",callback_data="a_set_upi_id")],[InlineKeyboardButton("👤 Set UPI Name",callback_data="a_set_upi_name")],[InlineKeyboardButton("🖼 Upload QR",callback_data="a_set_qr")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
     @staticmethod
     def settings_menu():
-        return InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Bot Name",callback_data="a_set_bot_name")],[InlineKeyboardButton("💬 Welcome Message",callback_data="a_welcome")],[InlineKeyboardButton("📞 Support Username",callback_data="a_set_support")],[InlineKeyboardButton("💵 Currency",callback_data="a_set_currency"),InlineKeyboardButton("🕒 Timezone",callback_data="a_set_timezone")],[InlineKeyboardButton("🔔 Reminder Days",callback_data="a_set_reminder")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Bot Name",callback_data="a_set_bot_name")],[InlineKeyboardButton("💬 Welcome Message",callback_data="a_welcome")],[InlineKeyboardButton("📞 Support Username",callback_data="a_set_support")],[InlineKeyboardButton("💵 Currency",callback_data="a_set_currency"),InlineKeyboardButton("🕒 Timezone",callback_data="a_set_timezone")],[InlineKeyboardButton("🔔 Reminder Days",callback_data="a_set_reminder")],[InlineKeyboardButton("🎁 Referral Reward Days",callback_data="a_set_referral_days")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
 
     @staticmethod
     def welcome_menu():
@@ -246,6 +248,14 @@ class SellerBotManager:
 
         try:
             await upsert_user(owner,update.effective_user)
+            if context.args:
+                arg=context.args[0]
+                if arg.startswith("ref_"):
+                    try:
+                        referrer_id=int(arg.replace("ref_","",1))
+                        await register_referral(owner,referrer_id,update.effective_user.id)
+                    except (TypeError,ValueError):
+                        pass
             record=await get_bot(owner)
             settings=await ensure_seller_defaults(
                 owner,
@@ -418,13 +428,38 @@ class SellerBotManager:
 
         if action=="c_referral":
             me=await context.bot.get_me()
-
-            await self.safe_query_message(
-                q,
-                "🎁 Referral link\n"
-                f"https://t.me/{me.username}?start=ref_{q.from_user.id}",
-                back_keyboard,
+            settings=await get_seller_settings(owner)
+            reward_days=int(settings.get("referral_reward_days",7) or 7)
+            total=await count_all_referrals(owner,q.from_user.id)
+            successful=await count_successful_referrals(owner,q.from_user.id)
+            referral_link=f"https://t.me/{me.username}?start=ref_{q.from_user.id}"
+            share_url=(
+                "https://t.me/share/url?url="
+                + referral_link
+                + "&text=Join%20this%20subscription%20bot"
             )
+
+            text=(
+                "🎁 Referral Program\n\n"
+                f"👥 Total Referrals: {total}\n"
+                f"✅ Successful Referrals: {successful}\n"
+                f"🎉 Reward: {reward_days} Free Days per successful referral.\n\n"
+                "🔗 Your Referral Link:\n"
+                f"{referral_link}"
+            )
+
+            kb=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "📤 Share Referral Link",
+                    url=share_url,
+                )],
+                [InlineKeyboardButton(
+                    "⬅ Back",
+                    callback_data="c_home",
+                )],
+            ])
+
+            await self.safe_query_message(q,text,kb)
             return
 
         if action=="c_support":
@@ -642,7 +677,7 @@ class SellerBotManager:
             return
         if a=="a_payment":
             s=await get_seller_settings(owner); await q.edit_message_text(f"💳 Payment Settings\n\nUPI Name: {s.get('upi_name') or 'Not Set'}\nUPI ID: {s.get('upi_id') or 'Not Set'}\nQR: {'Added' if s.get('upi_qr_file_id') else 'Not Added'}",reply_markup=self.payment_menu()); return
-        state={"a_set_upi_id":("wait_upi_id","Send UPI ID","a_payment"),"a_set_upi_name":("wait_upi_name","Send UPI Name","a_payment"),"a_set_bot_name":("wait_bot_name","Send Bot Name","a_settings"),"a_set_support":("wait_support","Send Support Username","a_settings"),"a_set_currency":("wait_currency","Send Currency","a_settings"),"a_set_timezone":("wait_timezone","Send Timezone","a_settings"),"a_set_reminder":("wait_reminder","Send Reminder Days","a_settings")}
+        state={"a_set_upi_id":("wait_upi_id","Send UPI ID","a_payment"),"a_set_upi_name":("wait_upi_name","Send UPI Name","a_payment"),"a_set_bot_name":("wait_bot_name","Send Bot Name","a_settings"),"a_set_support":("wait_support","Send Support Username","a_settings"),"a_set_currency":("wait_currency","Send Currency","a_settings"),"a_set_timezone":("wait_timezone","Send Timezone","a_settings"),"a_set_reminder":("wait_reminder","Send Reminder Days","a_settings"),"a_set_referral_days":("wait_referral_days","Send free reward days per successful referral","a_settings")}
         if a in state:
             key,msg,back=state[a]; context.user_data.clear(); context.user_data[key]=True; await q.edit_message_text(msg,reply_markup=self.back(back)); return
         if a=="a_set_qr": context.user_data.clear(); context.user_data["wait_qr"]=True; await q.edit_message_text("Send QR image",reply_markup=self.back("a_payment")); return
@@ -663,7 +698,31 @@ class SellerBotManager:
             approve=a.startswith("a_pay_ok_"); pid=a.replace("a_pay_ok_" if approve else "a_pay_no_",""); p=await get_payment(owner,pid)
             if not p or not await set_payment_status(owner,pid,"approved" if approve else "rejected",owner): await q.edit_message_text("Already processed or missing"); return
             if approve:
-                expiry=await activate_subscription(owner,p["user_id"],p["plan"],p["duration_minutes"]); links=[]
+                expiry=await activate_subscription(owner,p["user_id"],p["plan"],p["duration_minutes"])
+
+                referral=await mark_referral_rewarded(owner,p["user_id"])
+                if referral:
+                    settings=await get_seller_settings(owner)
+                    reward_days=int(settings.get("referral_reward_days",7) or 0)
+                    referrer_id=int(referral["referrer_user_id"])
+
+                    if reward_days > 0:
+                        await activate_subscription(
+                            owner,
+                            referrer_id,
+                            "Referral Reward",
+                            reward_days * 1440,
+                        )
+                        try:
+                            await context.bot.send_message(
+                                referrer_id,
+                                "🎉 Referral Reward Added!\n"
+                                f"You received {reward_days} free day(s).",
+                            )
+                        except Exception:
+                            pass
+
+                links=[]
                 for ch in await get_channels(owner):
                     try:
                         inv=await context.bot.create_chat_invite_link(ch["chat_id"],member_limit=1); links.append(f"{ch.get('title')}: {inv.invite_link}")
@@ -712,6 +771,28 @@ class SellerBotManager:
                 try: ZoneInfo(text)
                 except ZoneInfoNotFoundError: await update.effective_message.reply_text("❌ Invalid timezone"); return
                 await set_seller_setting(owner,"timezone",text); context.user_data.clear(); await update.effective_message.reply_text("✅ Updated",reply_markup=self.settings_menu()); return
+            if context.user_data.get("wait_referral_days"):
+                try:
+                    days=int(text)
+                    if days < 0 or days > 3650:
+                        raise ValueError
+                except ValueError:
+                    await update.effective_message.reply_text(
+                        "❌ Send a number from 0 to 3650."
+                    )
+                    return
+
+                await set_seller_setting(
+                    owner,
+                    "referral_reward_days",
+                    days,
+                )
+                context.user_data.clear()
+                await update.effective_message.reply_text(
+                    f"✅ Referral reward set to {days} day(s).",
+                    reply_markup=self.settings_menu(),
+                )
+                return
             if context.user_data.get("wait_reminder"):
                 try: days=int(text)
                 except ValueError: await update.effective_message.reply_text("❌ Send number"); return
