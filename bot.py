@@ -14,7 +14,8 @@ from database.seller_bots import initialize_seller_bot_indexes
 from database.seller_data import initialize_seller_data_indexes
 
 from handlers.start import start_command, start_callback_handler
-from handlers.help import help_handler
+from handlers.help import help_handler, help_callback_handler
+from handlers.main_dashboard import main_dashboard_handlers
 from handlers.errors import error_handler
 from handlers.upload_payment import payment_upload_handlers
 from handlers.plans import plans_handler
@@ -69,7 +70,10 @@ def register_handlers(application: Application):
 
     application.add_handler(start_command())
     application.add_handler(help_handler())
+    application.add_handler(help_callback_handler())
     application.add_handler(start_callback_handler())
+    for handler in main_dashboard_handlers():
+        application.add_handler(handler)
     application.add_handler(plans_handler())
     application.add_handler(profile_callback())
     application.add_handler(payment_handler())
