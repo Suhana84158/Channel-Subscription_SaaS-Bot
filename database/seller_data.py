@@ -151,6 +151,21 @@ async def remove_subscription(owner_id:int, user_id:int):
 async def create_payment(owner_id,user_id,plan,screenshot_file_id):
     now=datetime.now(timezone.utc); doc={"owner_id":owner_id,"payment_id":uuid4().hex[:16],"user_id":user_id,"plan_id":plan["plan_id"],"plan":plan["name"],"amount":plan["price"],"duration_text":plan["duration_text"],"duration_minutes":plan["duration_minutes"],"screenshot_file_id":screenshot_file_id,"status":"pending","created_at":now,"updated_at":now}
     await c(PAYMENTS).insert_one(doc); return doc
+
+async def create_automatic_payment(owner_id,user_id,plan,gateway,transaction_id,gateway_payment_id=""):
+    now=datetime.now(timezone.utc)
+    doc={
+        "owner_id":int(owner_id),"payment_id":str(transaction_id),"user_id":int(user_id),
+        "plan_id":plan["plan_id"],"plan":plan["name"],"amount":float(plan["price"]),
+        "duration_text":plan["duration_text"],"duration_minutes":int(plan["duration_minutes"]),
+        "payment_method":gateway,"gateway_payment_id":str(gateway_payment_id or ""),
+        "status":"approved","admin_id":0,"processed_at":now,"created_at":now,"updated_at":now,
+    }
+    await c(PAYMENTS).update_one(
+        {"owner_id":int(owner_id),"payment_id":str(transaction_id)},
+        {"$setOnInsert":doc},upsert=True,
+    )
+    return await c(PAYMENTS).find_one({"owner_id":int(owner_id),"payment_id":str(transaction_id)})
 async def get_payment(owner_id,payment_id): return await c(PAYMENTS).find_one({"owner_id":owner_id,"payment_id":payment_id})
 async def pending_payments(owner_id): return await c(PAYMENTS).find({"owner_id":owner_id,"status":"pending"}).sort("created_at",-1).to_list(length=50)
 async def payment_history(owner_id): return await c(PAYMENTS).find({"owner_id":owner_id,"status":{"$in":["approved","rejected"]}}).sort("updated_at",-1).to_list(length=50)
