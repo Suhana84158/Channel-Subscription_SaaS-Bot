@@ -22,6 +22,8 @@ def seller_keyboard(record=None):
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("👤 Seller Profile", callback_data="main_seller_profile")],
             [InlineKeyboardButton("➕ Create / Connect Clone Bot", callback_data="seller_connect")],
+            [InlineKeyboardButton("🤝 Seller Referral", callback_data="main_seller_referral")],
+            [InlineKeyboardButton("🆘 Help & Commands", callback_data="main_help")],
             [InlineKeyboardButton("📖 Setup Guide", callback_data="main_child_setup")],
             [InlineKeyboardButton("⬅ Main Menu", callback_data="main_home")],
         ])
@@ -35,6 +37,8 @@ def seller_keyboard(record=None):
         [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
         [InlineKeyboardButton("🌐 Child Bot Payment Gateways", callback_data="pgcfg_seller_home")],
         [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
+        [InlineKeyboardButton("🤝 Seller Referral", callback_data="main_seller_referral")],
+        [InlineKeyboardButton("🆘 Help & Commands", callback_data="main_help")],
         [InlineKeyboardButton("🏪 Seller Dashboard", callback_data="main_seller_dashboard")],
         [InlineKeyboardButton("⬅ Main Menu", callback_data="main_home")],
     ])
