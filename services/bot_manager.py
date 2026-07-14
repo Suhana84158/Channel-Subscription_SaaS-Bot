@@ -27,7 +27,7 @@ from database.seller_data import (
 )
 
 logger=logging.getLogger(__name__)
-WELCOME_RUNTIME_VERSION="2026-07-13-main-role-dashboard-fix-13"
+WELCOME_RUNTIME_VERSION="2026-07-14-child-owner-direct-admin-14"
 MAIN_BOT_USERNAME=os.getenv("MAIN_BOT_USERNAME","Local_supplier3_bot").lstrip("@")
 
 @dataclass
@@ -419,6 +419,16 @@ class SellerBotManager:
 
     async def child_start(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
+
+        # The child-bot owner/seller should enter the admin panel directly.
+        # Do not show the subscriber welcome message or save the seller as a user.
+        if update.effective_user.id == owner:
+            context.user_data.clear()
+            await update.effective_message.reply_text(
+                "🛠 Seller Admin Panel",
+                reply_markup=self.admin_menu(),
+            )
+            return
 
         try:
             await upsert_user(owner,update.effective_user)
