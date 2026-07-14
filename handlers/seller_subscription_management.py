@@ -6,6 +6,7 @@ from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, fil
 from config import ADMIN_IDS
 from database.admins import is_admin
 from database.platform_features import reserve_payment_fingerprint, audit
+from database.seller_referrals import set_seller_referral_settings
 from database.seller_subscriptions import (
     assign_plan_with_history, create_plan_request, create_seller_payment,
     current_plan_text, decide_seller_payment, delete_paid_plan, get_config,
@@ -25,6 +26,7 @@ def main_menu():
         [InlineKeyboardButton("🎁 Free Trial", callback_data="sub_mgmt_trial"), InlineKeyboardButton("🧾 Pending Payments", callback_data="sub_mgmt_pending")],
         [InlineKeyboardButton("👤 Assign / Suspend Seller", callback_data="sub_mgmt_seller_control")],
         [InlineKeyboardButton("📜 Subscription History", callback_data="sub_mgmt_history"), InlineKeyboardButton("💰 Seller Revenue", callback_data="sub_mgmt_revenue")],
+        [InlineKeyboardButton("🤝 Seller Referral Reward", callback_data="sub_mgmt_referral")],
         [InlineKeyboardButton("🏷 Branding Control", callback_data="sub_mgmt_branding")],
         [InlineKeyboardButton("⬅ Owner Dashboard", callback_data="main_owner_dashboard")],
     ])
@@ -100,6 +102,20 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("\n".join(lines),reply_markup=back()); return
     if a=="sub_mgmt_revenue":
         r=await seller_revenue_summary(); await q.edit_message_text(f"💰 Seller Revenue\n\nTotal: ₹{r['total']:g} ({r['count']} payments)\nThis month: ₹{r['month_total']:g} ({r['month_count']} payments)",reply_markup=back()); return
+    if a=="sub_mgmt_referral":
+        await q.edit_message_text(
+            "🤝 Seller Referral Reward\n\n"
+            f"Reward Days: {cfg.get('seller_referral_reward_days',7)}\n"
+            f"Reward Plan: {cfg.get('seller_referral_reward_plan_id','starter').title()}\n\n"
+            "A seller receives this reward when a new seller joins through their referral link.",
+            reply_markup=kb([
+                [InlineKeyboardButton("✏ Edit Reward", callback_data="sub_mgmt_referral_edit")],
+                [InlineKeyboardButton("⬅ Back", callback_data="sub_mgmt_home")],
+            ]),
+        ); return
+    if a=="sub_mgmt_referral_edit":
+        context.user_data.clear(); context.user_data["sub_wait"]="seller_referral"
+        await q.edit_message_text("Send: Reward_Days | Paid_Plan_ID\nExample: 7 | starter",reply_markup=back("sub_mgmt_referral")); return
     if a=="sub_mgmt_branding":
         await q.edit_message_text(f"🏷 Branding Control\n\nCurrent: {cfg.get('branding_text','Powered by Subscription SaaS Bot')}\n\nBranding remains visible on Free and every Paid plan.",reply_markup=kb([[InlineKeyboardButton("✏ Edit Branding Text",callback_data="sub_mgmt_branding_edit")],[InlineKeyboardButton("⬅ Back",callback_data="sub_mgmt_home")]])); return
     if a=="sub_mgmt_branding_edit":
@@ -124,6 +140,9 @@ async def receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await save_paid_plan({"plan_id":pid,"name":name,"price":float(price),"duration_days":int(days),"bot_limit":int(bots),"active_subscriber_limit":int(subs),"channel_limit":int(channels),"plan_limit":int(plans),"admin_limit":int(admins),"broadcast_enabled":True,"coupon_enabled":True,"referral_enabled":True,"analytics_enabled":True,"branding_enabled":True,"active":True})
         elif mode=="trial":
             days,pid=[x.strip() for x in text.split("|",1)]; await update_config(trial_days=max(1,int(days)),trial_plan_id=pid)
+        elif mode=="seller_referral":
+            days,plan_id=[x.strip() for x in text.split("|",1)]
+            await set_seller_referral_settings(int(days),plan_id)
         elif mode=="branding": await update_config(branding_text=text)
         elif mode=="seller_control":
             p=[x.strip() for x in text.split("|")]; cmd=p[0].upper(); sid=int(p[1])

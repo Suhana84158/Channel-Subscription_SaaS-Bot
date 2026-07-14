@@ -1,3 +1,4 @@
+import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
@@ -5,6 +6,7 @@ from database.admins import is_admin
 from database.payments import count_pending_payments, total_revenue
 from database.seller_bots import get_bot, total_bots
 from database.seller_data import stats as seller_stats
+from database.seller_referrals import seller_referral_stats
 from database.sellers import (
     get_all_sellers,
     get_or_create_seller,
@@ -84,6 +86,7 @@ def seller_dashboard_keyboard(record=None):
         ])
 
     rows.extend([
+        [InlineKeyboardButton("🤝 Seller Referral", callback_data="main_seller_referral")],
         [InlineKeyboardButton("📖 Setup Instructions", callback_data="main_child_setup")],
         [InlineKeyboardButton("🆘 Seller Help", callback_data="main_help")],
         home_button(),
@@ -287,6 +290,26 @@ async def main_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await get_or_create_seller(query.from_user)
         text, record = await seller_dashboard_text(user_id)
         await query.edit_message_text(text, reply_markup=seller_dashboard_keyboard(record))
+        return
+
+    if action == "main_seller_referral":
+        await get_or_create_seller(query.from_user)
+        stats = await seller_referral_stats(user_id)
+        username = os.getenv("MAIN_BOT_USERNAME", "Local_supplier3_bot").lstrip("@")
+        link = f"https://t.me/{username}?start=refseller_{user_id}"
+        await query.edit_message_text(
+            "🤝 Seller Referral Program\n\n"
+            f"👥 Sellers joined: {stats['total']}\n"
+            f"🎁 Rewards received: {stats['rewarded']}\n\n"
+            "Share this link with people who want to create their own subscription bot:\n"
+            f"{link}\n\n"
+            "When a new seller joins through your link, your seller-plan reward is added automatically.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📤 Share Referral Link", url=f"https://t.me/share/url?url={link}")],
+                [InlineKeyboardButton("⬅ Seller Dashboard", callback_data="main_seller_dashboard")],
+            ]),
+            disable_web_page_preview=True,
+        )
         return
 
     if action == "main_child_setup":

@@ -3,7 +3,8 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
 from database.admins import is_admin
 from database.seller_bots import get_bot
-from database.sellers import get_seller
+from database.sellers import get_or_create_seller, get_seller
+from database.seller_referrals import register_seller_referral, reward_seller_referral
 from database.users import get_or_create_user
 
 
@@ -90,6 +91,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Reason: {user.get('ban_reason') or 'Not specified'}"
         )
         return
+
+    # Register seller-to-seller referral from /start refseller_<seller_id>.
+    if context.args and context.args[0].startswith("refseller_"):
+        try:
+            referrer_id = int(context.args[0].replace("refseller_", "", 1))
+            if referrer_id != tg_user.id:
+                await get_or_create_seller(tg_user)
+                referral = await register_seller_referral(referrer_id, tg_user.id)
+                reward = await reward_seller_referral(tg_user.id) if referral else None
+                if reward and int(reward.get("reward_days", 0)) > 0:
+                    try:
+                        await context.bot.send_message(
+                            referrer_id,
+                            "🎉 Seller Referral Reward Added!\n\n"
+                            f"A new seller joined using your link.\n"
+                            f"Reward: {reward['reward_days']} day(s).",
+                        )
+                    except Exception:
+                        pass
+        except (TypeError, ValueError):
+            pass
 
     # Owner should land directly on the full Owner Dashboard.
     if await is_admin(tg_user.id):
