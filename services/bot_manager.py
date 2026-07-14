@@ -16,6 +16,7 @@ from database.payment_gateways import (
     save_gateway_config, set_gateway_preferences, gateway_history,
 )
 from services.payment_gateways import create_checkout, GatewayError
+from services.group_detector import connect_current_group, validate_forwarded_chat
 from database.seller_bots import get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status
 from database.platform_features import (reserve_payment_fingerprint, create_invoice, save_failed_delivery, get_failed_deliveries, resolve_failed_delivery, create_coupon, list_coupons, save_scheduled_broadcast, set_scheduled_status, audit, get_policy)
 from database.seller_data import (
@@ -489,7 +490,7 @@ class SellerBotManager:
         is_owner=update.effective_user.id==owner
 
         user_text=(
-            "🆘 Clone Bot Help\n\n"
+            "🆘 Child Bot Help\n\n"
             "👤 User Commands\n"
             "/start - Open the welcome menu\n"
             "/help - Show this help guide\n"
@@ -1995,87 +1996,120 @@ class SellerBotManager:
                 "✅ Payment submitted. Waiting for approval."
             )
 
-    async def forward_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
-        owner=self.owner(context)
-        if update.effective_user.id!=owner or not context.user_data.get("wait_channel"): return
-        m=update.effective_message; chat=getattr(m,"forward_from_chat",None)
-        if chat is None:
-            origin=getattr(m,"forward_origin",None); chat=getattr(origin,"chat",None)
-        if chat is None:
-            await m.reply_text(
-                "❌ Forward se group detect nahi hua.\n\n"
-                "Easy method: child bot ko group me Admin banao, phir group ke andar /connectgroup bhejo."
-            )
+    async def forward_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        owner = self.owner(context)
+        if update.effective_user.id != owner or not context.user_data.get("wait_channel"):
             return
-        await add_channel(owner,chat.id,chat.title or "Unknown",getattr(chat,"type","unknown")); context.user_data.clear(); await m.reply_text("✅ Channel/group added",reply_markup=self.channels_menu())
 
+        message = update.effective_message
+        chat = getattr(message, "forward_from_chat", None)
+        if chat is None:
+            origin = getattr(message, "forward_origin", None)
+            chat = getattr(origin, "chat", None)
 
-    async def connect_group_command(self, update:Update, context:ContextTypes.DEFAULT_TYPE):
-        """Connect the current private/super group without asking for a numeric chat id."""
-        owner=self.owner(context)
-        user=update.effective_user
-        chat=update.effective_chat
-        message=update.effective_message
-
-        if not user or user.id != owner:
-            await message.reply_text("❌ Sirf bot seller/admin group connect kar sakta hai.")
-            return
-        if not chat or chat.type not in {"group", "supergroup"}:
+        if chat is None:
             await message.reply_text(
-                "❌ Ye command target group ke andar bhejo.\n\n"
-                "Child bot ko group me add karke Admin banao, phir /connectgroup send karo."
+                "❌ Forward se channel/group detect nahi hua.\n\n"
+                "Private group ke liye easy method:\n"
+                "1. Clone bot ko group me Admin banao.\n"
+                "2. Invite Users permission ON karo.\n"
+                "3. Group ke andar /connectgroup bhejo."
             )
             return
 
         try:
-            me=await context.bot.get_me()
-            member=await context.bot.get_chat_member(chat.id, me.id)
-            status=getattr(member, "status", "")
-            can_invite=getattr(member, "can_invite_users", False)
-            if status not in {"administrator", "creator"}:
-                await message.reply_text(
-                    "❌ Pehle child bot ko is group ka Admin banao.\n"
-                    "Invite Users permission bhi ON rakho."
-                )
-                return
-            if status != "creator" and not can_invite:
-                await message.reply_text(
-                    "❌ Bot ke paas Invite Users permission nahi hai.\n"
-                    "Group Admin settings me Invite Users permission ON karo, phir /connectgroup dobara bhejo."
-                )
-                return
-
-            await add_channel(owner, chat.id, chat.title or "Premium Group", chat.type)
-
-            # Confirm that Telegram can actually generate an invite for this chat.
-            invite=await context.bot.create_chat_invite_link(
-                chat_id=chat.id,
-                member_limit=1,
-                name="Connection test",
-            )
-            try:
-                await context.bot.revoke_chat_invite_link(chat.id, invite.invite_link)
-            except Exception:
-                pass
-
-            await message.reply_text(
-                "✅ Group connected successfully.\n\n"
-                f"Group: {chat.title or 'Premium Group'}\n"
-                "Invite-link permission: Working ✅\n\n"
-                "Ab payment approve hone par active user ko fresh invite link milega."
+            connected = await validate_forwarded_chat(context, chat)
+            await add_channel(
+                owner,
+                connected.chat_id,
+                connected.title,
+                connected.chat_type,
             )
             context.user_data.clear()
-        except BadRequest as exc:
-            logger.warning("Group connect failed owner=%s chat=%s: %s", owner, getattr(chat,'id',None), exc)
             await message.reply_text(
-                "❌ Group save nahi hua ya invite link create nahi ho saka.\n\n"
+                "✅ Channel/group connected successfully.\n\n"
+                f"Name: {connected.title}\n"
+                "Invite-link permission: Working ✅",
+                reply_markup=self.channels_menu(),
+            )
+        except BadRequest as exc:
+            logger.warning(
+                "Forwarded chat connection failed owner=%s chat=%s: %s",
+                owner,
+                getattr(chat, "id", None),
+                exc,
+            )
+            await message.reply_text(
+                "❌ Channel/group connect nahi hua.\n\n"
                 "Check karo:\n"
-                "• Bot group me Admin ho\n"
+                "• Clone bot Admin ho\n"
                 "• Invite Users permission ON ho\n"
-                "• Group supergroup/private group ho\n\n"
+                "• Forward original channel/group se ho\n\n"
                 f"Telegram error: {exc}"
             )
-        except Exception as exc:
+
+    async def connect_group_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Connect the current private/supergroup without a numeric chat ID."""
+        owner = self.owner(context)
+        user = update.effective_user
+        chat = update.effective_chat
+        message = update.effective_message
+
+        if not user or user.id != owner:
+            await message.reply_text("❌ Sirf bot seller/admin group connect kar sakta hai.")
+            return
+
+        if not chat or chat.type not in {"group", "supergroup"}:
+            await message.reply_text(
+                "❌ /connectgroup target group ke andar bhejo.\n\n"
+                "Clone bot ko group me add karke Admin banao aur Invite Users permission ON rakho."
+            )
+            return
+
+        try:
+            connected = await connect_current_group(context, chat)
+            await add_channel(
+                owner,
+                connected.chat_id,
+                connected.title,
+                connected.chat_type,
+            )
+
+            # The test link must not remain usable.
+            try:
+                await context.bot.revoke_chat_invite_link(
+                    connected.chat_id,
+                    connected.invite_link,
+                )
+            except TelegramError:
+                logger.info(
+                    "Connection-test invite could not be revoked chat=%s",
+                    connected.chat_id,
+                )
+
+            context.user_data.clear()
+            await message.reply_text(
+                "✅ Group connected successfully.\n\n"
+                f"Group: {connected.title}\n"
+                "Invite-link permission: Working ✅\n\n"
+                "Ab payment approve hone par user ko fresh one-time invite link milega."
+            )
+        except BadRequest as exc:
+            logger.warning(
+                "Group connect failed owner=%s chat=%s: %s",
+                owner,
+                getattr(chat, "id", None),
+                exc,
+            )
+            await message.reply_text(
+                "❌ Group connect nahi hua.\n\n"
+                "Check karo:\n"
+                "• Clone bot group me Admin ho\n"
+                "• Invite Users permission ON ho\n"
+                "• Group private group/supergroup ho\n\n"
+                f"Telegram error: {exc}"
+            )
+        except TelegramError as exc:
             logger.exception("Unexpected group connect error owner=%s", owner)
             await message.reply_text(f"❌ Group connect failed: {exc}")
 
