@@ -656,7 +656,7 @@ class SellerBotManager:
                 if (gateway_cfg.get("gateways") or {}).get(gateway,{}).get("enabled"):
                     rows.append([InlineKeyboardButton(f"💳 Pay with {gateway.title()}",callback_data=f"c_pg_{gateway}_{plan['plan_id']}")])
             if gateway_cfg.get("manual_enabled",True):
-                rows.append([InlineKeyboardButton("📤 Manual Screenshot Payment",callback_data="c_upload")])
+                rows.append([InlineKeyboardButton("📤 Upload Payment Screenshot",callback_data="c_upload")])
             rows.append([InlineKeyboardButton("⬅ Back",callback_data="c_buy")])
             kb=InlineKeyboardMarkup(rows)
 
@@ -698,7 +698,7 @@ class SellerBotManager:
         if action=="c_upload":
             context.user_data["waiting_child_screenshot"]=True
             await q.message.reply_text(
-                "📷 Send payment screenshot.",
+                "📷 Upload your payment screenshot.",
                 reply_markup=back_keyboard,
             )
             return
