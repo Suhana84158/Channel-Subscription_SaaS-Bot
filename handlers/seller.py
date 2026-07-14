@@ -20,16 +20,12 @@ def limit_keyboard():
 def seller_keyboard(record=None):
     if not record:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("👤 Seller Profile", callback_data="main_seller_profile")],
-            [InlineKeyboardButton("➕ Create / Connect Clone Bot", callback_data="seller_connect")],
-            [InlineKeyboardButton("🤝 Seller Referral", callback_data="main_seller_referral")],
-            [InlineKeyboardButton("🆘 Help & Commands", callback_data="main_help")],
+            [InlineKeyboardButton("➕ Create / Connect Child Bot", callback_data="seller_connect")],
             [InlineKeyboardButton("📖 Setup Guide", callback_data="main_child_setup")],
             [InlineKeyboardButton("⬅ Main Menu", callback_data="main_home")],
         ])
     active = bool(record.get("active"))
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 Seller Profile", callback_data="main_seller_profile")],
         [InlineKeyboardButton("🤖 My Bot", callback_data="seller_my_bot")],
         [InlineKeyboardButton("⏸ Pause Bot" if active else "▶️ Resume Bot", callback_data="seller_pause" if active else "seller_resume")],
         [InlineKeyboardButton("🔄 Replace Token", callback_data="seller_replace")],
@@ -37,8 +33,6 @@ def seller_keyboard(record=None):
         [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
         [InlineKeyboardButton("🌐 Child Bot Payment Gateways", callback_data="pgcfg_seller_home")],
         [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
-        [InlineKeyboardButton("🤝 Seller Referral", callback_data="main_seller_referral")],
-        [InlineKeyboardButton("🆘 Help & Commands", callback_data="main_help")],
         [InlineKeyboardButton("🏪 Seller Dashboard", callback_data="main_seller_dashboard")],
         [InlineKeyboardButton("⬅ Main Menu", callback_data="main_home")],
     ])
@@ -70,7 +64,7 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if (gateway_cfg.get("gateways") or {}).get(gateway,{}).get("enabled"):
                 rows.append([InlineKeyboardButton(f"💳 Pay with {gateway.title()}",callback_data=f"pgsp_{gateway}_{request_type}_{plan_id}")])
         if gateway_cfg.get("manual_enabled",True):
-            rows.append([InlineKeyboardButton("📤 Manual Screenshot Payment",callback_data=f"seller_manual_{request_type}_{plan_id}")])
+            rows.append([InlineKeyboardButton("📤 Upload Payment Screenshot",callback_data=f"seller_manual_{request_type}_{plan_id}")])
         rows.append([InlineKeyboardButton("⬅ Back",callback_data="seller_upgrade_plan")])
         await q.edit_message_text(
             f"💳 Choose Payment Method\n\nPlan: {plan.get('name')}\nAmount: ₹{plan.get('price',0):g}\n\nAutomatic gateway payment verify hote hi plan activate hoga.",
@@ -81,7 +75,23 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cfg=await get_config(); plan=next((p for p in cfg.get("paid_plans",[]) if p.get("plan_id")==plan_id),None)
         if not plan: await q.answer("Plan unavailable",show_alert=True); return
         context.user_data.clear(); context.user_data["seller_payment_plan"]=plan_id; context.user_data["seller_request_type"]=request_type
-        await q.edit_message_text(f"📤 Manual Payment\n\nPlan: {plan.get('name')}\nAmount: ₹{plan.get('price',0):g}\nUPI: {cfg.get('payment_upi_id') or 'Contact owner'}\nName: {cfg.get('payment_upi_name') or '-'}\n\nPay and send payment screenshot here.", reply_markup=seller_keyboard(record)); return
+        payment_text=(
+            "💳 Seller Plan Payment\n\n"
+            f"Plan: {plan.get('name')}\n"
+            f"Amount: ₹{plan.get('price',0):g}\n"
+            f"UPI Name: {cfg.get('payment_upi_name') or 'Not Set'}\n"
+            f"UPI ID: {cfg.get('payment_upi_id') or 'Not Set'}\n\n"
+            "Pay using the QR/UPI details, then upload your payment screenshot here."
+        )
+        payment_kb=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Upload Payment Screenshot",callback_data=f"seller_manual_{request_type}_{plan_id}")],
+            [InlineKeyboardButton("⬅ Back",callback_data="seller_upgrade_plan")],
+        ])
+        if cfg.get("payment_qr_file_id"):
+            await q.message.reply_photo(cfg["payment_qr_file_id"],caption=payment_text,reply_markup=payment_kb)
+        else:
+            await q.edit_message_text(payment_text+"\n\n⚠️ QR Code is not added yet.",reply_markup=payment_kb)
+        return
     if action=="seller_plan_history":
         items=await subscription_history(owner_id,15); lines=["📜 Your Plan History",""]
         for h in items: lines.append(f"• {h.get('action')} | {h.get('new_plan',h.get('target_plan_id','-'))} | {h.get('created_at').strftime('%d-%m-%Y')}")
