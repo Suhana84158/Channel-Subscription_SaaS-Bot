@@ -838,6 +838,35 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
 
+async def receive_upi_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save the owner payment QR image while the QR-upload state is active."""
+    if not update.effective_user or not await is_admin(update.effective_user.id):
+        return
+
+    if not context.user_data.get("waiting_upi_qr"):
+        return
+
+    message = update.effective_message
+    if not message or not message.photo:
+        return
+
+    try:
+        file_id = message.photo[-1].file_id
+        await set_setting("upi_qr_file_id", file_id)
+        context.user_data.clear()
+        await message.reply_text(
+            "✅ UPI QR Code updated successfully.",
+            reply_markup=back_keyboard(),
+        )
+    except Exception as exc:
+        await message.reply_text(
+            "❌ Could not save the UPI QR Code.\n\n"
+            f"Error: {str(exc)[:250]}",
+            reply_markup=back_keyboard(),
+        )
+
+
+
 async def receive_channel_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id):
         return
