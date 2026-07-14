@@ -25,6 +25,7 @@ async def initialize_live_support_indexes():
     )
     await c(MESSAGE_LINKS).create_index("created_at", expireAfterSeconds=60 * 60 * 24 * 180)
     await c(BLOCKS).create_index([("owner_id", 1), ("user_id", 1)], unique=True)
+    await c(TEMPLATES).create_index([("owner_id", 1), ("command", 1)], unique=True)
 
 
 async def get_live_support_settings(owner_id: int):
@@ -185,4 +186,58 @@ async def is_support_blocked(owner_id: int, user_id: int) -> bool:
 async def count_support_blocks(owner_id: int) -> int:
     return await c(BLOCKS).count_documents(
         {"owner_id": int(owner_id), "blocked": True}
+    )
+
+TEMPLATES = "clone_live_support_templates"
+
+
+async def initialize_live_support_template_indexes():
+    await c(TEMPLATES).create_index(
+        [("owner_id", 1), ("command", 1)], unique=True
+    )
+
+
+async def list_support_templates(owner_id: int):
+    return await c(TEMPLATES).find(
+        {"owner_id": int(owner_id)}
+    ).sort("command", 1).to_list(length=None)
+
+
+async def get_support_template(owner_id: int, command: str):
+    command = str(command or "").strip().lower().lstrip("/")
+    return await c(TEMPLATES).find_one(
+        {"owner_id": int(owner_id), "command": command}
+    )
+
+
+async def save_support_template(owner_id: int, command: str, **values):
+    command = str(command or "").strip().lower().lstrip("/")
+    if not command or not command.replace("_", "").isalnum():
+        raise ValueError("Command me sirf letters, numbers aur underscore use karo")
+    allowed = {"text", "media_type", "media_file_id", "buttons"}
+    clean = {key: value for key, value in values.items() if key in allowed}
+    clean["updated_at"] = datetime.now(timezone.utc)
+    await c(TEMPLATES).update_one(
+        {"owner_id": int(owner_id), "command": command},
+        {
+            "$set": clean,
+            "$setOnInsert": {
+                "owner_id": int(owner_id),
+                "command": command,
+                "text": "",
+                "media_type": "",
+                "media_file_id": "",
+                "buttons": [],
+                "created_at": datetime.now(timezone.utc),
+            },
+        },
+        upsert=True,
+    )
+    return await get_support_template(owner_id, command)
+
+
+async def delete_support_template(owner_id: int, command: str):
+    command = str(command or "").strip().lower().lstrip("/")
+    return await c(TEMPLATES).delete_one(
+        {"owner_id": int(owner_id), "command": command}
     )
