@@ -15,6 +15,7 @@ from database.seller_data import initialize_seller_data_indexes
 from database.seller_subscriptions import initialize_seller_subscription_indexes
 from database.platform_features import initialize_platform_feature_indexes
 from database.payment_gateways import initialize_payment_gateway_indexes
+from database.seller_referrals import initialize_seller_referral_indexes
 
 from handlers.start import start_command, start_callback_handler
 from handlers.help import help_handler, help_callback_handler
@@ -52,6 +53,7 @@ async def post_init(application: Application):
     await initialize_seller_subscription_indexes()
     await initialize_platform_feature_indexes()
     await initialize_payment_gateway_indexes()
+    await initialize_seller_referral_indexes()
     configure_runtime(__import__("asyncio").get_running_loop(), application.bot)
 
     start_scheduler()
