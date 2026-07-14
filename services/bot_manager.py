@@ -128,11 +128,31 @@ class SellerBotManager:
                 ("✅ " if mode=="topic" else "")+"🧵 Topic Mode",
                 callback_data="a_live_support_mode_topic",
             )],
-            [InlineKeyboardButton("👥 Connect Support Group",callback_data="a_live_support_connect")],
             [InlineKeyboardButton(f"📌 Group: {group_title[:28]}",callback_data="a_live_support_group_info")],
             [InlineKeyboardButton("🚫 Blocked Users Count",callback_data="a_live_support_blocks")],
             [InlineKeyboardButton("⬅ Back",callback_data="a_home")],
         ])
+
+    @staticmethod
+    def live_support_text(settings, blocked_count):
+        mode_name="Topic Mode" if settings.get("mode","topic")=="topic" else "Normal Private Reply"
+        group_name=settings.get("support_group_title") or "Not connected"
+        return (
+            "💬 Live Support Settings\n\n"
+            f"Status: {'🟢 ON' if settings.get('enabled') else '🔴 OFF'}\n"
+            f"Reply Mode: {mode_name}\n"
+            f"Support Group: {group_name}\n"
+            f"Blocked Users: {blocked_count}\n\n"
+            "Topic Mode me har user ke liye ek permanent topic banta hai. "
+            "Messages auto-delete nahi honge.\n\n"
+            "Connect Support Group\n\n"
+            "1. Private supergroup banao.\n"
+            "2. Topics ON karo.\n"
+            "3. Clone Bot ko Admin banao.\n"
+            "4. Manage Topics permission ON rakho.\n"
+            "5. Usi group me /connectsupport bhejo.\n\n"
+            "Connect hone ke baad har user ka alag topic automatically banega."
+        )
 
     @staticmethod
     def settings_menu():
@@ -1392,45 +1412,25 @@ class SellerBotManager:
         if a=="a_live_support":
             support=await get_live_support_settings(owner)
             blocked=await count_support_blocks(owner)
-            mode_name="Topic Mode" if support.get("mode","topic")=="topic" else "Normal Private Reply"
-            group_name=support.get("support_group_title") or "Not connected"
-            text=(
-                "💬 Live Support Settings\n\n"
-                f"Status: {'🟢 ON' if support.get('enabled') else '🔴 OFF'}\n"
-                f"Reply Mode: {mode_name}\n"
-                f"Support Group: {group_name}\n"
-                f"Blocked Users: {blocked}\n\n"
-                "Topic Mode me har user ke liye ek permanent topic banta hai. "
-                "Messages auto-delete nahi honge."
-            )
-            await q.edit_message_text(text,reply_markup=self.live_support_menu(support)); return
+            await q.edit_message_text(
+                self.live_support_text(support,blocked),
+                reply_markup=self.live_support_menu(support),
+            ); return
         if a=="a_live_support_toggle":
             support=await get_live_support_settings(owner)
             updated=await update_live_support_settings(owner,enabled=not bool(support.get("enabled")))
+            blocked=await count_support_blocks(owner)
             await q.edit_message_text(
-                f"✅ Live Support {'ON' if updated.get('enabled') else 'OFF'} ho gaya.",
+                self.live_support_text(updated,blocked),
                 reply_markup=self.live_support_menu(updated),
             ); return
         if a in {"a_live_support_mode_private","a_live_support_mode_topic"}:
             mode="private" if a.endswith("private") else "topic"
             updated=await update_live_support_settings(owner,mode=mode)
-            note=""
-            if mode=="topic" and not updated.get("support_group_id"):
-                note="\n\n⚠️ Ab private forum group me /connectsupport bhejkar support group connect karo."
+            blocked=await count_support_blocks(owner)
             await q.edit_message_text(
-                f"✅ Reply mode: {'Topic Mode' if mode=='topic' else 'Normal Private Reply'}{note}",
+                self.live_support_text(updated,blocked),
                 reply_markup=self.live_support_menu(updated),
-            ); return
-        if a=="a_live_support_connect":
-            await q.edit_message_text(
-                "👥 Connect Support Group\n\n"
-                "1. Private supergroup banao.\n"
-                "2. Topics ON karo.\n"
-                "3. Clone Bot ko Admin banao.\n"
-                "4. Manage Topics permission ON rakho.\n"
-                "5. Usi group me /connectsupport bhejo.\n\n"
-                "Connect hone ke baad har user ka alag topic automatically banega.",
-                reply_markup=self.back("a_live_support"),
             ); return
         if a=="a_live_support_group_info":
             support=await get_live_support_settings(owner)
