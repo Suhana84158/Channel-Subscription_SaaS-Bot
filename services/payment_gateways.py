@@ -21,7 +21,7 @@ from database.payment_gateways import (
     reserve_webhook_event,
     update_gateway_transaction,
 )
-from database.seller_data import activate_subscription, get_plan, create_automatic_payment
+from database.seller_data import activate_subscription, get_plan
 from database.seller_subscriptions import assign_plan_with_history, get_paid_plan
 from database.platform_features import create_invoice, audit
 
