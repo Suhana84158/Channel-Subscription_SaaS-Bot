@@ -6,6 +6,7 @@ SETTINGS = "clone_live_support_settings"
 TOPICS = "clone_live_support_topics"
 MESSAGE_LINKS = "clone_live_support_message_links"
 BLOCKS = "clone_live_support_blocks"
+TEMPLATES = "clone_live_support_templates"
 
 
 def c(name: str):
@@ -188,8 +189,6 @@ async def count_support_blocks(owner_id: int) -> int:
         {"owner_id": int(owner_id), "blocked": True}
     )
 
-TEMPLATES = "clone_live_support_templates"
-
 
 async def initialize_live_support_template_indexes():
     await c(TEMPLATES).create_index(
@@ -212,25 +211,50 @@ async def get_support_template(owner_id: int, command: str):
 
 async def save_support_template(owner_id: int, command: str, **values):
     command = str(command or "").strip().lower().lstrip("/")
-    if not command or not command.replace("_", "").isalnum():
-        raise ValueError("Command me sirf letters, numbers aur underscore use karo")
-    allowed = {"text", "media_type", "media_file_id", "buttons"}
+    if (
+        not command
+        or len(command) > 20
+        or not command.replace("_", "").isalnum()
+    ):
+        raise ValueError(
+            "Command me sirf letters, numbers aur underscore use karo (max 20)"
+        )
+
+    allowed = {
+        "text",
+        "media_type",
+        "media_file_id",
+        "buttons",
+        "auto_delete_minutes",
+    }
     clean = {key: value for key, value in values.items() if key in allowed}
-    clean["updated_at"] = datetime.now(timezone.utc)
+    if "auto_delete_minutes" in clean:
+        minutes = int(clean["auto_delete_minutes"] or 0)
+        if minutes < 0 or minutes > 10080:
+            raise ValueError("Auto remove 0 se 10080 minutes ke beech rakho")
+        clean["auto_delete_minutes"] = minutes
+
+    now = datetime.now(timezone.utc)
+    clean["updated_at"] = now
+
+    # Do not write the same path in $set and $setOnInsert. MongoDB treats that
+    # as a conflicting update, which was why Text/Media/Buttons were not saving.
+    insert_defaults = {
+        "owner_id": int(owner_id),
+        "command": command,
+        "text": "",
+        "media_type": "",
+        "media_file_id": "",
+        "buttons": [],
+        "auto_delete_minutes": 0,
+        "created_at": now,
+    }
+    for key in clean:
+        insert_defaults.pop(key, None)
+
     await c(TEMPLATES).update_one(
         {"owner_id": int(owner_id), "command": command},
-        {
-            "$set": clean,
-            "$setOnInsert": {
-                "owner_id": int(owner_id),
-                "command": command,
-                "text": "",
-                "media_type": "",
-                "media_file_id": "",
-                "buttons": [],
-                "created_at": datetime.now(timezone.utc),
-            },
-        },
+        {"$set": clean, "$setOnInsert": insert_defaults},
         upsert=True,
     )
     return await get_support_template(owner_id, command)
