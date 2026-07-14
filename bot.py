@@ -99,7 +99,7 @@ def register_handlers(application: Application):
     application.add_handler(help_callback_handler())
     application.add_handler(start_callback_handler())
     for handler in main_dashboard_handlers():
-        application.add_handler(handler)
+        application.add_handler(handler, group=-20)
     for handler in seller_subscription_management_handlers():
         application.add_handler(handler, group=-5)
     for handler in platform_feature_handlers():
