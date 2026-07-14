@@ -271,19 +271,32 @@ class SellerBotManager:
         return InlineKeyboardMarkup(keyboard) if keyboard else None
 
     async def send_welcome(self,message,context,settings,user):
-        text=self.personalize(
-            settings.get("welcome_message") or "Welcome!",
-            user,
-            settings.get("bot_name","Subscription Bot"),
-        )
+        # Seller ka editable welcome text optional hai. Agar seller text remove
+        # kare, tab bhi default welcome title aur permanent SaaS branding dikhegi.
+        seller_text=(settings.get("welcome_message") or "").strip()
+        if seller_text:
+            welcome_text=self.personalize(
+                seller_text,
+                user,
+                settings.get("bot_name","Subscription Bot"),
+            )
+        else:
+            welcome_text="👋 WELCOME TO OUR SUBSCRIPTION BOT"
 
+        # Ye branding seller edit/remove nahi kar sakta. Main bot username
+        # Render ke MAIN_BOT_USERNAME environment variable se aata hai.
         creator_line=(
-            "\n\n🤖 Bot was created by "
+            "\n\n🤖 Powered by "
             f'<a href="https://t.me/{MAIN_BOT_USERNAME}">'
             f"@{MAIN_BOT_USERNAME}</a>"
         )
-        text=f"{text}{creator_line}"
-        keyboard=self.build_welcome_keyboard(settings.get("welcome_buttons") or []) or self.main_menu()
+        text=f"{welcome_text}{creator_line}"
+
+        # Seller ke welcome buttons fully removable hain. Empty list ka matlab
+        # welcome message ke niche koi button nahi dikhana.
+        keyboard=self.build_welcome_keyboard(
+            settings.get("welcome_buttons") or []
+        )
         media_type=settings.get("welcome_media_type")
         file_id=settings.get("welcome_media_file_id")
 
