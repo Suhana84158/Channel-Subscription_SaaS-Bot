@@ -50,7 +50,6 @@ def owner_dashboard_keyboard():
         ],
         [InlineKeyboardButton("📜 Terms & Policy", callback_data="owner_terms_policy")],
         [InlineKeyboardButton("🆘 Owner Help", callback_data="main_help")],
-        home_button(),
     ])
 
 

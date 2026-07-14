@@ -91,6 +91,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Owner should land directly on the full Owner Dashboard.
+    if await is_admin(tg_user.id):
+        from handlers.main_dashboard import owner_dashboard_keyboard, owner_dashboard_text
+
+        await update.effective_message.reply_text(
+            await owner_dashboard_text(),
+            reply_markup=owner_dashboard_keyboard(),
+        )
+        return
+
     text, keyboard = await role_welcome(tg_user.id)
     await update.effective_message.reply_text(text, reply_markup=keyboard)
 
@@ -99,6 +109,16 @@ async def start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await get_or_create_user(query.from_user)
+
+    # Old owner Main Menu buttons should also return to Owner Dashboard.
+    if await is_admin(query.from_user.id):
+        from handlers.main_dashboard import owner_dashboard_keyboard, owner_dashboard_text
+
+        await query.edit_message_text(
+            await owner_dashboard_text(),
+            reply_markup=owner_dashboard_keyboard(),
+        )
+        return
 
     text, keyboard = await role_welcome(query.from_user.id)
     await query.edit_message_text(text, reply_markup=keyboard)
