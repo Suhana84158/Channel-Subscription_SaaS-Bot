@@ -80,7 +80,6 @@ def seller_dashboard_keyboard(record=None):
         ])
 
     rows.extend([
-        [InlineKeyboardButton("📖 Setup Instructions", callback_data="main_child_setup")],
         [InlineKeyboardButton("🆘 Seller Help", callback_data="main_help")],
         home_button(),
     ])
@@ -478,26 +477,23 @@ async def main_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "main_child_setup":
+        # Compatibility for old messages: open the same Create/Connect flow.
         record = await get_bot(user_id)
+        context.user_data.clear()
+        context.user_data["waiting_seller_token"] = True
         await query.edit_message_text(
-            "📖 Clone Bot Setup Guide\n\n"
+            "🤖 Create / Connect Child Bot\n\n"
+            "Follow these steps:\n\n"
             "1. Open @BotFather\n"
             "2. Send /newbot\n"
-            "3. Choose bot name and username\n"
-            "4. Copy the token\n"
-            "5. Return here and tap Create / Connect Clone Bot\n"
-            "6. Send the token\n"
-            "7. Open the new clone bot and send /admin\n\n"
-            "Security: Send only your own BotFather token.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "➕ Connect Bot" if not record else "🔄 Replace Token",
-                        callback_data="seller_connect" if not record else "seller_replace",
-                    )
-                ],
-                home_button(),
-            ]),
+            "3. Choose a bot name\n"
+            "4. Choose a bot username\n"
+            "5. Copy the BotFather token\n"
+            "6. Return here\n"
+            "7. Send your BotFather token below.\n\n"
+            "🔐 Security:\n"
+            "Only send a token from your own BotFather account.\n\n"
+            "👇 Now send your BotFather token."
         )
         return
 
