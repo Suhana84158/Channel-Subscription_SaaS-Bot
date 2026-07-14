@@ -1,10 +1,10 @@
 import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from database.admins import is_admin
 from database.payments import count_pending_payments, total_revenue
-from database.seller_bots import get_bot, total_bots
+from database.seller_bots import get_bot, total_bots, set_bot_active
 from database.seller_data import stats as seller_stats
 from database.seller_referrals import seller_referral_stats
 from database.sellers import (
@@ -15,10 +15,11 @@ from database.sellers import (
     total_sellers,
     unsuspend_seller,
 )
-from database.users import total_users
+from database.users import total_users, users_collection
 from services.bot_manager import bot_manager
 from database.seller_subscriptions import effective_plan, seller_usage
 from datetime import datetime, timezone
+from database.mongo import get_database
 
 
 def home_button():
@@ -29,29 +30,18 @@ def owner_dashboard_keyboard():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("👥 Users Management", callback_data="admin_users"),
-            InlineKeyboardButton("🏪 Sellers Management", callback_data="main_owner_sellers"),
-        ],
-        [
-            InlineKeyboardButton("🤖 Clone Bots", callback_data="main_owner_bots"),
-            InlineKeyboardButton("💳 Pending Payments", callback_data="admin_pending_payments"),
-        ],
-        [
-            InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
-            InlineKeyboardButton("📊 Main Statistics", callback_data="admin_stats"),
-        ],
-        [
-            InlineKeyboardButton("📋 Channels / Groups", callback_data="admin_channels"),
-            InlineKeyboardButton("⚙ Settings", callback_data="admin_bot_settings"),
+            InlineKeyboardButton("🏪 Seller Management", callback_data="main_owner_sellers"),
         ],
         [InlineKeyboardButton("💼 Subscription Management", callback_data="sub_mgmt_home")],
         [
-            InlineKeyboardButton("🧰 Seller Management+", callback_data="owner_seller_management_plus"),
-            InlineKeyboardButton("🩺 Health Monitoring", callback_data="owner_health"),
+            InlineKeyboardButton("📢 Broadcast", callback_data="owner_broadcast_menu"),
+            InlineKeyboardButton("📊 Main Statistics", callback_data="admin_stats"),
         ],
         [
-            InlineKeyboardButton("💾 Backup & Export", callback_data="owner_backup_export"),
+            InlineKeyboardButton("💾 Backup & Restore", callback_data="owner_backup_restore"),
             InlineKeyboardButton("🧾 Audit Logs", callback_data="owner_audit"),
         ],
+        [InlineKeyboardButton("🩺 Health Monitoring", callback_data="owner_health")],
         [InlineKeyboardButton("📜 Terms & Policy", callback_data="owner_terms_policy")],
         [InlineKeyboardButton("🆘 Owner Help", callback_data="main_help")],
     ])
@@ -343,6 +333,7 @@ async def seller_owner_view(query, owner_id: int):
     )
 
     keyboard = [
+        [InlineKeyboardButton("💎 Manage Seller Subscription", callback_data="sub_mgmt_seller_control")],
         [
             InlineKeyboardButton(
                 "✅ Unsuspend Seller" if suspended else "🚫 Suspend Seller",
@@ -351,16 +342,15 @@ async def seller_owner_view(query, owner_id: int):
                     if suspended else f"main_seller_suspend_{owner_id}"
                 ),
             )
-        ]
+        ],
     ]
 
     if record:
-        keyboard.append([
-            InlineKeyboardButton(
-                "⏹ Stop Child Bot",
-                callback_data=f"main_seller_stopbot_{owner_id}",
-            )
-        ])
+        if record.get("active"):
+            keyboard.append([InlineKeyboardButton("⏸ Pause Clone Bot", callback_data=f"main_seller_pausebot_{owner_id}")])
+        else:
+            keyboard.append([InlineKeyboardButton("▶ Resume Clone Bot", callback_data=f"main_seller_resumebot_{owner_id}")])
+        keyboard.append([InlineKeyboardButton("⏹ Stop Clone Bot Runtime", callback_data=f"main_seller_stopbot_{owner_id}")])
 
     keyboard.extend([
         [InlineKeyboardButton("⬅ Sellers", callback_data="main_owner_sellers")],
@@ -370,11 +360,72 @@ async def seller_owner_view(query, owner_id: int):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
+async def owner_broadcast_menu(query):
+    await query.edit_message_text(
+        "📢 Owner Broadcast\n\nChoose audience. After choosing, send one text, photo, video, document, voice, audio, GIF, sticker or forwarded message.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏪 Sellers Only", callback_data="owner_broadcast_sellers")],
+            [InlineKeyboardButton("👥 Main Bot Users (Non-Sellers)", callback_data="owner_broadcast_main_users")],
+            [InlineKeyboardButton("🤖 All Clone Bot Members", callback_data="owner_broadcast_clone_users")],
+            [InlineKeyboardButton("⬅ Owner Dashboard", callback_data="main_owner_dashboard")],
+        ]),
+    )
+
+
+async def owner_broadcast_receiver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target=context.user_data.get("owner_broadcast_target")
+    if not target or not await is_admin(update.effective_user.id):
+        return
+    db=get_database()
+    ids=set()
+    if target=="sellers":
+        ids={int(x["owner_id"]) for x in await get_all_sellers() if x.get("owner_id")}
+    elif target=="main_users":
+        seller_ids={int(x["owner_id"]) for x in await get_all_sellers() if x.get("owner_id")}
+        docs=await users_collection().find({}, {"user_id":1}).to_list(length=None)
+        ids={int(x["user_id"]) for x in docs if x.get("user_id")} - seller_ids
+    elif target=="clone_users":
+        ids={int(x) for x in await db["seller_users"].distinct("user_id") if x}
+    ids.discard(update.effective_user.id)
+    sent=failed=0
+    for uid in ids:
+        try:
+            await context.bot.copy_message(uid, update.effective_chat.id, update.effective_message.message_id)
+            sent+=1
+        except Exception:
+            failed+=1
+    context.user_data.pop("owner_broadcast_target",None)
+    await update.effective_message.reply_text(
+        f"✅ Broadcast completed\n\nAudience: {target.replace('_',' ').title()}\nSent: {sent}\nFailed/blocked: {failed}",
+        reply_markup=owner_dashboard_keyboard(),
+    )
+    raise ApplicationHandlerStop
+
+
 async def main_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     action = query.data
     user_id = query.from_user.id
+
+    if action == "owner_broadcast_menu":
+        if not await is_admin(user_id):
+            await query.edit_message_text("❌ Owner access only.")
+            return
+        await owner_broadcast_menu(query)
+        return
+
+    if action in {"owner_broadcast_sellers","owner_broadcast_main_users","owner_broadcast_clone_users"}:
+        if not await is_admin(user_id):
+            await query.edit_message_text("❌ Owner access only.")
+            return
+        context.user_data.clear()
+        context.user_data["owner_broadcast_target"]=action.replace("owner_broadcast_","")
+        await query.edit_message_text(
+            "📢 Send the broadcast message now.\n\nSupported: text, photo, video, document, voice, audio, GIF, sticker and forwarded message.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="owner_broadcast_menu")]]),
+        )
+        return
 
     if action == "main_owner_dashboard":
         if not await is_admin(user_id):
@@ -518,6 +569,26 @@ async def main_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await seller_owner_view(query, seller_id)
         return
 
+    if action.startswith("main_seller_pausebot_"):
+        if not await is_admin(user_id):
+            await query.edit_message_text("❌ Owner access only.")
+            return
+        seller_id=int(action.replace("main_seller_pausebot_",""))
+        await set_bot_active(seller_id,False)
+        await bot_manager.stop_bot(seller_id,"paused_by_owner")
+        await seller_owner_view(query,seller_id)
+        return
+
+    if action.startswith("main_seller_resumebot_"):
+        if not await is_admin(user_id):
+            await query.edit_message_text("❌ Owner access only.")
+            return
+        seller_id=int(action.replace("main_seller_resumebot_",""))
+        await set_bot_active(seller_id,True)
+        await bot_manager.start_bot(seller_id)
+        await seller_owner_view(query,seller_id)
+        return
+
     if action.startswith("main_seller_stopbot_"):
         if not await is_admin(user_id):
             await query.edit_message_text("❌ Owner access only.")
@@ -533,5 +604,6 @@ def main_dashboard_handlers():
         CommandHandler("dashboard", dashboard_command),
         CommandHandler("owner", owner_command),
         CommandHandler("mybots", mybots_command),
-        CallbackQueryHandler(main_callbacks, pattern=r"^main_(?!home$).+"),
+        CallbackQueryHandler(main_callbacks, pattern=r"^(?:main_(?!home$).+|owner_broadcast_.+)$"),
+        MessageHandler(filters.ALL & ~filters.COMMAND, owner_broadcast_receiver),
     ]

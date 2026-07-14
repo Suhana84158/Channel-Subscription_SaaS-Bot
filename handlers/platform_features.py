@@ -37,7 +37,7 @@ async def owner_feature_callback(update: Update, context: ContextTypes.DEFAULT_T
         await q.edit_message_text("\n".join(lines), reply_markup=back())
         return
 
-    if data == "owner_backup_export":
+    if data in {"owner_backup_export", "owner_backup_restore"}:
         collections = ["sellers", "seller_bots", "seller_users", "seller_payments", "seller_subscriptions", "seller_invoices"]
         output = io.StringIO()
         writer = csv.writer(output)
@@ -50,7 +50,7 @@ async def owner_feature_callback(update: Update, context: ContextTypes.DEFAULT_T
                 total += 1
         raw = output.getvalue().encode("utf-8")
         await context.bot.send_document(q.message.chat_id, InputFile(io.BytesIO(raw), filename=f"saas-backup-{datetime.now():%Y%m%d-%H%M}.csv"), caption=f"✅ Export ready: {total} records")
-        await q.edit_message_text("✅ Backup/export generated and sent above.", reply_markup=back())
+        await q.edit_message_text("✅ Backup generated and sent above. Keep this file safe for manual restore/migration.", reply_markup=back())
         return
 
     if data == "owner_health":
@@ -91,4 +91,4 @@ async def owner_feature_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 def handlers():
-    return [CallbackQueryHandler(owner_feature_callback, pattern=r"^owner_(seller_management_plus|backup_export|health|audit|terms_policy)$")]
+    return [CallbackQueryHandler(owner_feature_callback, pattern=r"^owner_(seller_management_plus|backup_export|backup_restore|health|audit|terms_policy)$")]
