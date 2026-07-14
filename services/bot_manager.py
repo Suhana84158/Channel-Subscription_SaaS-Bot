@@ -15,8 +15,7 @@ from database.payment_gateways import (
     SUPPORTED_GATEWAYS, create_gateway_transaction, get_gateway_config,
     save_gateway_config, set_gateway_preferences, gateway_history,
 )
-from services.payment_gateways import create_checkout, GatewayError
-from services.group_detector import connect_current_group, validate_forwarded_chat
+from services.payment_gateways import create_checkout, test_gateway_connection, GatewayError
 from database.seller_bots import get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status
 from database.platform_features import (reserve_payment_fingerprint, create_invoice, save_failed_delivery, get_failed_deliveries, resolve_failed_delivery, create_coupon, list_coupons, save_scheduled_broadcast, set_scheduled_status, audit, get_policy)
 from database.seller_data import (
@@ -1236,10 +1235,36 @@ class SellerBotManager:
             await q.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(rows)); return
         if a.startswith("a_pg_view_"):
             gateway=a.replace("a_pg_view_",""); cfg=await get_gateway_config("seller",owner,decrypt=True); g=(cfg.get("gateways") or {}).get(gateway,{})
-            await q.edit_message_text(f"💳 {gateway.title()}\n\nStatus: {'Enabled' if g.get('enabled') else 'Disabled'}\nMode: {g.get('mode','test').title()}\nCredentials: {'Set' if len(g)>2 else 'Not set'}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Enable/Disable",callback_data=f"a_pg_toggle_{gateway}")],[InlineKeyboardButton("🔑 Set Credentials",callback_data=f"a_pg_creds_{gateway}")],[InlineKeyboardButton("🧪 Test",callback_data=f"a_pg_mode_test_{gateway}"),InlineKeyboardButton("🚀 Live",callback_data=f"a_pg_mode_live_{gateway}")],[InlineKeyboardButton("⬅ Back",callback_data="a_pg_home")]])); return
+            await q.edit_message_text(
+                f"💳 {gateway.title()}\n\n"
+                f"Status: {'Enabled' if g.get('enabled') else 'Disabled'}\n"
+                f"Mode: {g.get('mode','test').title()}\n"
+                f"Credentials: {'Set' if len(g)>2 else 'Not set'}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Enable/Disable",callback_data=f"a_pg_toggle_{gateway}")],
+                    [InlineKeyboardButton("🔑 Set Credentials",callback_data=f"a_pg_creds_{gateway}")],
+                    [InlineKeyboardButton("✅ Test Connection",callback_data=f"a_pg_testconn_{gateway}")],
+                    [InlineKeyboardButton("🧪 Test Mode",callback_data=f"a_pg_mode_test_{gateway}"),InlineKeyboardButton("🚀 Live Mode",callback_data=f"a_pg_mode_live_{gateway}")],
+                    [InlineKeyboardButton("⬅ Back",callback_data="a_pg_home")],
+                ]),
+            ); return
         if a.startswith("a_pg_toggle_"):
             gateway=a.replace("a_pg_toggle_",""); cfg=await get_gateway_config("seller",owner,decrypt=True); g=(cfg.get("gateways") or {}).get(gateway,{})
             await save_gateway_config("seller",owner,gateway,{"enabled":not bool(g.get("enabled"))}); await q.edit_message_text("✅ Gateway status updated",reply_markup=self.payment_menu()); return
+        if a.startswith("a_pg_testconn_"):
+            gateway=a.replace("a_pg_testconn_","")
+            try:
+                result=await test_gateway_connection("seller",owner,gateway)
+                await q.edit_message_text(
+                    f"✅ {gateway.title()} connection successful.\n\nMode: {result.get('mode','test').title()}\nAPI access verified.",
+                    reply_markup=self.back(f"a_pg_view_{gateway}"),
+                )
+            except GatewayError as exc:
+                await q.edit_message_text(
+                    f"❌ {gateway.title()} connection failed.\n\n{exc}",
+                    reply_markup=self.back(f"a_pg_view_{gateway}"),
+                )
+            return
         if a.startswith("a_pg_mode_test_") or a.startswith("a_pg_mode_live_"):
             mode="test" if a.startswith("a_pg_mode_test_") else "live"; gateway=a.rsplit("_",1)[-1]
             await save_gateway_config("seller",owner,gateway,{"mode":mode}); await q.edit_message_text(f"✅ {gateway.title()} mode: {mode}",reply_markup=self.payment_menu()); return
@@ -1996,120 +2021,87 @@ class SellerBotManager:
                 "✅ Payment submitted. Waiting for approval."
             )
 
-    async def forward_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        owner = self.owner(context)
-        if update.effective_user.id != owner or not context.user_data.get("wait_channel"):
-            return
-
-        message = update.effective_message
-        chat = getattr(message, "forward_from_chat", None)
+    async def forward_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
+        owner=self.owner(context)
+        if update.effective_user.id!=owner or not context.user_data.get("wait_channel"): return
+        m=update.effective_message; chat=getattr(m,"forward_from_chat",None)
         if chat is None:
-            origin = getattr(message, "forward_origin", None)
-            chat = getattr(origin, "chat", None)
-
+            origin=getattr(m,"forward_origin",None); chat=getattr(origin,"chat",None)
         if chat is None:
-            await message.reply_text(
-                "❌ Forward se channel/group detect nahi hua.\n\n"
-                "Private group ke liye easy method:\n"
-                "1. Clone bot ko group me Admin banao.\n"
-                "2. Invite Users permission ON karo.\n"
-                "3. Group ke andar /connectgroup bhejo."
+            await m.reply_text(
+                "❌ Forward se group detect nahi hua.\n\n"
+                "Easy method: child bot ko group me Admin banao, phir group ke andar /connectgroup bhejo."
             )
             return
+        await add_channel(owner,chat.id,chat.title or "Unknown",getattr(chat,"type","unknown")); context.user_data.clear(); await m.reply_text("✅ Channel/group added",reply_markup=self.channels_menu())
 
-        try:
-            connected = await validate_forwarded_chat(context, chat)
-            await add_channel(
-                owner,
-                connected.chat_id,
-                connected.title,
-                connected.chat_type,
-            )
-            context.user_data.clear()
-            await message.reply_text(
-                "✅ Channel/group connected successfully.\n\n"
-                f"Name: {connected.title}\n"
-                "Invite-link permission: Working ✅",
-                reply_markup=self.channels_menu(),
-            )
-        except BadRequest as exc:
-            logger.warning(
-                "Forwarded chat connection failed owner=%s chat=%s: %s",
-                owner,
-                getattr(chat, "id", None),
-                exc,
-            )
-            await message.reply_text(
-                "❌ Channel/group connect nahi hua.\n\n"
-                "Check karo:\n"
-                "• Clone bot Admin ho\n"
-                "• Invite Users permission ON ho\n"
-                "• Forward original channel/group se ho\n\n"
-                f"Telegram error: {exc}"
-            )
 
-    async def connect_group_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Connect the current private/supergroup without a numeric chat ID."""
-        owner = self.owner(context)
-        user = update.effective_user
-        chat = update.effective_chat
-        message = update.effective_message
+    async def connect_group_command(self, update:Update, context:ContextTypes.DEFAULT_TYPE):
+        """Connect the current private/super group without asking for a numeric chat id."""
+        owner=self.owner(context)
+        user=update.effective_user
+        chat=update.effective_chat
+        message=update.effective_message
 
         if not user or user.id != owner:
             await message.reply_text("❌ Sirf bot seller/admin group connect kar sakta hai.")
             return
-
         if not chat or chat.type not in {"group", "supergroup"}:
             await message.reply_text(
-                "❌ /connectgroup target group ke andar bhejo.\n\n"
-                "Clone bot ko group me add karke Admin banao aur Invite Users permission ON rakho."
+                "❌ Ye command target group ke andar bhejo.\n\n"
+                "Child bot ko group me add karke Admin banao, phir /connectgroup send karo."
             )
             return
 
         try:
-            connected = await connect_current_group(context, chat)
-            await add_channel(
-                owner,
-                connected.chat_id,
-                connected.title,
-                connected.chat_type,
+            me=await context.bot.get_me()
+            member=await context.bot.get_chat_member(chat.id, me.id)
+            status=getattr(member, "status", "")
+            can_invite=getattr(member, "can_invite_users", False)
+            if status not in {"administrator", "creator"}:
+                await message.reply_text(
+                    "❌ Pehle child bot ko is group ka Admin banao.\n"
+                    "Invite Users permission bhi ON rakho."
+                )
+                return
+            if status != "creator" and not can_invite:
+                await message.reply_text(
+                    "❌ Bot ke paas Invite Users permission nahi hai.\n"
+                    "Group Admin settings me Invite Users permission ON karo, phir /connectgroup dobara bhejo."
+                )
+                return
+
+            await add_channel(owner, chat.id, chat.title or "Premium Group", chat.type)
+
+            # Confirm that Telegram can actually generate an invite for this chat.
+            invite=await context.bot.create_chat_invite_link(
+                chat_id=chat.id,
+                member_limit=1,
+                name="Connection test",
             )
-
-            # The test link must not remain usable.
             try:
-                await context.bot.revoke_chat_invite_link(
-                    connected.chat_id,
-                    connected.invite_link,
-                )
-            except TelegramError:
-                logger.info(
-                    "Connection-test invite could not be revoked chat=%s",
-                    connected.chat_id,
-                )
+                await context.bot.revoke_chat_invite_link(chat.id, invite.invite_link)
+            except Exception:
+                pass
 
-            context.user_data.clear()
             await message.reply_text(
                 "✅ Group connected successfully.\n\n"
-                f"Group: {connected.title}\n"
+                f"Group: {chat.title or 'Premium Group'}\n"
                 "Invite-link permission: Working ✅\n\n"
-                "Ab payment approve hone par user ko fresh one-time invite link milega."
+                "Ab payment approve hone par active user ko fresh invite link milega."
             )
+            context.user_data.clear()
         except BadRequest as exc:
-            logger.warning(
-                "Group connect failed owner=%s chat=%s: %s",
-                owner,
-                getattr(chat, "id", None),
-                exc,
-            )
+            logger.warning("Group connect failed owner=%s chat=%s: %s", owner, getattr(chat,'id',None), exc)
             await message.reply_text(
-                "❌ Group connect nahi hua.\n\n"
+                "❌ Group save nahi hua ya invite link create nahi ho saka.\n\n"
                 "Check karo:\n"
-                "• Clone bot group me Admin ho\n"
+                "• Bot group me Admin ho\n"
                 "• Invite Users permission ON ho\n"
-                "• Group private group/supergroup ho\n\n"
+                "• Group supergroup/private group ho\n\n"
                 f"Telegram error: {exc}"
             )
-        except TelegramError as exc:
+        except Exception as exc:
             logger.exception("Unexpected group connect error owner=%s", owner)
             await message.reply_text(f"❌ Group connect failed: {exc}")
 

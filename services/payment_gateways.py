@@ -38,6 +38,13 @@ def _base_url() -> str:
 
 
 async def _request(method: str, url: str, **kwargs) -> dict:
+    status, data = await _request_with_status(method, url, **kwargs)
+    if status >= 400:
+        raise GatewayError(f"Gateway HTTP {status}: {data}")
+    return data
+
+
+async def _request_with_status(method: str, url: str, **kwargs) -> tuple[int, dict]:
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.request(method, url, **kwargs) as response:
@@ -46,11 +53,27 @@ async def _request(method: str, url: str, **kwargs) -> dict:
                 data = json.loads(text) if text else {}
             except json.JSONDecodeError:
                 data = {"raw": text}
-            if response.status >= 400:
-                raise GatewayError(f"Gateway HTTP {response.status}: {data}")
-            return data
+            return response.status, data
 
 
+def _cashfree_base(mode: str) -> str:
+    return "https://sandbox.cashfree.com/pg" if mode == "test" else "https://api.cashfree.com/pg"
+
+
+def _cashfree_headers(settings: dict, *, idempotency_key: str | None = None) -> dict[str, str]:
+    client_id = settings.get("client_id")
+    client_secret = settings.get("client_secret")
+    if not client_id or not client_secret:
+        raise GatewayError("Cashfree App ID or Secret Key is missing")
+    headers = {
+        "x-client-id": str(client_id),
+        "x-client-secret": str(client_secret),
+        "x-api-version": "2025-01-01",
+        "Content-Type": "application/json",
+    }
+    if idempotency_key:
+        headers["x-idempotency-key"] = idempotency_key
+    return headers
 
 
 async def test_gateway_connection(scope: str, owner_id: int, gateway: str) -> dict:
@@ -69,7 +92,19 @@ async def test_gateway_connection(scope: str, owner_id: int, gateway: str) -> di
             headers={"Authorization": f"Basic {auth}"},
         )
         return {"ok": True, "gateway": gateway, "mode": mode}
-    raise GatewayError(f"Connection test for {gateway.title()} will be added in its gateway patch")
+    if gateway == "cashfree":
+        # A missing test order should return 404 when authentication is valid.
+        # Authentication failures return 401/403, so no real payment/order is created.
+        probe_order = f"connection_test_{int(time.time())}"
+        status, data = await _request_with_status(
+            "GET",
+            f"{_cashfree_base(mode)}/orders/{probe_order}",
+            headers=_cashfree_headers(settings),
+        )
+        if status in {200, 404}:
+            return {"ok": True, "gateway": gateway, "mode": mode}
+        raise GatewayError(f"Cashfree authentication failed (HTTP {status}): {data}")
+    raise GatewayError(f"Connection test for {gateway.title()} is not enabled in this launch version")
 
 
 async def create_checkout(transaction: dict) -> dict:
@@ -111,10 +146,8 @@ async def _create_razorpay(tx: dict, s: dict) -> dict:
 
 
 async def _create_cashfree(tx: dict, s: dict) -> dict:
-    client_id, client_secret = s.get("client_id"), s.get("client_secret")
-    if not client_id or not client_secret:
-        raise GatewayError("Cashfree credentials are incomplete")
-    base = "https://sandbox.cashfree.com/pg" if s.get("mode", "test") == "test" else "https://api.cashfree.com/pg"
+    mode = s.get("mode", "test")
+    base = _cashfree_base(mode)
     payload = {
         "order_id": tx["transaction_id"],
         "order_amount": tx["amount"],
@@ -130,7 +163,12 @@ async def _create_cashfree(tx: dict, s: dict) -> dict:
         },
         "order_note": tx["metadata"].get("description", tx["purpose"]),
     }
-    data = await _request("POST", f"{base}/orders", headers={"x-client-id": client_id, "x-client-secret": client_secret, "x-api-version": "2025-01-01", "Content-Type": "application/json", "x-idempotency-key": tx["transaction_id"]}, json=payload)
+    data = await _request(
+        "POST",
+        f"{base}/orders",
+        headers=_cashfree_headers(s, idempotency_key=tx["transaction_id"]),
+        json=payload,
+    )
     checkout = f"{_base_url()}/checkout/cashfree/{tx['transaction_id']}"
     return {"gateway_order_id": data.get("cf_order_id", tx["transaction_id"]), "payment_session_id": data.get("payment_session_id", ""), "checkout_url": checkout, "gateway_response": data, "gateway_mode": s.get("mode", "test"), "status": "pending"}
 
@@ -203,8 +241,14 @@ async def verify_and_process_webhook(gateway: str, scope: str, owner_id: int, he
     elif gateway == "cashfree":
         timestamp = headers.get("x-webhook-timestamp", "")
         signature = headers.get("x-webhook-signature", "")
-        expected = base64.b64encode(hmac.new(str(s.get("client_secret", "")).encode(), timestamp.encode() + raw_body, hashlib.sha256).digest()).decode()
-        if not signature or not hmac.compare_digest(expected, signature):
+        client_secret = str(s.get("client_secret", ""))
+        if not client_secret or not timestamp or not signature:
+            return False, "cashfree webhook credentials/headers missing"
+        signed_payload = timestamp.encode("utf-8") + raw_body
+        expected = base64.b64encode(
+            hmac.new(client_secret.encode("utf-8"), signed_payload, hashlib.sha256).digest()
+        ).decode("utf-8")
+        if not hmac.compare_digest(expected, signature):
             return False, "invalid signature"
         data = payload.get("data") or {}
         order, payment = data.get("order") or {}, data.get("payment") or {}
