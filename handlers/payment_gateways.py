@@ -13,7 +13,7 @@ from database.payment_gateways import (
     set_gateway_preferences,
 )
 from database.seller_subscriptions import get_paid_plan
-from services.payment_gateways import GatewayError, create_checkout
+from services.payment_gateways import GatewayError, create_checkout, test_gateway_connection
 
 
 def _kb(rows):
@@ -40,6 +40,7 @@ def _gateway_keyboard(scope: str, gateway: str, enabled: bool):
     return _kb([
         [InlineKeyboardButton("⛔ Disable" if enabled else "✅ Enable", callback_data=f"pgcfg_{scope}_{gateway}_toggle")],
         [InlineKeyboardButton("🔑 Set Credentials", callback_data=f"pgcfg_{scope}_{gateway}_credentials")],
+        [InlineKeyboardButton("✅ Test Connection", callback_data=f"pgcfg_{scope}_{gateway}_test")],
         [InlineKeyboardButton("🧪 Test Mode", callback_data=f"pgcfg_{scope}_{gateway}_mode_test"), InlineKeyboardButton("🚀 Live Mode", callback_data=f"pgcfg_{scope}_{gateway}_mode_live")],
         [InlineKeyboardButton("⬅ Back", callback_data=f"pgcfg_{scope}_home")],
     ])
@@ -140,6 +141,22 @@ async def gateway_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode = suffix.replace("mode_", "")
         await save_gateway_config(scope, owner_id, gateway, {"mode": mode})
         await q.edit_message_text(f"✅ {gateway.title()} mode set to {mode.title()}.", reply_markup=_home_keyboard(scope))
+        return
+
+    if suffix == "test":
+        try:
+            result = await test_gateway_connection(scope, owner_id, gateway)
+            await q.edit_message_text(
+                f"✅ {gateway.title()} connection successful.\n\n"
+                f"Mode: {result.get('mode', 'test').title()}\n"
+                f"Account/API access verified.",
+                reply_markup=_gateway_keyboard(scope, gateway, bool(gcfg.get("enabled"))),
+            )
+        except GatewayError as exc:
+            await q.edit_message_text(
+                f"❌ {gateway.title()} connection failed.\n\n{exc}",
+                reply_markup=_gateway_keyboard(scope, gateway, bool(gcfg.get("enabled"))),
+            )
         return
 
     if suffix == "credentials":
