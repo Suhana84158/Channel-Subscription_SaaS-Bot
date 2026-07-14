@@ -266,17 +266,33 @@ async def mybots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def seller_management_menu(query):
+    total = await total_sellers()
+    await query.edit_message_text(
+        "🏪 Seller Management\n\n"
+        f"Total Sellers: {total}\n\n"
+        "Search a seller by Telegram User ID or @username, or open the seller list.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 Search Seller", callback_data="main_seller_search")],
+            [InlineKeyboardButton("📋 Seller List", callback_data="main_seller_list")],
+            [InlineKeyboardButton("⬅ Owner Dashboard", callback_data="main_owner_dashboard")],
+        ]),
+    )
+
+
 async def list_sellers(query):
     sellers = await get_all_sellers()
 
     if not sellers:
         await query.edit_message_text(
-            "🏪 Sellers Management\n\nNo sellers registered yet.",
-            reply_markup=InlineKeyboardMarkup([home_button()]),
+            "🏪 Seller List\n\nNo sellers registered yet.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅ Seller Management", callback_data="main_owner_sellers")]
+            ]),
         )
         return
 
-    lines = [f"🏪 Sellers Management\n\nTotal Sellers: {len(sellers)}\n"]
+    lines = [f"📋 Seller List\n\nTotal Sellers: {len(sellers)}\n"]
     keyboard = []
 
     for seller in sellers[:40]:
@@ -294,7 +310,7 @@ async def list_sellers(query):
             )
         ])
 
-    keyboard.append([InlineKeyboardButton("⬅ Owner Dashboard", callback_data="main_owner_dashboard")])
+    keyboard.append([InlineKeyboardButton("⬅ Seller Management", callback_data="main_owner_sellers")])
     await query.edit_message_text(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -332,7 +348,7 @@ async def seller_owner_view(query, owner_id: int):
     )
 
     keyboard = [
-        [InlineKeyboardButton("💎 Manage Seller Subscription", callback_data="sub_mgmt_seller_control")],
+        [InlineKeyboardButton("⏳ Extend Subscription", callback_data=f"sub_mgmt_extend_{owner_id}")],
         [
             InlineKeyboardButton(
                 "✅ Unsuspend Seller" if suspended else "🚫 Suspend Seller",
@@ -372,8 +388,62 @@ async def owner_broadcast_menu(query):
 
 
 async def owner_broadcast_receiver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id):
+        return
+
+    if context.user_data.get("owner_seller_search"):
+        import re
+        raw=(update.effective_message.text or "").strip()
+        seller=None
+        if raw.startswith("@"):
+            seller=await get_database()["sellers"].find_one({"username":{"$regex":f"^{re.escape(raw[1:])}$","$options":"i"}})
+        else:
+            try:
+                seller=await get_seller(int(raw))
+            except ValueError:
+                seller=await get_database()["sellers"].find_one({"username":{"$regex":f"^{re.escape(raw)}$","$options":"i"}})
+        if not seller:
+            await update.effective_message.reply_text(
+                "❌ Seller not found. Send a valid Seller ID or @username.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅ Seller Management",callback_data="main_owner_sellers")]
+                ]),
+            )
+            raise ApplicationHandlerStop
+        context.user_data.clear()
+        owner_id=int(seller["owner_id"])
+        # Send the same Seller Details page without asking for another search.
+        record=await get_bot(owner_id)
+        name=seller.get("first_name") or "-"
+        username=f"@{seller.get('username')}" if seller.get("username") else "-"
+        suspended=bool(seller.get("suspended"))
+        text=(
+            "🏪 Seller Details\n\n"
+            f"🆔 Seller ID: {owner_id}\n"
+            f"👤 Name: {name}\n"
+            f"📝 Username: {username}\n"
+            f"✅ Approved: {'Yes' if seller.get('approved') else 'No'}\n"
+            f"🚫 Suspended: {'Yes' if suspended else 'No'}\n\n"
+            f"🤖 Clone Bot: @{record.get('bot_username') if record else '-'}\n"
+            f"📌 Bot Status: {'Active' if record and record.get('active') else 'Paused / Not connected'}\n"
+            f"⚙ Runtime: {(record or {}).get('runtime_status','-')}"
+        )
+        keyboard=[
+            [InlineKeyboardButton("⏳ Extend Subscription",callback_data=f"sub_mgmt_extend_{owner_id}")],
+            [InlineKeyboardButton("✅ Unsuspend Seller" if suspended else "🚫 Suspend Seller",callback_data=f"main_seller_unsuspend_{owner_id}" if suspended else f"main_seller_suspend_{owner_id}")],
+        ]
+        if record:
+            keyboard.append([InlineKeyboardButton("⏸ Pause Clone Bot" if record.get("active") else "▶ Resume Clone Bot",callback_data=f"main_seller_pausebot_{owner_id}" if record.get("active") else f"main_seller_resumebot_{owner_id}")])
+            keyboard.append([InlineKeyboardButton("⏹ Stop Clone Bot Runtime",callback_data=f"main_seller_stopbot_{owner_id}")])
+        keyboard += [
+            [InlineKeyboardButton("⬅ Seller Management",callback_data="main_owner_sellers")],
+            [InlineKeyboardButton("⬅ Owner Dashboard",callback_data="main_owner_dashboard")],
+        ]
+        await update.effective_message.reply_text(text,reply_markup=InlineKeyboardMarkup(keyboard))
+        raise ApplicationHandlerStop
+
     target=context.user_data.get("owner_broadcast_target")
-    if not target or not await is_admin(update.effective_user.id):
+    if not target:
         return
     db=get_database()
     ids=set()
@@ -501,7 +571,29 @@ async def main_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await is_admin(user_id):
             await query.edit_message_text("❌ Owner access only.")
             return
+        context.user_data.pop("owner_seller_search", None)
+        await seller_management_menu(query)
+        return
+
+    if action == "main_seller_list":
+        if not await is_admin(user_id):
+            await query.edit_message_text("❌ Owner access only.")
+            return
         await list_sellers(query)
+        return
+
+    if action == "main_seller_search":
+        if not await is_admin(user_id):
+            await query.edit_message_text("❌ Owner access only.")
+            return
+        context.user_data.clear()
+        context.user_data["owner_seller_search"] = True
+        await query.edit_message_text(
+            "🔍 Search Seller\n\nSend the seller's Telegram User ID or @username.\n\nExamples:\n1216769499\n@username",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅ Seller Management", callback_data="main_owner_sellers")]
+            ]),
+        )
         return
 
     if action == "main_owner_bots":

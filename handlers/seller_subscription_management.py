@@ -30,6 +30,33 @@ def main_menu():
         [InlineKeyboardButton("⬅ Owner Dashboard", callback_data="main_owner_dashboard")],
     ])
 
+
+async def extension_confirmation(update_message, context, seller_id, plan_id, days):
+    seller=await get_seller(int(seller_id)) or {}
+    plan=await get_paid_plan(plan_id) or {}
+    from database.seller_subscriptions import get_assignment
+    from datetime import timedelta
+    current=await get_assignment(int(seller_id)) or {}
+    current_expiry=current.get("expiry_date")
+    if current_expiry and current_expiry.tzinfo is None:
+        current_expiry=current_expiry.replace(tzinfo=timezone.utc)
+    base=current_expiry if current_expiry and current_expiry>datetime.now(timezone.utc) else datetime.now(timezone.utc)
+    new_expiry=base+timedelta(days=int(days))
+    context.user_data.clear()
+    context.user_data["pending_extension"]={"seller_id":int(seller_id),"plan_id":plan_id,"days":int(days)}
+    await update_message.reply_text(
+        "✅ Confirm Subscription Extension\n\n"
+        f"Seller: {seller.get('first_name') or seller_id}\n"
+        f"Plan: {plan.get('name',plan_id)}\n"
+        f"Extension: +{int(days)} Days\n"
+        f"New Expiry: {new_expiry.strftime('%d %b %Y')}\n\n"
+        "Do you want to continue?",
+        reply_markup=kb([
+            [InlineKeyboardButton("✅ Confirm Extension",callback_data="sub_mgmt_extend_confirm")],
+            [InlineKeyboardButton("❌ Cancel",callback_data=f"sub_mgmt_extend_cancel_{int(seller_id)}")],
+        ]),
+    )
+
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer(); a=q.data
     if not await is_admin(q.from_user.id): await q.answer("Owner only", show_alert=True); return
@@ -129,11 +156,11 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Send the seller's Telegram User ID or @username.",
             reply_markup=back(),
         ); return
-    if a.startswith("sub_mgmt_extend_"):
+    if a.startswith("sub_mgmt_extend_") and a.replace("sub_mgmt_extend_", "").isdigit():
         seller_id=int(a.replace("sub_mgmt_extend_", ""))
         seller=await get_seller(seller_id)
         if not seller:
-            await q.edit_message_text("❌ Seller not found.", reply_markup=back()); return
+            await q.edit_message_text("❌ Seller not found.", reply_markup=back("main_owner_sellers")); return
         rows=[]
         for plan in cfg.get("paid_plans", []):
             if plan.get("active", True):
@@ -141,7 +168,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"💎 {plan.get('name','Plan')}",
                     callback_data=f"sub_mgmt_extplan_{seller_id}_{plan['plan_id']}",
                 )])
-        rows.append([InlineKeyboardButton("⬅ Back", callback_data="sub_mgmt_seller_control")])
+        rows.append([InlineKeyboardButton("⬅ Seller Details", callback_data=f"main_seller_view_{seller_id}")])
         await q.edit_message_text(
             f"⏳ Extend Subscription\n\nSeller: {seller.get('first_name') or seller_id}\n\nSelect a plan:",
             reply_markup=kb(rows),
@@ -152,20 +179,65 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         seller_id=int(seller_id_text)
         plan=await get_paid_plan(plan_id)
         if not plan:
-            await q.edit_message_text("❌ Plan not found.", reply_markup=back()); return
+            await q.edit_message_text("❌ Plan not found.", reply_markup=back(f"sub_mgmt_extend_{seller_id}")); return
+        rows=[
+            [InlineKeyboardButton("7 Days",callback_data=f"sub_mgmt_extdays_{seller_id}_{plan_id}_7"),InlineKeyboardButton("15 Days",callback_data=f"sub_mgmt_extdays_{seller_id}_{plan_id}_15")],
+            [InlineKeyboardButton("30 Days",callback_data=f"sub_mgmt_extdays_{seller_id}_{plan_id}_30"),InlineKeyboardButton("90 Days",callback_data=f"sub_mgmt_extdays_{seller_id}_{plan_id}_90")],
+            [InlineKeyboardButton("180 Days",callback_data=f"sub_mgmt_extdays_{seller_id}_{plan_id}_180"),InlineKeyboardButton("365 Days",callback_data=f"sub_mgmt_extdays_{seller_id}_{plan_id}_365")],
+            [InlineKeyboardButton("✍ Custom Days",callback_data=f"sub_mgmt_extcustom_{seller_id}_{plan_id}")],
+            [InlineKeyboardButton("⬅ Select Plan",callback_data=f"sub_mgmt_extend_{seller_id}")],
+        ]
+        await q.edit_message_text(
+            f"⏳ Extend Subscription\n\nSelected Plan: {plan.get('name',plan_id)}\n\nHow many days of validity do you want to add?",
+            reply_markup=kb(rows),
+        ); return
+    if a.startswith("sub_mgmt_extdays_"):
+        raw=a.replace("sub_mgmt_extdays_","")
+        seller_id_text,rest=raw.split("_",1)
+        plan_id,days_text=rest.rsplit("_",1)
+        seller=await get_seller(int(seller_id_text)) or {}
+        plan=await get_paid_plan(plan_id) or {}
+        from database.seller_subscriptions import get_assignment
+        from datetime import timedelta
+        current=await get_assignment(int(seller_id_text)) or {}
+        current_expiry=current.get("expiry_date")
+        if current_expiry and current_expiry.tzinfo is None:
+            current_expiry=current_expiry.replace(tzinfo=timezone.utc)
+        base=current_expiry if current_expiry and current_expiry>datetime.now(timezone.utc) else datetime.now(timezone.utc)
+        new_expiry=base+timedelta(days=int(days_text))
+        context.user_data.clear()
+        context.user_data["pending_extension"]={"seller_id":int(seller_id_text),"plan_id":plan_id,"days":int(days_text)}
+        await q.edit_message_text(
+            "✅ Confirm Subscription Extension\n\n"
+            f"Seller: {seller.get('first_name') or seller_id_text}\n"
+            f"Plan: {plan.get('name',plan_id)}\n"
+            f"Extension: +{int(days_text)} Days\n"
+            f"New Expiry: {new_expiry.strftime('%d %b %Y')}\n\n"
+            "Do you want to continue?",
+            reply_markup=kb([
+                [InlineKeyboardButton("✅ Confirm Extension",callback_data="sub_mgmt_extend_confirm")],
+                [InlineKeyboardButton("❌ Cancel",callback_data=f"sub_mgmt_extend_cancel_{int(seller_id_text)}")],
+            ]),
+        )
+        return
+    if a.startswith("sub_mgmt_extcustom_"):
+        raw=a.replace("sub_mgmt_extcustom_","")
+        seller_id_text,plan_id=raw.split("_",1)
         context.user_data.clear()
         context.user_data["sub_wait"]="extend_days"
-        context.user_data["extend_seller_id"]=seller_id
+        context.user_data["extend_seller_id"]=int(seller_id_text)
         context.user_data["extend_plan_id"]=plan_id
         await q.edit_message_text(
-            f"⏳ Extend Subscription\n\nSelected Plan: {plan.get('name',plan_id)}\n\n"
-            "How many days of validity do you want to add?\n\nSend only a number, for example: 30",
-            reply_markup=back(f"sub_mgmt_extend_{seller_id}"),
+            "✍ Custom Validity\n\nSend only the number of days.\n\nExample: 30",
+            reply_markup=back(f"sub_mgmt_extplan_{seller_id_text}_{plan_id}"),
         ); return
     if a=="sub_mgmt_extend_confirm":
         pending=context.user_data.get("pending_extension")
         if not pending:
-            await q.edit_message_text("❌ Extension session expired. Start again.", reply_markup=back("sub_mgmt_seller_control")); return
+            await q.edit_message_text(
+                "❌ Extension session expired. Please select the seller again.",
+                reply_markup=back("main_owner_sellers"),
+            ); return
         result=await extend_plan_with_history(
             pending["seller_id"], pending["plan_id"], pending["days"],
             "owner", q.from_user.id,
@@ -190,11 +262,18 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Plan: {plan.get('name',pending['plan_id'])}\n"
             f"Added: {pending['days']} Days\n"
             f"New Expiry: {expiry.strftime('%d %b %Y, %I:%M %p UTC') if expiry else '-'}",
-            reply_markup=back("sub_mgmt_seller_control"),
+            reply_markup=back(f"main_seller_view_{pending['seller_id']}"),
         ); return
-    if a=="sub_mgmt_extend_cancel":
+    if a.startswith("sub_mgmt_extend_cancel"):
+        pending=context.user_data.get("pending_extension") or {}
+        seller_id=pending.get("seller_id")
+        if not seller_id and a.startswith("sub_mgmt_extend_cancel_"):
+            seller_id=int(a.replace("sub_mgmt_extend_cancel_",""))
         context.user_data.clear()
-        await q.edit_message_text("❌ Extension cancelled.", reply_markup=back("sub_mgmt_seller_control")); return
+        await q.edit_message_text(
+            "❌ Extension cancelled.",
+            reply_markup=back(f"main_seller_view_{seller_id}" if seller_id else "main_owner_sellers"),
+        ); return
     if a=="sub_mgmt_history":
         hist=await subscription_history(limit=25); lines=["📜 Seller Subscription History\n"]
         for h in hist: lines.append(f"• {h.get('owner_id')} | {h.get('action')} | {h.get('new_plan',h.get('target_plan_id','-'))} | {h.get('created_at').strftime('%d-%m %H:%M')}")
@@ -260,30 +339,7 @@ async def receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise ValueError("Days must be between 1 and 3650")
             seller_id=int(context.user_data["extend_seller_id"])
             plan_id=context.user_data["extend_plan_id"]
-            seller=await get_seller(seller_id) or {}
-            plan=await get_paid_plan(plan_id) or {}
-            from database.seller_subscriptions import get_assignment
-            current=await get_assignment(seller_id) or {}
-            current_expiry=current.get("expiry_date")
-            if current_expiry and current_expiry.tzinfo is None:
-                current_expiry=current_expiry.replace(tzinfo=timezone.utc)
-            base=current_expiry if current_expiry and current_expiry > datetime.now(timezone.utc) else datetime.now(timezone.utc)
-            from datetime import timedelta
-            new_expiry=base + timedelta(days=days)
-            context.user_data.clear()
-            context.user_data["pending_extension"]={"seller_id":seller_id,"plan_id":plan_id,"days":days}
-            await update.effective_message.reply_text(
-                "✅ Confirm Subscription Extension\n\n"
-                f"Seller: {seller.get('first_name') or seller_id}\n"
-                f"Plan: {plan.get('name',plan_id)}\n"
-                f"Extension: +{days} Days\n"
-                f"New Expiry: {new_expiry.strftime('%d %b %Y')}\n\n"
-                "Do you want to continue?",
-                reply_markup=kb([
-                    [InlineKeyboardButton("✅ Confirm", callback_data="sub_mgmt_extend_confirm")],
-                    [InlineKeyboardButton("❌ Cancel", callback_data="sub_mgmt_extend_cancel")],
-                ]),
-            )
+            await extension_confirmation(update.effective_message,context,seller_id,plan_id,days)
             return
         context.user_data.clear(); await update.effective_message.reply_text("✅ Saved.",reply_markup=main_menu())
     except Exception as e: await update.effective_message.reply_text(f"❌ Invalid format: {e}")
