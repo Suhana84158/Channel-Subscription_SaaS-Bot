@@ -21,7 +21,9 @@ def seller_keyboard(record=None):
     if not record:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Create / Connect Child Bot", callback_data="seller_connect")],
-            [InlineKeyboardButton("📖 Setup Guide", callback_data="main_child_setup")],
+            [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
+            [InlineKeyboardButton("📊 View Current Plan", callback_data="seller_current_plan")],
+            [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
             [InlineKeyboardButton("⬅ Main Menu", callback_data="main_home")],
         ])
     active = bool(record.get("active"))
@@ -103,8 +105,22 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current=1 if await get_bot(owner_id) else 0
             if limit>=0 and current>=limit:
                 await q.edit_message_text(await plan_limit_warning(owner_id), reply_markup=limit_keyboard()); return
-        context.user_data.clear(); context.user_data["waiting_seller_token"]=True
-        await q.edit_message_text("Send your BotFather token.")
+        context.user_data.clear()
+        context.user_data["waiting_seller_token"] = True
+        await q.edit_message_text(
+            "🤖 Create / Connect Child Bot\n\n"
+            "Follow these steps:\n\n"
+            "1. Open @BotFather\n"
+            "2. Send /newbot\n"
+            "3. Choose a bot name\n"
+            "4. Choose a bot username\n"
+            "5. Copy the BotFather token\n"
+            "6. Return here\n"
+            "7. Send your BotFather token below.\n\n"
+            "🔐 Security:\n"
+            "Only send a token from your own BotFather account.\n\n"
+            "👇 Now send your BotFather token."
+        )
         return
     if action=="seller_my_bot":
         if not record: await q.edit_message_text("No bot connected.",reply_markup=seller_keyboard(None)); return

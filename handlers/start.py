@@ -38,7 +38,9 @@ def seller_welcome_keyboard(has_bot: bool):
         ])
 
     rows.extend([
-        [InlineKeyboardButton("📖 Child Bot Setup Guide", callback_data="main_child_setup")],
+        [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
+        [InlineKeyboardButton("📊 View Current Plan", callback_data="seller_current_plan")],
+        [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
         [InlineKeyboardButton("🆘 Help & Commands", callback_data="main_help")],
     ])
     return InlineKeyboardMarkup(rows)
