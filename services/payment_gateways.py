@@ -21,7 +21,7 @@ from database.payment_gateways import (
     reserve_webhook_event,
     update_gateway_transaction,
 )
-from database.seller_data import activate_subscription, get_plan
+from database.seller_data import activate_subscription, get_plan, create_automatic_payment
 from database.seller_subscriptions import assign_plan_with_history, get_paid_plan
 from database.platform_features import create_invoice, audit
 
@@ -49,6 +49,27 @@ async def _request(method: str, url: str, **kwargs) -> dict:
             if response.status >= 400:
                 raise GatewayError(f"Gateway HTTP {response.status}: {data}")
             return data
+
+
+
+
+async def test_gateway_connection(scope: str, owner_id: int, gateway: str) -> dict:
+    """Validate stored credentials without creating or charging a payment."""
+    cfg = await get_gateway_config(scope, owner_id, decrypt=True)
+    settings = (cfg.get("gateways") or {}).get(gateway) or {}
+    mode = settings.get("mode", "test")
+    if gateway == "razorpay":
+        key_id, key_secret = settings.get("key_id"), settings.get("key_secret")
+        if not key_id or not key_secret:
+            raise GatewayError("Razorpay Key ID or Key Secret is missing")
+        auth = base64.b64encode(f"{key_id}:{key_secret}".encode()).decode()
+        await _request(
+            "GET",
+            "https://api.razorpay.com/v1/orders?count=1",
+            headers={"Authorization": f"Basic {auth}"},
+        )
+        return {"ok": True, "gateway": gateway, "mode": mode}
+    raise GatewayError(f"Connection test for {gateway.title()} will be added in its gateway patch")
 
 
 async def create_checkout(transaction: dict) -> dict:
@@ -248,9 +269,40 @@ async def fulfill_transaction(tx: dict) -> None:
         plan = await get_paid_plan(plan_id)
         if not plan:
             raise GatewayError("Seller plan no longer exists")
-        await assign_plan_with_history(tx["payer_user_id"], plan_id, int(plan.get("duration_days", 30)), f"gateway:{tx['gateway']}", tx["amount"], 0)
-        await audit("seller_plan_gateway_paid", tx["payer_user_id"], tx["owner_id"], {"transaction_id": tx["transaction_id"], "gateway": tx["gateway"]})
-        await mark_transaction_fulfilled(tx["transaction_id"], {"plan_id": plan_id})
+        assignment = await assign_plan_with_history(
+            tx["payer_user_id"],
+            plan_id,
+            int(plan.get("duration_days", 30)),
+            f"gateway:{tx['gateway']}",
+            tx["amount"],
+            0,
+        )
+        payment_record = {
+            "payment_id": tx.get("gateway_payment_id") or tx["transaction_id"],
+            "plan": plan.get("name", plan_id),
+            "amount": tx["amount"],
+        }
+        invoice = await create_invoice(0, tx["payer_user_id"], payment_record, "Platform Owner")
+        await audit(
+            "seller_plan_gateway_paid",
+            tx["payer_user_id"],
+            0,
+            {
+                "transaction_id": tx["transaction_id"],
+                "gateway": tx["gateway"],
+                "plan_id": plan_id,
+                "request_type": tx.get("metadata", {}).get("request_type", "upgrade"),
+                "invoice_no": invoice.get("invoice_no"),
+            },
+        )
+        await mark_transaction_fulfilled(
+            tx["transaction_id"],
+            {
+                "plan_id": plan_id,
+                "expiry_date": assignment.get("expiry_date"),
+                "invoice_no": invoice.get("invoice_no"),
+            },
+        )
         return
     if tx["purpose"] == "child_subscription":
         seller_id = tx["owner_id"]
