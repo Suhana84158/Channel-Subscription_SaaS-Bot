@@ -269,9 +269,15 @@ class SellerBotManager:
         ) or "Unknown"
 
         now=datetime.now(timezone.utc)
+        expiry_date=(sub or {}).get("expiry_date")
+        if expiry_date and expiry_date.tzinfo is None:
+            expiry_date=expiry_date.replace(tzinfo=timezone.utc)
+        elif expiry_date:
+            expiry_date=expiry_date.astimezone(timezone.utc)
+
         active=bool(
-            sub and sub.get("active") and sub.get("expiry_date")
-            and sub["expiry_date"]>now
+            sub and sub.get("active") and expiry_date
+            and expiry_date>now
         )
 
         text=(
@@ -283,7 +289,7 @@ class SellerBotManager:
             f"📋 Reason: {user.get('ban_reason') or '-'}\n"
             f"📅 Joined: {self.format_dt(user.get('joined_at'))}\n\n"
             f"💎 Plan: {(sub or {}).get('plan') or 'No Plan'}\n"
-            f"📅 Expiry: {self.format_dt((sub or {}).get('expiry_date'))}\n"
+            f"📅 Expiry: {self.format_dt(expiry_date)}\n"
             f"📌 Status: {'Active' if active else 'No Subscription'}"
         )
         return text,user,sub
