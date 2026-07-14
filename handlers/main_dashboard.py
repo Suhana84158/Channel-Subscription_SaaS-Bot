@@ -1,4 +1,3 @@
-import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
@@ -6,7 +5,6 @@ from database.admins import is_admin
 from database.payments import count_pending_payments, total_revenue
 from database.seller_bots import get_bot, total_bots
 from database.seller_data import stats as seller_stats
-from database.seller_referrals import seller_referral_stats
 from database.sellers import (
     get_all_sellers,
     get_or_create_seller,
@@ -17,6 +15,8 @@ from database.sellers import (
 )
 from database.users import total_users
 from services.bot_manager import bot_manager
+from database.seller_subscriptions import effective_plan, seller_usage
+from datetime import datetime, timezone
 
 
 def home_button():
@@ -62,6 +62,7 @@ def seller_dashboard_keyboard(record=None):
     if record:
         active = bool(record.get("active"))
         rows.extend([
+            [InlineKeyboardButton("👤 Seller Profile", callback_data="main_seller_profile")],
             [InlineKeyboardButton("🤖 My Bot", callback_data="seller_my_bot")],
             [
                 InlineKeyboardButton(
@@ -76,6 +77,7 @@ def seller_dashboard_keyboard(record=None):
             [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
         ])
     else:
+        rows.append([InlineKeyboardButton("👤 Seller Profile", callback_data="main_seller_profile")])
         rows.append([
             InlineKeyboardButton("➕ Create / Connect Clone Bot", callback_data="seller_connect")
         ])
@@ -86,7 +88,6 @@ def seller_dashboard_keyboard(record=None):
         ])
 
     rows.extend([
-        [InlineKeyboardButton("🤝 Seller Referral", callback_data="main_seller_referral")],
         [InlineKeyboardButton("📖 Setup Instructions", callback_data="main_child_setup")],
         [InlineKeyboardButton("🆘 Seller Help", callback_data="main_help")],
         home_button(),
@@ -138,6 +139,103 @@ async def seller_dashboard_text(user_id: int):
         "Open your clone bot and send /admin for plan, payment, user, "
         "broadcast and channel controls."
     ), record
+
+
+def _aware_utc(value):
+    if not value:
+        return None
+    if getattr(value, "tzinfo", None) is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _limit_display(value):
+    try:
+        number=int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return "Unlimited" if number < 0 else f"{number:,}"
+
+
+async def seller_profile_text(user):
+    owner_id=int(user.id)
+    seller=await get_or_create_seller(user)
+    record=await get_bot(owner_id)
+    plan,assignment=await effective_plan(owner_id)
+    usage=await seller_usage(owner_id)
+    child_stats=await seller_stats(owner_id)
+
+    expiry=_aware_utc((assignment or {}).get("expiry_date"))
+    now=datetime.now(timezone.utc)
+    if expiry and expiry>now:
+        remaining=expiry-now
+        remaining_text=f"{remaining.days}d {remaining.seconds//3600}h {(remaining.seconds%3600)//60}m"
+        expiry_text=expiry.strftime("%d %b %Y, %I:%M %p UTC")
+        plan_status="✅ Active"
+    elif plan.get("plan_id")=="free" or str(plan.get("name","")).lower()=="free":
+        remaining_text="No expiry"
+        expiry_text="No expiry"
+        plan_status="🆓 Free Plan"
+    else:
+        remaining_text="Expired"
+        expiry_text=expiry.strftime("%d %b %Y, %I:%M %p UTC") if expiry else "-"
+        plan_status="❌ Expired"
+
+    joined=_aware_utc(seller.get("created_at"))
+    joined_text=joined.strftime("%d %b %Y") if joined else "-"
+    username=f"@{seller.get('username')}" if seller.get('username') else "Not set"
+    name=seller.get("first_name") or user.first_name or "Unknown"
+
+    limits=[
+        ("🤖 Clone Bots",usage.get("bot_count",0),plan.get("bot_limit",1)),
+        ("👥 Active Subscribers",usage.get("active_subscriber_count",0),plan.get("active_subscriber_limit",25)),
+        ("📢 Channels / Groups",usage.get("channel_count",0),plan.get("channel_limit",1)),
+        ("📦 Subscription Plans",usage.get("plan_count",0),plan.get("plan_limit",2)),
+    ]
+    limit_lines=[]
+    warning_lines=[]
+    for label,used,limit in limits:
+        limit_lines.append(f"{label}: {used:,} / {_limit_display(limit)}")
+        try:
+            numeric_limit=int(limit)
+            if numeric_limit>=0 and numeric_limit>0:
+                percent=(used/numeric_limit)*100
+                if used>=numeric_limit:
+                    warning_lines.append(f"⚠️ {label} limit reached")
+                elif percent>=80:
+                    warning_lines.append(f"⚠️ {label} usage: {percent:.0f}%")
+        except (TypeError,ValueError,ZeroDivisionError):
+            pass
+
+    bot_username=f"@{record.get('bot_username')}" if record and record.get("bot_username") else "Not connected"
+    bot_status=("🟢 Active" if record and record.get("active") else "⏸ Paused / Not connected")
+    runtime=(record or {}).get("runtime_status","-")
+
+    text=(
+        "👤 Seller Profile\n\n"
+        f"🆔 Seller ID: {owner_id}\n"
+        f"👤 Name: {name}\n"
+        f"📝 Username: {username}\n"
+        f"📅 Joined: {joined_text}\n\n"
+        "💎 Seller Plan\n"
+        f"Plan: {plan.get('name','Free')}\n"
+        f"Status: {plan_status}\n"
+        f"Expiry: {expiry_text}\n"
+        f"Remaining: {remaining_text}\n\n"
+        "📊 Usage & Limitations\n"
+        + "\n".join(limit_lines)
+        + "\n\n🤖 Clone Bot\n"
+        f"Bot: {bot_username}\n"
+        f"Status: {bot_status}\n"
+        f"Runtime: {runtime}\n\n"
+        "💼 Business Summary\n"
+        f"👥 Total Users: {child_stats.get('users',0):,}\n"
+        f"📨 Pending Payments: {child_stats.get('pending',0):,}\n"
+        f"💰 Revenue: ₹{child_stats.get('revenue',0):g}"
+    )
+    if warning_lines:
+        text += "\n\n" + "\n".join(warning_lines)
+    return text,record
 
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -292,23 +390,15 @@ async def main_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=seller_dashboard_keyboard(record))
         return
 
-    if action == "main_seller_referral":
-        await get_or_create_seller(query.from_user)
-        stats = await seller_referral_stats(user_id)
-        username = os.getenv("MAIN_BOT_USERNAME", "Local_supplier3_bot").lstrip("@")
-        link = f"https://t.me/{username}?start=refseller_{user_id}"
+    if action == "main_seller_profile":
+        text,record=await seller_profile_text(query.from_user)
         await query.edit_message_text(
-            "🤝 Seller Referral Program\n\n"
-            f"👥 Sellers joined: {stats['total']}\n"
-            f"🎁 Rewards received: {stats['rewarded']}\n\n"
-            "Share this link with people who want to create their own subscription bot:\n"
-            f"{link}\n\n"
-            "When a new seller joins through your link, your seller-plan reward is added automatically.",
+            text,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📤 Share Referral Link", url=f"https://t.me/share/url?url={link}")],
-                [InlineKeyboardButton("⬅ Seller Dashboard", callback_data="main_seller_dashboard")],
+                [InlineKeyboardButton("💎 Buy / Change Plan",callback_data="seller_upgrade_plan")],
+                [InlineKeyboardButton("📜 Plan History",callback_data="seller_plan_history")],
+                [InlineKeyboardButton("⬅ Seller Dashboard",callback_data="main_seller_dashboard")],
             ]),
-            disable_web_page_preview=True,
         )
         return
 

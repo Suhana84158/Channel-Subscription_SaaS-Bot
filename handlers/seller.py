@@ -20,12 +20,14 @@ def limit_keyboard():
 def seller_keyboard(record=None):
     if not record:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Create / Connect Child Bot", callback_data="seller_connect")],
+            [InlineKeyboardButton("👤 Seller Profile", callback_data="main_seller_profile")],
+            [InlineKeyboardButton("➕ Create / Connect Clone Bot", callback_data="seller_connect")],
             [InlineKeyboardButton("📖 Setup Guide", callback_data="main_child_setup")],
             [InlineKeyboardButton("⬅ Main Menu", callback_data="main_home")],
         ])
     active = bool(record.get("active"))
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Seller Profile", callback_data="main_seller_profile")],
         [InlineKeyboardButton("🤖 My Bot", callback_data="seller_my_bot")],
         [InlineKeyboardButton("⏸ Pause Bot" if active else "▶️ Resume Bot", callback_data="seller_pause" if active else "seller_resume")],
         [InlineKeyboardButton("🔄 Replace Token", callback_data="seller_replace")],
