@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import os
 from dataclasses import dataclass
@@ -18,6 +19,12 @@ from database.payment_gateways import (
 from services.payment_gateways import create_checkout, test_gateway_connection, GatewayError
 from database.seller_bots import get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status
 from database.seller_referrals import seller_referral_stats
+from database.live_support import (
+    count_support_blocks, delete_support_topic, get_live_support_settings,
+    get_private_message_link, get_support_topic, get_topic_by_thread,
+    is_support_blocked, save_private_message_link, save_support_topic,
+    set_support_block, update_live_support_settings,
+)
 from database.platform_features import (reserve_payment_fingerprint, create_invoice, save_failed_delivery, get_failed_deliveries, resolve_failed_delivery, create_coupon, list_coupons, save_scheduled_broadcast, set_scheduled_status, audit, get_policy)
 from database.seller_data import (
     activate_subscription, active_subscriptions, add_channel, create_payment, create_plan, delete_plan,
@@ -65,6 +72,7 @@ class SellerBotManager:
             [InlineKeyboardButton("🎟 Coupons",callback_data="a_coupons"), InlineKeyboardButton("🔁 Retry Failed",callback_data="a_retry_failed")],
             [InlineKeyboardButton("👤 Seller Profile",callback_data="a_seller_profile")],
             [InlineKeyboardButton("🤝 Seller Referral",callback_data="a_seller_referral")],
+            [InlineKeyboardButton("💬 Live Support",callback_data="a_live_support")],
             [InlineKeyboardButton("📜 Terms & Policy",callback_data="a_terms")],
             [InlineKeyboardButton("🆘 Help & Commands",callback_data="a_help")],
             [InlineKeyboardButton("👥 User Management",callback_data="a_users")],[InlineKeyboardButton("📊 Statistics",callback_data="a_stats")],
@@ -102,6 +110,30 @@ class SellerBotManager:
             [InlineKeyboardButton("🖼 Upload QR",callback_data="a_set_qr")],
             [InlineKeyboardButton("⬅ Back",callback_data="a_home")],
         ])
+    @staticmethod
+    def live_support_menu(settings):
+        enabled=bool(settings.get("enabled"))
+        mode=settings.get("mode","topic")
+        group_title=settings.get("support_group_title") or "Not connected"
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "🔴 Turn Support OFF" if enabled else "🟢 Turn Support ON",
+                callback_data="a_live_support_toggle",
+            )],
+            [InlineKeyboardButton(
+                ("✅ " if mode=="private" else "")+"💬 Normal Private Reply",
+                callback_data="a_live_support_mode_private",
+            )],
+            [InlineKeyboardButton(
+                ("✅ " if mode=="topic" else "")+"🧵 Topic Mode",
+                callback_data="a_live_support_mode_topic",
+            )],
+            [InlineKeyboardButton("👥 Connect Support Group",callback_data="a_live_support_connect")],
+            [InlineKeyboardButton(f"📌 Group: {group_title[:28]}",callback_data="a_live_support_group_info")],
+            [InlineKeyboardButton("🚫 Blocked Users Count",callback_data="a_live_support_blocks")],
+            [InlineKeyboardButton("⬅ Back",callback_data="a_home")],
+        ])
+
     @staticmethod
     def settings_menu():
         return InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Bot Name",callback_data="a_set_bot_name")],[InlineKeyboardButton("💬 Welcome Message",callback_data="a_welcome")],[InlineKeyboardButton("📞 Support Username",callback_data="a_set_support")],[InlineKeyboardButton("💵 Currency",callback_data="a_set_currency"),InlineKeyboardButton("🕒 Timezone",callback_data="a_set_timezone")],[InlineKeyboardButton("🔔 Reminder Days",callback_data="a_set_reminder")],[InlineKeyboardButton("🎁 Referral Reward Days",callback_data="a_set_referral_days")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
@@ -879,11 +911,17 @@ class SellerBotManager:
             return
 
         if action=="c_support":
-            context.user_data["waiting_support_message"]=True
-
+            support=await get_live_support_settings(owner)
+            if not support.get("enabled"):
+                await self.safe_query_message(
+                    q,
+                    "🔴 Live support is currently unavailable. Please try again later.",
+                    back_keyboard,
+                )
+                return
             await self.safe_query_message(
                 q,
-                "📞 Send your message for admin.",
+                "💬 Live Support is ON.\n\nSend any text, photo, video, voice, audio, document or sticker here. Your message will stay in the support conversation and will not be auto-deleted.",
                 back_keyboard,
             )
             return
@@ -1351,6 +1389,65 @@ class SellerBotManager:
             items=await gateway_history("seller",owner,25); text="📜 Gateway History\n\n"+"\n".join(f"• {x.get('gateway','-').title()} ₹{x.get('amount',0):g} — {x.get('status')}" for x in items)
             await q.edit_message_text(text if items else "No gateway payments yet",reply_markup=self.back("a_pg_home")); return
 
+        if a=="a_live_support":
+            support=await get_live_support_settings(owner)
+            blocked=await count_support_blocks(owner)
+            mode_name="Topic Mode" if support.get("mode","topic")=="topic" else "Normal Private Reply"
+            group_name=support.get("support_group_title") or "Not connected"
+            text=(
+                "💬 Live Support Settings\n\n"
+                f"Status: {'🟢 ON' if support.get('enabled') else '🔴 OFF'}\n"
+                f"Reply Mode: {mode_name}\n"
+                f"Support Group: {group_name}\n"
+                f"Blocked Users: {blocked}\n\n"
+                "Topic Mode me har user ke liye ek permanent topic banta hai. "
+                "Messages auto-delete nahi honge."
+            )
+            await q.edit_message_text(text,reply_markup=self.live_support_menu(support)); return
+        if a=="a_live_support_toggle":
+            support=await get_live_support_settings(owner)
+            updated=await update_live_support_settings(owner,enabled=not bool(support.get("enabled")))
+            await q.edit_message_text(
+                f"✅ Live Support {'ON' if updated.get('enabled') else 'OFF'} ho gaya.",
+                reply_markup=self.live_support_menu(updated),
+            ); return
+        if a in {"a_live_support_mode_private","a_live_support_mode_topic"}:
+            mode="private" if a.endswith("private") else "topic"
+            updated=await update_live_support_settings(owner,mode=mode)
+            note=""
+            if mode=="topic" and not updated.get("support_group_id"):
+                note="\n\n⚠️ Ab private forum group me /connectsupport bhejkar support group connect karo."
+            await q.edit_message_text(
+                f"✅ Reply mode: {'Topic Mode' if mode=='topic' else 'Normal Private Reply'}{note}",
+                reply_markup=self.live_support_menu(updated),
+            ); return
+        if a=="a_live_support_connect":
+            await q.edit_message_text(
+                "👥 Connect Support Group\n\n"
+                "1. Private supergroup banao.\n"
+                "2. Topics ON karo.\n"
+                "3. Clone Bot ko Admin banao.\n"
+                "4. Manage Topics permission ON rakho.\n"
+                "5. Usi group me /connectsupport bhejo.\n\n"
+                "Connect hone ke baad har user ka alag topic automatically banega.",
+                reply_markup=self.back("a_live_support"),
+            ); return
+        if a=="a_live_support_group_info":
+            support=await get_live_support_settings(owner)
+            await q.edit_message_text(
+                "📌 Support Group\n\n"
+                f"Name: {support.get('support_group_title') or 'Not connected'}\n"
+                f"Chat ID: {support.get('support_group_id') or '-'}\n\n"
+                "Group badalne ke liye naye forum group me /connectsupport bhejo.",
+                reply_markup=self.back("a_live_support"),
+            ); return
+        if a=="a_live_support_blocks":
+            blocked=await count_support_blocks(owner)
+            await q.edit_message_text(
+                f"🚫 Support-blocked users: {blocked}\n\n"
+                "User ke support topic ke first details message se Block/Unblock kiya ja sakta hai.",
+                reply_markup=self.back("a_live_support"),
+            ); return
         if a=="a_payment":
             s=await get_seller_settings(owner); await q.edit_message_text(f"💳 Payment Settings\n\nUPI Name: {s.get('upi_name') or 'Not Set'}\nUPI ID: {s.get('upi_id') or 'Not Set'}\nQR: {'Added' if s.get('upi_qr_file_id') else 'Not Added'}",reply_markup=self.payment_menu()); return
         state={"a_set_upi_id":("wait_upi_id","Send UPI ID","a_payment"),"a_set_upi_name":("wait_upi_name","Send UPI Name","a_payment"),"a_set_bot_name":("wait_bot_name","Send Bot Name","a_settings"),"a_set_support":("wait_support","Send Support Username","a_settings"),"a_set_currency":("wait_currency","Send Currency","a_settings"),"a_set_timezone":("wait_timezone","Send Timezone","a_settings"),"a_set_reminder":("wait_reminder","Send Reminder Days","a_settings"),"a_set_referral_days":("wait_referral_days","Send free reward days per successful referral","a_settings")}
@@ -1771,6 +1868,246 @@ class SellerBotManager:
         if a=="a_stats":
             s=await stats(owner); await q.edit_message_text(f"📊 Statistics\n\nUsers: {s['users']}\nPlans: {s['plans']}\nChannels: {s['channels']}\nPending: {s['pending']}\nRevenue: ₹{s['revenue']:g}",reply_markup=self.admin_menu()); return
 
+    @staticmethod
+    def _support_datetime(value):
+        if not value:
+            return "-"
+        if value.tzinfo is None:
+            value=value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).strftime("%d %b %Y, %I:%M %p UTC")
+
+    async def support_user_details_text(self,owner,user):
+        record=await get_user(owner,user.id) or {}
+        sub=await get_subscription(owner,user.id) or {}
+        expiry=sub.get("expiry_date")
+        if expiry and expiry.tzinfo is None:
+            expiry=expiry.replace(tzinfo=timezone.utc)
+        active=bool(sub.get("active") and expiry and expiry>datetime.now(timezone.utc))
+        full_name=html.escape(user.full_name or str(user.id))
+        username=("@"+html.escape(user.username)) if user.username else "Not set"
+        mention=f'<a href="tg://user?id={user.id}">{full_name}</a>'
+        return (
+            "🆕 <b>New Support User</b>\n\n"
+            f"👤 Name: {full_name}\n"
+            f"📝 Username: {username}\n"
+            f"🆔 User ID: <code>{user.id}</code>\n"
+            f"🔗 Mention: {mention}\n"
+            f"🌐 Language: {html.escape(user.language_code or 'Unknown')}\n"
+            f"📅 Joined: {self._support_datetime(record.get('joined_at'))}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "💎 <b>Subscription</b>\n"
+            f"Plan: {html.escape(str(sub.get('plan') or 'No Plan'))}\n"
+            f"Status: {'✅ Active' if active else '❌ Inactive'}\n"
+            f"Expiry: {self._support_datetime(expiry)}\n\n"
+            "User ke Telegram profile par jane ke liye mention ya button use karo."
+        )
+
+    @staticmethod
+    def support_topic_keyboard(user_id,blocked=False):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("👤 Open Telegram Profile",url=f"tg://user?id={int(user_id)}")],
+            [InlineKeyboardButton("📋 View User Details",callback_data=f"support_profile_{int(user_id)}")],
+            [InlineKeyboardButton(
+                "✅ Unblock Support" if blocked else "🚫 Block Support",
+                callback_data=(f"support_unblock_{int(user_id)}" if blocked else f"support_block_{int(user_id)}"),
+            )],
+            [InlineKeyboardButton("🆔 Show User ID",callback_data=f"support_id_{int(user_id)}")],
+        ])
+
+    async def ensure_support_topic(self,context,owner,user,support):
+        topic=await get_support_topic(owner,user.id)
+        group_id=int(support["support_group_id"])
+        if topic and int(topic.get("support_group_id",0))==group_id:
+            return topic
+        topic_name=f"👤 {user.first_name or 'User'} | {user.id}"[:128]
+        forum_topic=await context.bot.create_forum_topic(group_id,name=topic_name)
+        topic=await save_support_topic(
+            owner,user.id,group_id,forum_topic.message_thread_id,topic_name,
+        )
+        blocked=await is_support_blocked(owner,user.id)
+        await context.bot.send_message(
+            chat_id=group_id,
+            message_thread_id=forum_topic.message_thread_id,
+            text=await self.support_user_details_text(owner,user),
+            parse_mode="HTML",
+            reply_markup=self.support_topic_keyboard(user.id,blocked),
+            disable_web_page_preview=True,
+        )
+        return topic
+
+    async def route_live_support_message(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
+        message=update.effective_message
+        user=update.effective_user
+        chat=update.effective_chat
+        if not message or not user or user.is_bot or not chat:
+            return
+        owner=self.owner(context)
+        support=await get_live_support_settings(owner)
+
+        # Seller reply inside the connected topic group.
+        if (
+            support.get("enabled") and support.get("mode")=="topic"
+            and support.get("support_group_id")
+            and int(chat.id)==int(support["support_group_id"])
+            and message.message_thread_id
+        ):
+            if user.id!=owner:
+                return
+            topic=await get_topic_by_thread(owner,chat.id,message.message_thread_id)
+            if not topic:
+                return
+            try:
+                await context.bot.copy_message(
+                    chat_id=int(topic["user_id"]),
+                    from_chat_id=chat.id,
+                    message_id=message.message_id,
+                )
+            except TelegramError as exc:
+                logger.warning("Support topic reply failed owner=%s user=%s: %s",owner,topic.get("user_id"),exc)
+            raise ApplicationHandlerStop
+
+        # Seller reply in normal private mode must be a reply to a copied user message.
+        if chat.type=="private" and user.id==owner:
+            if support.get("enabled") and support.get("mode")=="private" and message.reply_to_message:
+                link=await get_private_message_link(owner,chat.id,message.reply_to_message.message_id)
+                if link:
+                    await context.bot.copy_message(
+                        chat_id=int(link["user_id"]),
+                        from_chat_id=chat.id,
+                        message_id=message.message_id,
+                    )
+                    raise ApplicationHandlerStop
+            return
+
+        # Users send any non-command message in private chat.
+        if chat.type!="private" or user.id==owner:
+            return
+        if not support.get("enabled"):
+            return
+        special_states={
+            "waiting_child_screenshot","wait_qr","wait_welcome_media","wait_broadcast",
+            "wait_scheduled_broadcast","wait_channel","wait_plan_add","wait_plan_edit",
+        }
+        if any(context.user_data.get(key) for key in special_states):
+            return
+        if await is_support_blocked(owner,user.id):
+            await message.reply_text("🚫 You cannot contact live support right now.")
+            raise ApplicationHandlerStop
+
+        await upsert_user(owner,user)
+        mode=support.get("mode","topic")
+        try:
+            if mode=="topic":
+                if not support.get("support_group_id"):
+                    await message.reply_text("⚠️ Live support group is not connected yet. Please try again later.")
+                    raise ApplicationHandlerStop
+                try:
+                    topic=await self.ensure_support_topic(context,owner,user,support)
+                    await context.bot.copy_message(
+                        chat_id=int(topic["support_group_id"]),
+                        message_thread_id=int(topic["message_thread_id"]),
+                        from_chat_id=chat.id,
+                        message_id=message.message_id,
+                    )
+                except BadRequest as exc:
+                    # Topic may have been manually deleted. Recreate it once.
+                    logger.warning("Support topic stale owner=%s user=%s: %s",owner,user.id,exc)
+                    await delete_support_topic(owner,user.id)
+                    topic=await self.ensure_support_topic(context,owner,user,support)
+                    await context.bot.copy_message(
+                        chat_id=int(topic["support_group_id"]),
+                        message_thread_id=int(topic["message_thread_id"]),
+                        from_chat_id=chat.id,
+                        message_id=message.message_id,
+                    )
+            else:
+                header=await context.bot.send_message(
+                    owner,
+                    f"💬 Live Support\nUser: {user.full_name}\nID: {user.id}\nReply to the copied message below.",
+                )
+                copied=await context.bot.copy_message(
+                    chat_id=owner,
+                    from_chat_id=chat.id,
+                    message_id=message.message_id,
+                )
+                await save_private_message_link(owner,owner,copied.message_id,user.id)
+            await message.reply_text("✅ Message sent to live support.")
+        except ApplicationHandlerStop:
+            raise
+        except TelegramError as exc:
+            logger.exception("Live support routing failed owner=%s user=%s",owner,user.id)
+            await message.reply_text(f"❌ Support message could not be sent: {str(exc)[:180]}")
+        raise ApplicationHandlerStop
+
+    async def connect_support_command(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
+        owner=self.owner(context)
+        user=update.effective_user
+        chat=update.effective_chat
+        message=update.effective_message
+        if not user or user.id!=owner:
+            await message.reply_text("❌ Sirf Clone Bot seller/admin support group connect kar sakta hai.")
+            return
+        if not chat or chat.type!="supergroup" or not getattr(chat,"is_forum",False):
+            await message.reply_text("❌ /connectsupport ko Topics ON wale private supergroup ke andar bhejo.")
+            return
+        try:
+            me=await context.bot.get_me()
+            member=await context.bot.get_chat_member(chat.id,me.id)
+            if getattr(member,"status","") not in {"administrator","creator"}:
+                await message.reply_text("❌ Clone Bot ko group Admin banao.")
+                return
+            if getattr(member,"status","")!="creator" and not getattr(member,"can_manage_topics",False):
+                await message.reply_text("❌ Bot ke liye Manage Topics permission ON karo.")
+                return
+            updated=await update_live_support_settings(
+                owner,
+                support_group_id=chat.id,
+                support_group_title=chat.title or "Support Group",
+                mode="topic",
+                enabled=True,
+            )
+            await message.reply_text(
+                "✅ Support group connected successfully.\n\n"
+                f"Group: {updated.get('support_group_title')}\n"
+                "Live Support: ON\n"
+                "Mode: Topic Mode\n\n"
+                "Ab kisi user ka pehla message aate hi uske naam aur ID se naya topic banega."
+            )
+        except TelegramError as exc:
+            logger.exception("Support group connection failed owner=%s chat=%s",owner,getattr(chat,"id",None))
+            await message.reply_text(f"❌ Support group connect failed: {str(exc)[:200]}")
+
+    async def support_callback(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
+        q=update.callback_query
+        await q.answer()
+        owner=self.owner(context)
+        if q.from_user.id!=owner:
+            await q.answer("Not authorized",show_alert=True)
+            return
+        data=q.data
+        try:
+            user_id=int(data.rsplit("_",1)[-1])
+        except ValueError:
+            return
+        if data.startswith("support_id_"):
+            await q.answer(f"User ID: {user_id}",show_alert=True); return
+        if data.startswith("support_block_"):
+            await set_support_block(owner,user_id,True)
+            await q.edit_message_reply_markup(self.support_topic_keyboard(user_id,True)); return
+        if data.startswith("support_unblock_"):
+            await set_support_block(owner,user_id,False)
+            await q.edit_message_reply_markup(self.support_topic_keyboard(user_id,False)); return
+        if data.startswith("support_profile_"):
+            text,record,sub=await self.user_details_text(owner,user_id)
+            if not text:
+                await q.answer("User not found",show_alert=True); return
+            await context.bot.send_message(
+                chat_id=q.message.chat_id,
+                message_thread_id=q.message.message_thread_id,
+                text=text,
+            )
+            return
+
     async def text_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context); text=update.effective_message.text.strip()
         if update.effective_user.id==owner:
@@ -1919,35 +2256,6 @@ class SellerBotManager:
                 try: days=int(text)
                 except ValueError: await update.effective_message.reply_text("❌ Send number"); return
                 await set_seller_setting(owner,"reminder_days",days); context.user_data.clear(); await update.effective_message.reply_text("✅ Updated",reply_markup=self.settings_menu()); return
-        if context.user_data.get("waiting_support_message"):
-            context.user_data.clear()
-
-            await context.bot.send_message(
-                owner,
-                "📩 Support message\n"
-                f"User ID: {update.effective_user.id}\n"
-                f"Name: {update.effective_user.full_name}\n"
-                f"Username: @{update.effective_user.username if update.effective_user.username else 'Not set'}\n\n"
-                f"{text}",
-            )
-
-            await update.effective_message.reply_text(
-                "✅ Sent to admin"
-            )
-
-            record=await get_bot(owner)
-            settings=await ensure_seller_defaults(
-                owner,
-                (record or {}).get("bot_name","Subscription Bot"),
-            )
-
-            await self.send_welcome(
-                update.effective_message,
-                context,
-                settings,
-                update.effective_user,
-            )
-            return
 
     async def broadcast_message_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
@@ -2046,45 +2354,6 @@ class SellerBotManager:
     async def photo_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
 
-        if context.user_data.get("waiting_support_message"):
-            context.user_data.clear()
-
-            caption=update.effective_message.caption or ""
-            user=update.effective_user
-            admin_caption=(
-                "📩 Support photo\n"
-                f"User ID: {user.id}\n"
-                f"Name: {user.full_name}\n"
-                f"Username: @{user.username if user.username else 'Not set'}"
-            )
-
-            if caption:
-                admin_caption+=f"\n\n{caption}"
-
-            await context.bot.send_photo(
-                chat_id=owner,
-                photo=update.effective_message.photo[-1].file_id,
-                caption=admin_caption,
-            )
-
-            await update.effective_message.reply_text(
-                "✅ Photo sent to admin"
-            )
-
-            record=await get_bot(owner)
-            settings=await ensure_seller_defaults(
-                owner,
-                (record or {}).get("bot_name","Subscription Bot"),
-            )
-
-            await self.send_welcome(
-                update.effective_message,
-                context,
-                settings,
-                update.effective_user,
-            )
-            return
-
         if update.effective_user.id==owner and context.user_data.get("wait_qr"):
             await set_seller_setting(owner,"upi_qr_file_id",update.effective_message.photo[-1].file_id); context.user_data.clear(); await update.effective_message.reply_text("✅ QR updated",reply_markup=self.payment_menu()); return
         if context.user_data.get("waiting_child_screenshot"):
@@ -2125,6 +2394,7 @@ class SellerBotManager:
             await update.effective_message.reply_text(
                 "✅ Payment submitted. Waiting for approval."
             )
+            raise ApplicationHandlerStop
 
     async def forward_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
@@ -2264,6 +2534,7 @@ class SellerBotManager:
         app.add_handler(CommandHandler("help",self.help_command))
         app.add_handler(CommandHandler("admin",self.admin))
         app.add_handler(CommandHandler("connectgroup",self.connect_group_command))
+        app.add_handler(CommandHandler("connectsupport",self.connect_support_command))
         app.add_handler(
             CommandHandler(
                 "version",
@@ -2273,11 +2544,13 @@ class SellerBotManager:
             )
         )
         app.add_handler(CallbackQueryHandler(self.child_callback,pattern=r"^c_")); app.add_handler(CallbackQueryHandler(self.admin_callback,pattern=r"^a_"))
+        app.add_handler(CallbackQueryHandler(self.support_callback,pattern=r"^support_"))
         app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,self.broadcast_message_handler),group=-3)
         app.add_handler(MessageHandler(filters.FORWARDED,self.forward_handler),group=-2)
         app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.ALL,self.welcome_media_handler),group=-1)
         app.add_handler(MessageHandler(filters.PHOTO,self.photo_handler),group=0)
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,self.text_handler))
+        app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,self.route_live_support_message),group=10)
         if app.job_queue: app.job_queue.run_repeating(self.expiry_job,interval=300,first=60,name=f"seller_expiry_{owner}")
         return app
 
