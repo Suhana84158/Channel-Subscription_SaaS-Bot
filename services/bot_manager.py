@@ -489,7 +489,7 @@ class SellerBotManager:
         is_owner=update.effective_user.id==owner
 
         user_text=(
-            "🆘 Child Bot Help\n\n"
+            "🆘 Clone Bot Help\n\n"
             "👤 User Commands\n"
             "/start - Open the welcome menu\n"
             "/help - Show this help guide\n"
