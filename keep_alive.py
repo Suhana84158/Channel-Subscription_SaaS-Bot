@@ -89,9 +89,18 @@ async def _notify_success(transaction_id):
         return
     if tx.get("purpose") == "seller_plan":
         if _main_bot:
+            fulfillment = tx.get("fulfillment") or {}
+            expiry = fulfillment.get("expiry_date")
+            expiry_text = expiry.strftime("%d-%m-%Y %H:%M UTC") if hasattr(expiry, "strftime") else "-"
             await _main_bot.send_message(
                 tx["payer_user_id"],
-                f"✅ Payment verified automatically\n\nGateway: {tx.get('gateway','').title()}\nAmount: ₹{tx.get('amount',0):g}\nYour seller plan is now active.",
+                f"✅ Payment verified automatically\n\n"
+                f"Gateway: {tx.get('gateway','').title()}\n"
+                f"Amount: ₹{tx.get('amount',0):g}\n"
+                f"Plan: {tx.get('metadata',{}).get('description','Seller Plan')}\n"
+                f"Expiry: {expiry_text}\n"
+                f"Invoice: {fulfillment.get('invoice_no','-')}\n\n"
+                "Your seller plan is now active.",
             )
         return
     if tx.get("purpose") == "child_subscription":
