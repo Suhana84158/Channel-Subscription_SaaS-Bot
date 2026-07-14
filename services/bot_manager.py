@@ -63,6 +63,7 @@ class SellerBotManager:
             [InlineKeyboardButton("⚙️ Bot Settings",callback_data="a_settings")],
             [InlineKeyboardButton("📢 Broadcast",callback_data="a_broadcast"), InlineKeyboardButton("🗓 Scheduled",callback_data="a_broadcast_schedule")],
             [InlineKeyboardButton("🎟 Coupons",callback_data="a_coupons"), InlineKeyboardButton("🔁 Retry Failed",callback_data="a_retry_failed")],
+            [InlineKeyboardButton("👤 Seller Profile",callback_data="a_seller_profile")],
             [InlineKeyboardButton("🤝 Seller Referral",callback_data="a_seller_referral")],
             [InlineKeyboardButton("📜 Terms & Policy",callback_data="a_terms")],
             [InlineKeyboardButton("🆘 Help & Commands",callback_data="a_help")],
@@ -897,6 +898,66 @@ class SellerBotManager:
         if q.from_user.id!=owner: await q.edit_message_text("❌ Not authorized"); return
         a=q.data
         if a=="a_home": context.user_data.clear(); await q.edit_message_text("🛠 Seller Admin Panel",reply_markup=self.admin_menu()); return
+        if a=="a_seller_profile":
+            plan,assignment=await effective_plan(owner)
+            usage=await stats(owner)
+            bot_record=await get_bot(owner) or {}
+            expiry=(assignment or {}).get("expiry_date")
+            if expiry and getattr(expiry,"tzinfo",None) is None:
+                expiry=expiry.replace(tzinfo=timezone.utc)
+            now=datetime.now(timezone.utc)
+            if expiry and expiry>now:
+                remaining=expiry-now
+                remaining_text=f"{remaining.days}d {remaining.seconds//3600}h {(remaining.seconds%3600)//60}m"
+                status="✅ Active"
+            elif str(plan.get("plan_id","free"))=="free":
+                remaining_text="No expiry"
+                status="🆓 Free Plan"
+            else:
+                remaining_text="Expired"
+                status="❌ Expired"
+            def lim(value):
+                try:
+                    value=int(value)
+                    return "Unlimited" if value<0 else f"{value:,}"
+                except Exception:
+                    return str(value)
+            text=(
+                "👤 Seller Profile\n\n"
+                f"🆔 Seller ID: {owner}\n"
+                f"👤 Name: {q.from_user.full_name or 'Unknown'}\n"
+                f"📝 Username: @{q.from_user.username}" if q.from_user.username else f"📝 Username: Not set"
+            )
+            text += (
+                "\n\n💎 Plan Details\n"
+                f"Plan: {plan.get('name','Free')}\n"
+                f"Status: {status}\n"
+                f"Expiry: {self.format_dt(expiry)}\n"
+                f"Remaining: {remaining_text}\n\n"
+                "📊 Usage & Limits\n"
+                f"🤖 Clone Bots: {1 if bot_record else 0} / {lim(plan.get('bot_limit',1))}\n"
+                f"👥 Active Subscribers: {usage.get('active',0)} / {lim(plan.get('active_subscriber_limit',25))}\n"
+                f"📢 Channels / Groups: {usage.get('channels',0)} / {lim(plan.get('channel_limit',1))}\n"
+                f"📦 Subscription Plans: {usage.get('plans',0)} / {lim(plan.get('plan_limit',2))}\n\n"
+                f"👥 Total Users: {usage.get('users',0)}\n"
+                f"💳 Pending Payments: {usage.get('pending',0)}\n"
+                f"💰 Revenue: ₹{usage.get('revenue',0):g}"
+            )
+            kb=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💎 Buy / Change Plan",callback_data="seller_upgrade_plan")],
+                [InlineKeyboardButton("📜 Plan History",callback_data="a_seller_plan_history")],
+                [InlineKeyboardButton("🤝 Seller Referral",callback_data="a_seller_referral")],
+                [InlineKeyboardButton("🆘 Help & Commands",callback_data="a_help")],
+                [InlineKeyboardButton("⬅ Seller Admin Panel",callback_data="a_home")],
+            ])
+            await q.edit_message_text(text,reply_markup=kb)
+            return
+        if a=="a_seller_plan_history":
+            await q.edit_message_text(
+                "📜 Seller Plan History\n\nOpen the main SaaS bot → Seller Dashboard → Plan History to view complete seller plan records.",
+                reply_markup=self.back("a_seller_profile"),
+            )
+            return
         if a=="a_plans": await q.edit_message_text("📦 Plan Management",reply_markup=self.plans_admin_menu()); return
         if a=="a_plan_add":
             plan_cfg,_=await effective_plan(owner)
