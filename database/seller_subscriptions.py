@@ -297,6 +297,42 @@ async def assign_plan_with_history(owner_id: int, plan_id: str, days: int | None
     return assignment
 
 
+async def extend_plan_with_history(owner_id: int, plan_id: str, days: int, source="owner", approved_by: int | None = None):
+    """Extend a seller plan from the current expiry (or now if expired)."""
+    days=int(days)
+    if days <= 0:
+        raise ValueError("Days must be greater than zero")
+    plan=await get_paid_plan(plan_id)
+    if not plan:
+        raise ValueError("Paid plan not found")
+    now=datetime.now(timezone.utc)
+    current=await get_assignment(owner_id) or {}
+    current_expiry=current.get("expiry_date")
+    if current_expiry and current_expiry.tzinfo is None:
+        current_expiry=current_expiry.replace(tzinfo=timezone.utc)
+    base=current_expiry if current_expiry and current_expiry > now else now
+    new_expiry=base + timedelta(days=days)
+    previous_plan=current.get("plan_id", "free")
+    await _assignments().update_one(
+        {"owner_id": int(owner_id)},
+        {"$set": {
+            "plan_id": plan_id,
+            "expiry_date": new_expiry,
+            "source": source,
+            "subscription_suspended": False,
+            "suspension_reason": "",
+            "updated_at": now,
+        }, "$setOnInsert": {"owner_id": int(owner_id), "created_at": now}},
+        upsert=True,
+    )
+    await record_history(
+        owner_id, "plan_extended", previous_plan=previous_plan,
+        new_plan=plan_id, days=days, source=source,
+        approved_by=approved_by, expiry_date=new_expiry,
+    )
+    return await get_assignment(owner_id)
+
+
 async def create_seller_payment(owner_id: int, plan_id: str, file_id: str, request_type="upgrade"):
     import secrets
     plan = await get_paid_plan(plan_id)
