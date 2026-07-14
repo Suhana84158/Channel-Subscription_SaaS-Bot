@@ -24,6 +24,8 @@ from database.live_support import (
     get_private_message_link, get_support_topic, get_topic_by_thread,
     is_support_blocked, save_private_message_link, save_support_topic,
     set_support_block, update_live_support_settings,
+    list_support_templates, get_support_template, save_support_template,
+    delete_support_template,
 )
 from database.platform_features import (reserve_payment_fingerprint, create_invoice, save_failed_delivery, get_failed_deliveries, resolve_failed_delivery, create_coupon, list_coupons, save_scheduled_broadcast, set_scheduled_status, audit, get_policy)
 from database.seller_data import (
@@ -129,6 +131,7 @@ class SellerBotManager:
                 callback_data="a_live_support_mode_topic",
             )],
             [InlineKeyboardButton(f"📌 Group: {group_title[:28]}",callback_data="a_live_support_group_info")],
+            [InlineKeyboardButton("⚡ Reply Templates",callback_data="a_support_templates")],
             [InlineKeyboardButton("🚫 Blocked Users Count",callback_data="a_live_support_blocks")],
             [InlineKeyboardButton("⬅ Back",callback_data="a_home")],
         ])
@@ -153,6 +156,26 @@ class SellerBotManager:
             "5. Usi group me /connectsupport bhejo.\n\n"
             "Connect hone ke baad har user ka alag topic automatically banega."
         )
+
+    @staticmethod
+    def support_templates_menu(templates):
+        rows=[[InlineKeyboardButton("➕ Add Command",callback_data="a_support_tpl_add")]]
+        for item in templates:
+            command=item.get("command","")
+            rows.append([InlineKeyboardButton(f"/{command}",callback_data=f"a_support_tpl_view_{command}")])
+        rows.append([InlineKeyboardButton("⬅ Back",callback_data="a_live_support")])
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def support_template_edit_menu(command):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 Edit Text",callback_data=f"a_support_tpl_text_{command}"),InlineKeyboardButton("🗑 Remove Text",callback_data=f"a_support_tpl_rmtext_{command}")],
+            [InlineKeyboardButton("🖼 Edit Media",callback_data=f"a_support_tpl_media_{command}"),InlineKeyboardButton("🗑 Remove Media",callback_data=f"a_support_tpl_rmmedia_{command}")],
+            [InlineKeyboardButton("🔗 Edit Buttons",callback_data=f"a_support_tpl_buttons_{command}"),InlineKeyboardButton("🗑 Remove Buttons",callback_data=f"a_support_tpl_rmbuttons_{command}")],
+            [InlineKeyboardButton("👀 Preview",callback_data=f"a_support_tpl_preview_{command}")],
+            [InlineKeyboardButton("🗑 Delete Command",callback_data=f"a_support_tpl_delete_{command}")],
+            [InlineKeyboardButton("⬅ Back",callback_data="a_support_templates")],
+        ])
 
     @staticmethod
     def settings_menu():
@@ -1448,6 +1471,46 @@ class SellerBotManager:
                 "User ke support topic ke first details message se Block/Unblock kiya ja sakta hai.",
                 reply_markup=self.back("a_live_support"),
             ); return
+        if a=="a_support_templates":
+            templates=await list_support_templates(owner)
+            text="⚡ Live Support Reply Templates\n\nTopic/private support me saved command bhejo, jaise /payment. Bot saved text, media aur buttons user ko reply ke roop me bhejega.\n\nVariables: {NAME} {ID} {USERNAME} {PLAN} {EXPIRY}"
+            await q.edit_message_text(text,reply_markup=self.support_templates_menu(templates)); return
+        if a=="a_support_tpl_add":
+            context.user_data.clear(); context.user_data["wait_support_tpl_command"]=True
+            await q.edit_message_text("Command name bhejo. Example: payment\n\nSlash mat lagao. Sirf letters, numbers aur underscore.",reply_markup=self.back("a_support_templates")); return
+        if a.startswith("a_support_tpl_view_"):
+            command=a.replace("a_support_tpl_view_","")
+            tpl=await get_support_template(owner,command)
+            if not tpl:
+                await q.edit_message_text("❌ Template not found",reply_markup=self.back("a_support_templates")); return
+            count=sum(len(row) for row in (tpl.get("buttons") or []))
+            await q.edit_message_text(f"⚡ /{command}\n\n📝 Text: {'✅' if tpl.get('text') else '❌'}\n🖼 Media: {'✅' if tpl.get('media_file_id') else '❌'}\n🔗 Buttons: {count}",reply_markup=self.support_template_edit_menu(command)); return
+        if a.startswith("a_support_tpl_text_"):
+            command=a.replace("a_support_tpl_text_",""); context.user_data.clear(); context.user_data["wait_support_tpl_text"]=command
+            await q.edit_message_text("📝 Template text bhejo.\n\nVariables: {NAME} {ID} {USERNAME} {PLAN} {EXPIRY}",reply_markup=self.back(f"a_support_tpl_view_{command}")); return
+        if a.startswith("a_support_tpl_media_"):
+            command=a.replace("a_support_tpl_media_",""); context.user_data.clear(); context.user_data["wait_support_tpl_media"]=command
+            await q.edit_message_text("🖼 Photo, video, GIF ya document bhejo.",reply_markup=self.back(f"a_support_tpl_view_{command}")); return
+        if a.startswith("a_support_tpl_buttons_"):
+            command=a.replace("a_support_tpl_buttons_",""); context.user_data.clear(); context.user_data["wait_support_tpl_buttons"]=command
+            await q.edit_message_text("🔗 Buttons bhejo. Format:\nTitle - https://example.com\n\nSame row:\nButton 1 - URL && Button 2 - URL",reply_markup=self.back(f"a_support_tpl_view_{command}")); return
+        if a.startswith("a_support_tpl_rmtext_"):
+            command=a.replace("a_support_tpl_rmtext_",""); await save_support_template(owner,command,text="")
+            await q.edit_message_text("✅ Text removed",reply_markup=self.support_template_edit_menu(command)); return
+        if a.startswith("a_support_tpl_rmmedia_"):
+            command=a.replace("a_support_tpl_rmmedia_",""); await save_support_template(owner,command,media_type="",media_file_id="")
+            await q.edit_message_text("✅ Media removed",reply_markup=self.support_template_edit_menu(command)); return
+        if a.startswith("a_support_tpl_rmbuttons_"):
+            command=a.replace("a_support_tpl_rmbuttons_",""); await save_support_template(owner,command,buttons=[])
+            await q.edit_message_text("✅ Buttons removed",reply_markup=self.support_template_edit_menu(command)); return
+        if a.startswith("a_support_tpl_delete_"):
+            command=a.replace("a_support_tpl_delete_",""); await delete_support_template(owner,command)
+            await q.edit_message_text(f"✅ /{command} deleted",reply_markup=self.support_templates_menu(await list_support_templates(owner))); return
+        if a.startswith("a_support_tpl_preview_"):
+            command=a.replace("a_support_tpl_preview_",""); tpl=await get_support_template(owner,command)
+            await self.send_support_template(context,owner,q.from_user.id,tpl,q.from_user)
+            await q.answer("Preview sent",show_alert=True); return
+
         if a=="a_payment":
             s=await get_seller_settings(owner); await q.edit_message_text(f"💳 Payment Settings\n\nUPI Name: {s.get('upi_name') or 'Not Set'}\nUPI ID: {s.get('upi_id') or 'Not Set'}\nQR: {'Added' if s.get('upi_qr_file_id') else 'Not Added'}",reply_markup=self.payment_menu()); return
         state={"a_set_upi_id":("wait_upi_id","Send UPI ID","a_payment"),"a_set_upi_name":("wait_upi_name","Send UPI Name","a_payment"),"a_set_bot_name":("wait_bot_name","Send Bot Name","a_settings"),"a_set_support":("wait_support","Send Support Username","a_settings"),"a_set_currency":("wait_currency","Send Currency","a_settings"),"a_set_timezone":("wait_timezone","Send Timezone","a_settings"),"a_set_reminder":("wait_reminder","Send Reminder Days","a_settings"),"a_set_referral_days":("wait_referral_days","Send free reward days per successful referral","a_settings")}
@@ -1935,6 +1998,64 @@ class SellerBotManager:
         )
         return topic
 
+    async def support_template_values(self,owner,user):
+        sub=await get_subscription(owner,user.id) or {}
+        expiry=sub.get("expiry_date")
+        values={
+            "{NAME}":user.full_name or str(user.id),
+            "{ID}":str(user.id),
+            "{USERNAME}":("@"+user.username) if user.username else "",
+            "{PLAN}":str(sub.get("plan") or "No Plan"),
+            "{EXPIRY}":self._support_datetime(expiry),
+        }
+        return values
+
+    async def send_support_template(self,context,owner,target_user_id,template,user_obj=None):
+        if not template:
+            raise ValueError("Template not found")
+        if user_obj is None:
+            record=await get_user(owner,target_user_id) or {}
+            class UserView:
+                id=int(target_user_id)
+                full_name=" ".join(x for x in [record.get("first_name"),record.get("last_name")] if x) or str(target_user_id)
+                username=record.get("username")
+            user_obj=UserView()
+        text=template.get("text") or ""
+        for key,value in (await self.support_template_values(owner,user_obj)).items():
+            text=text.replace(key,value)
+        keyboard=self.build_welcome_keyboard(template.get("buttons") or [])
+        file_id=template.get("media_file_id")
+        media_type=template.get("media_type")
+        kwargs={"chat_id":int(target_user_id),"reply_markup":keyboard}
+        if file_id and media_type=="photo": return await context.bot.send_photo(photo=file_id,caption=text or None,**kwargs)
+        if file_id and media_type=="video": return await context.bot.send_video(video=file_id,caption=text or None,**kwargs)
+        if file_id and media_type=="animation": return await context.bot.send_animation(animation=file_id,caption=text or None,**kwargs)
+        if file_id and media_type=="document": return await context.bot.send_document(document=file_id,caption=text or None,**kwargs)
+        return await context.bot.send_message(text=text or "(Empty template)",disable_web_page_preview=True,**kwargs)
+
+    async def support_template_command_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
+        message=update.effective_message; user=update.effective_user; chat=update.effective_chat
+        if not message or not user or user.id!=self.owner(context) or not message.text:
+            return
+        owner=self.owner(context); support=await get_live_support_settings(owner)
+        command=message.text.split()[0].split("@",1)[0].lstrip("/").lower()
+        template=await get_support_template(owner,command)
+        if not template:
+            return
+        target_user_id=None
+        if support.get("mode")=="topic" and support.get("support_group_id") and int(chat.id)==int(support["support_group_id"]) and message.message_thread_id:
+            topic=await get_topic_by_thread(owner,chat.id,message.message_thread_id)
+            if topic: target_user_id=int(topic["user_id"])
+        elif support.get("mode")=="private" and chat.type=="private" and message.reply_to_message:
+            link=await get_private_message_link(owner,chat.id,message.reply_to_message.message_id)
+            if link: target_user_id=int(link["user_id"])
+        if not target_user_id:
+            await message.reply_text("❌ Is command ko user ke support topic me, ya private mode me user message ka reply karke bhejo.")
+            raise ApplicationHandlerStop
+        await self.send_support_template(context,owner,target_user_id,template)
+        await message.reply_text(f"✅ /{command} sent to user")
+        raise ApplicationHandlerStop
+
     async def route_live_support_message(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         message=update.effective_message
         user=update.effective_user
@@ -2131,6 +2252,23 @@ class SellerBotManager:
                 except Exception as exc:
                     await update.effective_message.reply_text(f"❌ {exc}")
                 return
+            if context.user_data.get("wait_support_tpl_command"):
+                command=text.strip().lower().lstrip("/")
+                try:
+                    await save_support_template(owner,command)
+                except Exception as exc:
+                    await update.effective_message.reply_text(f"❌ {exc}"); return
+                context.user_data.clear(); await update.effective_message.reply_text(f"✅ /{command} created",reply_markup=self.support_template_edit_menu(command)); return
+            if context.user_data.get("wait_support_tpl_text"):
+                command=context.user_data["wait_support_tpl_text"]
+                await save_support_template(owner,command,text=text); context.user_data.clear()
+                await update.effective_message.reply_text("✅ Template text saved",reply_markup=self.support_template_edit_menu(command)); return
+            if context.user_data.get("wait_support_tpl_buttons"):
+                command=context.user_data["wait_support_tpl_buttons"]
+                try: rows=self.parse_welcome_buttons(text)
+                except Exception as exc: await update.effective_message.reply_text(f"❌ {exc}"); return
+                await save_support_template(owner,command,buttons=rows); context.user_data.clear()
+                await update.effective_message.reply_text("✅ Template buttons saved",reply_markup=self.support_template_edit_menu(command)); return
             if context.user_data.get("wait_coupon_create"):
                 try:
                     code,ctype,value,limit=[x.strip() for x in text.split("|",3)]
@@ -2339,7 +2477,20 @@ class SellerBotManager:
 
     async def welcome_media_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
-        if update.effective_user.id!=owner or not context.user_data.get("wait_welcome_media"): return
+        if update.effective_user.id!=owner:
+            return
+        if context.user_data.get("wait_support_tpl_media"):
+            command=context.user_data["wait_support_tpl_media"]
+            msg=update.effective_message; media_type=""; file_id=""
+            if msg.photo: media_type="photo"; file_id=msg.photo[-1].file_id
+            elif msg.video: media_type="video"; file_id=msg.video.file_id
+            elif msg.animation: media_type="animation"; file_id=msg.animation.file_id
+            elif msg.document: media_type="document"; file_id=msg.document.file_id
+            if not file_id: await msg.reply_text("❌ Photo, video, GIF ya document bhejo."); return
+            await save_support_template(owner,command,media_type=media_type,media_file_id=file_id)
+            context.user_data.clear(); await msg.reply_text("✅ Template media saved",reply_markup=self.support_template_edit_menu(command))
+            raise ApplicationHandlerStop
+        if not context.user_data.get("wait_welcome_media"): return
         msg=update.effective_message; media_type=""; file_id=""
         if msg.photo: media_type="photo"; file_id=msg.photo[-1].file_id
         elif msg.video: media_type="video"; file_id=msg.video.file_id
@@ -2535,6 +2686,7 @@ class SellerBotManager:
         app.add_handler(CommandHandler("admin",self.admin))
         app.add_handler(CommandHandler("connectgroup",self.connect_group_command))
         app.add_handler(CommandHandler("connectsupport",self.connect_support_command))
+        app.add_handler(MessageHandler(filters.COMMAND,self.support_template_command_handler),group=9)
         app.add_handler(
             CommandHandler(
                 "version",
