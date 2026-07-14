@@ -17,6 +17,7 @@ from database.payment_gateways import (
 )
 from services.payment_gateways import create_checkout, test_gateway_connection, GatewayError
 from database.seller_bots import get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status
+from database.seller_referrals import seller_referral_stats
 from database.platform_features import (reserve_payment_fingerprint, create_invoice, save_failed_delivery, get_failed_deliveries, resolve_failed_delivery, create_coupon, list_coupons, save_scheduled_broadcast, set_scheduled_status, audit, get_policy)
 from database.seller_data import (
     activate_subscription, active_subscriptions, add_channel, create_payment, create_plan, delete_plan,
@@ -62,7 +63,9 @@ class SellerBotManager:
             [InlineKeyboardButton("⚙️ Bot Settings",callback_data="a_settings")],
             [InlineKeyboardButton("📢 Broadcast",callback_data="a_broadcast"), InlineKeyboardButton("🗓 Scheduled",callback_data="a_broadcast_schedule")],
             [InlineKeyboardButton("🎟 Coupons",callback_data="a_coupons"), InlineKeyboardButton("🔁 Retry Failed",callback_data="a_retry_failed")],
+            [InlineKeyboardButton("🤝 Seller Referral",callback_data="a_seller_referral")],
             [InlineKeyboardButton("📜 Terms & Policy",callback_data="a_terms")],
+            [InlineKeyboardButton("🆘 Help & Commands",callback_data="a_help")],
             [InlineKeyboardButton("👥 User Management",callback_data="a_users")],[InlineKeyboardButton("📊 Statistics",callback_data="a_stats")],
         ])
     @staticmethod
@@ -269,16 +272,12 @@ class SellerBotManager:
         ) or "Unknown"
 
         now=datetime.now(timezone.utc)
-        expiry_date=(sub or {}).get("expiry_date")
-        if expiry_date and expiry_date.tzinfo is None:
-            expiry_date=expiry_date.replace(tzinfo=timezone.utc)
-        elif expiry_date:
-            expiry_date=expiry_date.astimezone(timezone.utc)
-
-        active=bool(
-            sub and sub.get("active") and expiry_date
-            and expiry_date>now
-        )
+        expiry=(sub or {}).get("expiry_date")
+        if expiry and expiry.tzinfo is None:
+            expiry=expiry.replace(tzinfo=timezone.utc)
+        active=bool(sub and sub.get("active") and expiry and expiry>now)
+        if sub and expiry:
+            sub["expiry_date"]=expiry
 
         text=(
             "👤 User Details\n\n"
@@ -289,7 +288,7 @@ class SellerBotManager:
             f"📋 Reason: {user.get('ban_reason') or '-'}\n"
             f"📅 Joined: {self.format_dt(user.get('joined_at'))}\n\n"
             f"💎 Plan: {(sub or {}).get('plan') or 'No Plan'}\n"
-            f"📅 Expiry: {self.format_dt(expiry_date)}\n"
+            f"📅 Expiry: {self.format_dt((sub or {}).get('expiry_date'))}\n"
             f"📌 Status: {'Active' if active else 'No Subscription'}"
         )
         return text,user,sub
@@ -1562,6 +1561,45 @@ class SellerBotManager:
             for cpn in coupons[:20]: lines.append(f"• {cpn['code']} — {cpn['value']:g} {cpn['discount_type']} — {cpn['used_count']}/{cpn['usage_limit']}")
             context.user_data.clear(); context.user_data["wait_coupon_create"]=True
             await q.edit_message_text("\n".join(lines),reply_markup=self.back()); return
+        if a=="a_seller_referral":
+            data=await seller_referral_stats(owner)
+            link=f"https://t.me/{MAIN_BOT_USERNAME}?start=refseller_{owner}"
+            await q.edit_message_text(
+                "🤝 Seller Referral Program\n\n"
+                f"👥 Sellers joined: {data['total']}\n"
+                f"🎁 Rewards received: {data['rewarded']}\n\n"
+                "Share this link with new sellers:\n"
+                f"{link}\n\n"
+                "The owner controls reward days and reward plan from Owner Dashboard → Subscription Management.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📤 Share Referral Link",url=f"https://t.me/share/url?url={link}")],
+                    [InlineKeyboardButton("⬅ Back",callback_data="a_home")],
+                ]),
+                disable_web_page_preview=True,
+            ); return
+        if a=="a_help":
+            await q.edit_message_text(
+                "🆘 Clone Bot Admin Help & Commands\n\n"
+                "/start — Open Admin Panel for seller; users see welcome menu\n"
+                "/admin — Open Admin Panel\n"
+                "/connectgroup — Run inside a private group to connect it\n"
+                "/help — Full user and seller guide\n"
+                "/version — Show deployed runtime version\n\n"
+                "📦 Manage Plans — Add, edit, enable, disable or delete user plans\n"
+                "📢 Channels / Groups — Connect chats and resend fresh links to active subscribers\n"
+                "💳 Payment Settings — Set UPI/QR and Razorpay/Cashfree gateway credentials\n"
+                "📨 Pending Payments — Approve or reject uploaded payment proofs\n"
+                "📜 Payment History — Review processed payments\n"
+                "⚙ Bot Settings — Change name, welcome, support, timezone, reminders and referral days\n"
+                "📢 Broadcast / Scheduled — Send messages now or later\n"
+                "🎟 Coupons — Create discount codes\n"
+                "🔁 Retry Failed — Retry failed invite deliveries\n"
+                "🤝 Seller Referral — Share your main-bot seller referral link and earn seller-plan reward\n"
+                "👥 User Management — Search users, give/extend/remove subscription and ban/unban\n"
+                "📊 Statistics — View users, plans, channels, payments and revenue\n\n"
+                "Group setup: Add the clone bot as Admin with Invite Users and Ban Users permissions, then send /connectgroup inside the group.",
+                reply_markup=self.back("a_home"),
+            ); return
         if a=="a_terms":
             parts=[]
             for key in ("terms","privacy","refund","support"):
