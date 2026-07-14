@@ -171,41 +171,10 @@ class SellerBotManager:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("📝 Edit Text",callback_data=f"a_support_tpl_text_{command}"),InlineKeyboardButton("🗑 Remove Text",callback_data=f"a_support_tpl_rmtext_{command}")],
             [InlineKeyboardButton("🖼 Edit Media",callback_data=f"a_support_tpl_media_{command}"),InlineKeyboardButton("🗑 Remove Media",callback_data=f"a_support_tpl_rmmedia_{command}")],
-            [InlineKeyboardButton("🔗 Edit Buttons",callback_data=f"a_support_tpl_buttons_menu_{command}"),InlineKeyboardButton("🗑 Remove Buttons",callback_data=f"a_support_tpl_rmbuttons_{command}")],
-            [InlineKeyboardButton("⏱ Auto Remove",callback_data=f"a_support_tpl_autodel_{command}")],
+            [InlineKeyboardButton("🔗 Edit Buttons",callback_data=f"a_support_tpl_buttons_{command}"),InlineKeyboardButton("🗑 Remove Buttons",callback_data=f"a_support_tpl_rmbuttons_{command}")],
             [InlineKeyboardButton("👀 Preview",callback_data=f"a_support_tpl_preview_{command}")],
             [InlineKeyboardButton("🗑 Delete Command",callback_data=f"a_support_tpl_delete_{command}")],
             [InlineKeyboardButton("⬅ Back",callback_data="a_support_templates")],
-        ])
-
-    @staticmethod
-    def support_template_buttons_menu(command):
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("⚡ Choose Bot Button",callback_data=f"a_support_tpl_quick_{command}")],
-            [InlineKeyboardButton("✍ Write Manually",callback_data=f"a_support_tpl_buttons_{command}")],
-            [InlineKeyboardButton("🧹 Remove All Buttons",callback_data=f"a_support_tpl_rmbuttons_{command}")],
-            [InlineKeyboardButton("⬅ Back",callback_data=f"a_support_tpl_view_{command}")],
-        ])
-
-    @staticmethod
-    def support_template_quick_menu(command):
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 Plans",callback_data=f"a_support_tpl_q_plans_{command}"),InlineKeyboardButton("💳 Buy",callback_data=f"a_support_tpl_q_buy_{command}")],
-            [InlineKeyboardButton("👤 My Profile",callback_data=f"a_support_tpl_q_profile_{command}"),InlineKeyboardButton("🔄 Renew",callback_data=f"a_support_tpl_q_renew_{command}")],
-            [InlineKeyboardButton("🎁 Referral",callback_data=f"a_support_tpl_q_referral_{command}"),InlineKeyboardButton("📞 Support",callback_data=f"a_support_tpl_q_support_{command}")],
-            [InlineKeyboardButton("🏠 Main Menu",callback_data=f"a_support_tpl_q_home_{command}")],
-            [InlineKeyboardButton("⬅ Back",callback_data=f"a_support_tpl_buttons_menu_{command}")],
-        ])
-
-    @staticmethod
-    def support_template_auto_delete_menu(command,current_minutes=0):
-        def label(minutes,title):
-            return ("✅ " if int(current_minutes or 0)==minutes else "")+title
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton(label(0,"OFF"),callback_data=f"a_support_tpl_ad_0_{command}")],
-            [InlineKeyboardButton(label(5,"5 Minutes"),callback_data=f"a_support_tpl_ad_5_{command}"),InlineKeyboardButton(label(10,"10 Minutes"),callback_data=f"a_support_tpl_ad_10_{command}")],
-            [InlineKeyboardButton("✍ Custom Minutes",callback_data=f"a_support_tpl_adcustom_{command}")],
-            [InlineKeyboardButton("⬅ Back",callback_data=f"a_support_tpl_view_{command}")],
         ])
 
     @staticmethod
@@ -1528,83 +1497,13 @@ class SellerBotManager:
             if not tpl:
                 await q.edit_message_text("❌ Template not found",reply_markup=self.back("a_support_templates")); return
             count=sum(len(row) for row in (tpl.get("buttons") or []))
-            auto_minutes=int(tpl.get("auto_delete_minutes",0) or 0)
-            auto_text="OFF" if auto_minutes<=0 else f"{auto_minutes} minute(s)"
-            await q.edit_message_text(
-                f"⚡ /{command}\n\n"
-                f"📝 Text: {'✅' if tpl.get('text') else '❌'}\n"
-                f"🖼 Media: {'✅' if tpl.get('media_file_id') else '❌'}\n"
-                f"🔗 Buttons: {count}\n"
-                f"⏱ Auto Remove: {auto_text}",
-                reply_markup=self.support_template_edit_menu(command),
-            ); return
+            await q.edit_message_text(f"⚡ /{command}\n\n📝 Text: {'✅' if tpl.get('text') else '❌'}\n🖼 Media: {'✅' if tpl.get('media_file_id') else '❌'}\n🔗 Buttons: {count}",reply_markup=self.support_template_edit_menu(command)); return
         if a.startswith("a_support_tpl_text_"):
             command=a.replace("a_support_tpl_text_",""); context.user_data.clear(); context.user_data["wait_support_tpl_text"]=command
             await q.edit_message_text("📝 Template text bhejo.\n\nVariables: {NAME} {ID} {USERNAME} {PLAN} {EXPIRY}",reply_markup=self.back(f"a_support_tpl_view_{command}")); return
         if a.startswith("a_support_tpl_media_"):
             command=a.replace("a_support_tpl_media_",""); context.user_data.clear(); context.user_data["wait_support_tpl_media"]=command
             await q.edit_message_text("🖼 Photo, video, GIF ya document bhejo.",reply_markup=self.back(f"a_support_tpl_view_{command}")); return
-        if a.startswith("a_support_tpl_buttons_menu_"):
-            command=a.replace("a_support_tpl_buttons_menu_","")
-            await q.edit_message_text(
-                "🔗 Template Buttons\n\nBot ka ready button choose karo ya URL button manually likho.",
-                reply_markup=self.support_template_buttons_menu(command),
-            ); return
-        if a.startswith("a_support_tpl_quick_"):
-            command=a.replace("a_support_tpl_quick_","")
-            await q.edit_message_text(
-                "⚡ Choose Bot Button",
-                reply_markup=self.support_template_quick_menu(command),
-            ); return
-        if a.startswith("a_support_tpl_q_"):
-            rest=a.replace("a_support_tpl_q_", "", 1)
-            feature,command=rest.split("_",1)
-            config={
-                "plans":("📋 Plans","c_plans"),"buy":("💳 Buy","c_buy"),
-                "profile":("👤 My Profile","c_profile"),"renew":("🔄 Renew","c_renew"),
-                "referral":("🎁 Referral","c_referral"),"support":("📞 Support","c_support"),
-                "home":("🏠 Main Menu","c_home"),
-            }
-            title,callback=config[feature]
-            tpl=await get_support_template(owner,command) or {}
-            rows=list(tpl.get("buttons") or [])
-            exists=any(
-                item.get("type")=="callback" and item.get("value")==callback
-                for row in rows for item in row
-            )
-            if not exists:
-                rows.append([{"text":title,"type":"callback","value":callback}])
-                await save_support_template(owner,command,buttons=rows)
-            await q.edit_message_text(
-                f"✅ {title} button {'already exists' if exists else 'added'}.",
-                reply_markup=self.support_template_buttons_menu(command),
-            ); return
-        if a.startswith("a_support_tpl_autodel_"):
-            command=a.replace("a_support_tpl_autodel_","")
-            tpl=await get_support_template(owner,command) or {}
-            await q.edit_message_text(
-                "⏱ Auto Remove\n\nSirf user ko bheja gaya template message selected time ke baad delete hoga.",
-                reply_markup=self.support_template_auto_delete_menu(
-                    command,int(tpl.get("auto_delete_minutes",0) or 0)
-                ),
-            ); return
-        if a.startswith("a_support_tpl_adcustom_"):
-            command=a.replace("a_support_tpl_adcustom_","")
-            context.user_data.clear()
-            context.user_data["wait_support_tpl_auto_delete"]=command
-            await q.edit_message_text(
-                "✍ Auto remove ke minutes bhejo.\n0 = OFF\nAllowed: 0-10080",
-                reply_markup=self.back(f"a_support_tpl_autodel_{command}"),
-            ); return
-        if a.startswith("a_support_tpl_ad_"):
-            rest=a.replace("a_support_tpl_ad_", "", 1)
-            minutes_text,command=rest.split("_",1)
-            minutes=int(minutes_text)
-            await save_support_template(owner,command,auto_delete_minutes=minutes)
-            await q.edit_message_text(
-                f"✅ Auto Remove: {'OFF' if minutes==0 else str(minutes)+' minute(s)'}",
-                reply_markup=self.support_template_edit_menu(command),
-            ); return
         if a.startswith("a_support_tpl_buttons_"):
             command=a.replace("a_support_tpl_buttons_",""); context.user_data.clear(); context.user_data["wait_support_tpl_buttons"]=command
             await q.edit_message_text("🔗 Buttons bhejo. Format:\nTitle - https://example.com\n\nSame row:\nButton 1 - URL && Button 2 - URL",reply_markup=self.back(f"a_support_tpl_view_{command}")); return
@@ -1622,7 +1521,7 @@ class SellerBotManager:
             await q.edit_message_text(f"✅ /{command} deleted",reply_markup=self.support_templates_menu(await list_support_templates(owner))); return
         if a.startswith("a_support_tpl_preview_"):
             command=a.replace("a_support_tpl_preview_",""); tpl=await get_support_template(owner,command)
-            await self.send_support_template(context,owner,q.from_user.id,tpl,q.from_user,apply_auto_delete=False)
+            await self.send_support_template(context,owner,q.from_user.id,tpl,q.from_user)
             await q.answer("Preview sent",show_alert=True); return
 
         if a=="a_payment":
@@ -1996,12 +1895,15 @@ class SellerBotManager:
                 duration_text=plan.get("duration_text"),
             )
 
+            delivery=await self.deliver_subscription_access(owner,user_id)
             try:
                 await context.bot.send_message(
                     user_id,
-                    "🎉 Subscription activated by admin.\n"
+                    "🎉 Subscription activated/extended by admin.\n"
                     f"Plan: {plan['name']}\n"
-                    f"Duration: {plan['duration_text']}",
+                    f"Duration added: {plan['duration_text']}\n\n"
+                    f"New invite links sent: {delivery.get('sent',0)}\n"
+                    f"Already joined: {delivery.get('already_member',0)}",
                 )
             except Exception:
                 pass
@@ -2124,20 +2026,7 @@ class SellerBotManager:
         }
         return values
 
-    async def delete_support_template_message_job(self,context:ContextTypes.DEFAULT_TYPE):
-        data=context.job.data or {}
-        try:
-            await context.bot.delete_message(
-                chat_id=int(data["chat_id"]),
-                message_id=int(data["message_id"]),
-            )
-        except TelegramError as exc:
-            logger.info("Template auto-remove skipped chat=%s message=%s: %s",data.get("chat_id"),data.get("message_id"),exc)
-
-    async def send_support_template(
-        self,context,owner,target_user_id,template,user_obj=None,
-        apply_auto_delete=True,
-    ):
+    async def send_support_template(self,context,owner,target_user_id,template,user_obj=None):
         if not template:
             raise ValueError("Template not found")
         if user_obj is None:
@@ -2154,22 +2043,11 @@ class SellerBotManager:
         file_id=template.get("media_file_id")
         media_type=template.get("media_type")
         kwargs={"chat_id":int(target_user_id),"reply_markup":keyboard}
-        if file_id and media_type=="photo": sent=await context.bot.send_photo(photo=file_id,caption=text or None,**kwargs)
-        elif file_id and media_type=="video": sent=await context.bot.send_video(video=file_id,caption=text or None,**kwargs)
-        elif file_id and media_type=="animation": sent=await context.bot.send_animation(animation=file_id,caption=text or None,**kwargs)
-        elif file_id and media_type=="document": sent=await context.bot.send_document(document=file_id,caption=text or None,**kwargs)
-        else: sent=await context.bot.send_message(text=text or "(Empty template)",disable_web_page_preview=True,**kwargs)
-
-        minutes=int(template.get("auto_delete_minutes",0) or 0)
-        if apply_auto_delete and minutes>0 and context.application.job_queue:
-            context.application.job_queue.run_once(
-                self.delete_support_template_message_job,
-                when=minutes*60,
-                data={"chat_id":int(target_user_id),"message_id":sent.message_id},
-                name=f"support_tpl_delete_{owner}_{target_user_id}_{sent.message_id}",
-            )
-        return sent
-
+        if file_id and media_type=="photo": return await context.bot.send_photo(photo=file_id,caption=text or None,**kwargs)
+        if file_id and media_type=="video": return await context.bot.send_video(video=file_id,caption=text or None,**kwargs)
+        if file_id and media_type=="animation": return await context.bot.send_animation(animation=file_id,caption=text or None,**kwargs)
+        if file_id and media_type=="document": return await context.bot.send_document(document=file_id,caption=text or None,**kwargs)
+        return await context.bot.send_message(text=text or "(Empty template)",disable_web_page_preview=True,**kwargs)
 
     async def support_template_command_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         message=update.effective_message; user=update.effective_user; chat=update.effective_chat
@@ -2407,21 +2285,6 @@ class SellerBotManager:
                 except Exception as exc: await update.effective_message.reply_text(f"❌ {exc}"); return
                 await save_support_template(owner,command,buttons=rows); context.user_data.clear()
                 await update.effective_message.reply_text("✅ Template buttons saved",reply_markup=self.support_template_edit_menu(command)); return
-            if context.user_data.get("wait_support_tpl_auto_delete"):
-                command=context.user_data["wait_support_tpl_auto_delete"]
-                try:
-                    minutes=int(text)
-                    if minutes<0 or minutes>10080:
-                        raise ValueError
-                    await save_support_template(owner,command,auto_delete_minutes=minutes)
-                except ValueError:
-                    await update.effective_message.reply_text("❌ 0 se 10080 ke beech number bhejo.")
-                    return
-                context.user_data.clear()
-                await update.effective_message.reply_text(
-                    f"✅ Auto Remove: {'OFF' if minutes==0 else str(minutes)+' minute(s)'}",
-                    reply_markup=self.support_template_edit_menu(command),
-                ); return
             if context.user_data.get("wait_coupon_create"):
                 try:
                     code,ctype,value,limit=[x.strip() for x in text.split("|",3)]
@@ -2783,6 +2646,67 @@ class SellerBotManager:
         except Exception as exc:
             logger.exception("Unexpected group connect error owner=%s", owner)
             await message.reply_text(f"❌ Group connect failed: {exc}")
+
+    async def deliver_subscription_access(self, owner_id:int, user_id:int):
+        """Send fresh invite links only for chats the user has not joined yet."""
+        running=self.get_running(int(owner_id))
+        if not running:
+            started=await self.start_bot(int(owner_id))
+            running=self.get_running(int(owner_id)) if started else None
+        if not running:
+            return {"sent":0,"already_member":0,"failed":0,"error":"Clone bot is not running"}
+
+        bot=running.application.bot
+        channels=await get_channels(int(owner_id))
+        links=[]
+        already_member=0
+        failed=0
+
+        for ch in channels:
+            chat_id=int(ch["chat_id"])
+            try:
+                member=await bot.get_chat_member(chat_id,int(user_id))
+                status=getattr(member,"status","")
+                is_member=getattr(member,"is_member",None)
+                if status in {"creator","administrator","member"} or (status=="restricted" and is_member is not False):
+                    already_member+=1
+                    continue
+                if status=="kicked":
+                    try:
+                        await bot.unban_chat_member(chat_id,int(user_id),only_if_banned=True)
+                    except TelegramError:
+                        pass
+            except BadRequest:
+                pass
+            except TelegramError as exc:
+                logger.warning("Membership check failed owner=%s chat=%s user=%s: %s",owner_id,chat_id,user_id,exc)
+
+            try:
+                invite=await bot.create_chat_invite_link(
+                    chat_id=chat_id,
+                    member_limit=1,
+                    name=f"Subscription access {user_id}",
+                )
+                links.append(f"📢 {ch.get('title','Premium Channel/Group')}\n{invite.invite_link}")
+            except TelegramError as exc:
+                failed+=1
+                logger.warning("Invite creation failed owner=%s chat=%s user=%s: %s",owner_id,chat_id,user_id,exc)
+
+        if links:
+            try:
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        "✅ Your subscription has been updated.\n\n"
+                        "Use the fresh invite link(s) below to join the channel/group(s) you have not joined yet:\n\n"
+                        + "\n\n".join(links)
+                    ),
+                    disable_web_page_preview=True,
+                )
+            except TelegramError as exc:
+                return {"sent":0,"already_member":already_member,"failed":failed+len(links),"error":str(exc)}
+
+        return {"sent":len(links),"already_member":already_member,"failed":failed,"error":""}
 
     async def expiry_job(self,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
