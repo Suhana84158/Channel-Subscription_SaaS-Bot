@@ -918,7 +918,23 @@ class SellerBotManager:
             limit=int(plan_cfg.get("channel_limit",1))
             if limit>=0 and existing>=limit:
                 await q.edit_message_text(await plan_limit_warning(owner), reply_markup=self.limit_keyboard("a_channels")); return
-            context.user_data.clear(); context.user_data["wait_channel"]=True; await q.edit_message_text("Forward a channel/group message.\nIf private group is not detected, send:\n-1001234567890 | Group Name",reply_markup=self.back("a_channels")); return
+            context.user_data.clear(); context.user_data["wait_channel"]=True; await q.edit_message_text(
+                "📢 Connect Channel / Group\n\n"
+                "✅ Channel\n"
+                "• Child bot ko channel me Admin banao.\n"
+                "• Channel se koi bhi message yahan FORWARD karo.\n\n"
+                "✅ Private Group (Recommended)\n"
+                "1. Child bot ko group me add karo.\n"
+                "2. Bot ko Admin banao.\n"
+                "3. Invite Users permission ON rakho.\n"
+                "4. Usi group ke andar /connectgroup bhejo.\n\n"
+                "Bot group automatically detect karke save karega aur invite-link permission test karega.\n\n"
+                "🔄 Agar auto detect na ho:\n"
+                "• Group se koi message yahan FORWARD karo.\n\n"
+                "⚠️ Sirf last option:\n"
+                "-100xxxxxxxxxx | Group Name",
+                reply_markup=self.back("a_channels"),
+            ); return
         if a=="a_channel_list":
             channels=await get_channels(owner); lines=["📋 Channels / Groups\n"]; kb=[]
             for ch in channels:
