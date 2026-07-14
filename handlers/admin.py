@@ -838,33 +838,43 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
 
+async def add_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start the owner channel/group connection flow."""
+    if not await is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ You are not authorized.")
+        return
+
+    context.user_data.clear()
+    context.user_data["waiting_channel"] = True
+    await update.message.reply_text(
+        "📢 Add Channel / Group\n\n"
+        "1. Add the main bot as an administrator.\n"
+        "2. Forward any message from the target channel/group here.\n\n"
+        "The bot will detect the chat automatically.",
+        reply_markup=back_keyboard(),
+    )
+
+
 async def receive_upi_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Save the owner payment QR image while the QR-upload state is active."""
+    """Save the owner UPI QR image when Payment Settings requests it."""
     if not update.effective_user or not await is_admin(update.effective_user.id):
         return
-
     if not context.user_data.get("waiting_upi_qr"):
         return
-
-    message = update.effective_message
-    if not message or not message.photo:
+    if not update.message or not update.message.photo:
+        await update.effective_message.reply_text(
+            "❌ Please send the QR code as a photo.",
+            reply_markup=back_keyboard(),
+        )
         return
 
-    try:
-        file_id = message.photo[-1].file_id
-        await set_setting("upi_qr_file_id", file_id)
-        context.user_data.clear()
-        await message.reply_text(
-            "✅ UPI QR Code updated successfully.",
-            reply_markup=back_keyboard(),
-        )
-    except Exception as exc:
-        await message.reply_text(
-            "❌ Could not save the UPI QR Code.\n\n"
-            f"Error: {str(exc)[:250]}",
-            reply_markup=back_keyboard(),
-        )
-
+    file_id = update.message.photo[-1].file_id
+    await set_setting("upi_qr_file_id", file_id)
+    context.user_data.clear()
+    await update.message.reply_text(
+        "✅ UPI QR code updated successfully.",
+        reply_markup=admin_keyboard(),
+    )
 
 
 async def receive_channel_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
