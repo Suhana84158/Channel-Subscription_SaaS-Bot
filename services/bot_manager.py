@@ -11,6 +11,11 @@ from telegram.error import BadRequest, Conflict, InvalidToken, TelegramError
 from telegram.ext import Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from database.seller_subscriptions import effective_plan, plan_limit_warning, current_plan_text, get_config, seller_access_state, usage_warning
+from database.payment_gateways import (
+    SUPPORTED_GATEWAYS, create_gateway_transaction, get_gateway_config,
+    save_gateway_config, set_gateway_preferences, gateway_history,
+)
+from services.payment_gateways import create_checkout, GatewayError
 from database.seller_bots import get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status
 from database.platform_features import (reserve_payment_fingerprint, create_invoice, save_failed_delivery, get_failed_deliveries, resolve_failed_delivery, create_coupon, list_coupons, save_scheduled_broadcast, set_scheduled_status, audit, get_policy)
 from database.seller_data import (
@@ -27,7 +32,7 @@ from database.seller_data import (
 )
 
 logger=logging.getLogger(__name__)
-WELCOME_RUNTIME_VERSION="2026-07-14-child-owner-direct-admin-14"
+WELCOME_RUNTIME_VERSION="2026-07-13-main-role-dashboard-fix-13"
 MAIN_BOT_USERNAME=os.getenv("MAIN_BOT_USERNAME","Local_supplier3_bot").lstrip("@")
 
 @dataclass
@@ -37,6 +42,7 @@ class RunningSellerBot:
 class SellerBotManager:
     def __init__(self): self._running:Dict[int,RunningSellerBot]={}; self._lock=asyncio.Lock()
     def is_running(self,owner_id:int)->bool:return owner_id in self._running
+    def get_running(self,owner_id:int): return self._running.get(int(owner_id))
 
     @staticmethod
     def main_menu():
@@ -85,7 +91,13 @@ class SellerBotManager:
         ])
     @staticmethod
     def payment_menu():
-        return InlineKeyboardMarkup([[InlineKeyboardButton("🏦 Set UPI ID",callback_data="a_set_upi_id")],[InlineKeyboardButton("👤 Set UPI Name",callback_data="a_set_upi_name")],[InlineKeyboardButton("🖼 Upload QR",callback_data="a_set_qr")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌐 Automatic Gateways",callback_data="a_pg_home")],
+            [InlineKeyboardButton("🏦 Set UPI ID",callback_data="a_set_upi_id")],
+            [InlineKeyboardButton("👤 Set UPI Name",callback_data="a_set_upi_name")],
+            [InlineKeyboardButton("🖼 Upload QR",callback_data="a_set_qr")],
+            [InlineKeyboardButton("⬅ Back",callback_data="a_home")],
+        ])
     @staticmethod
     def settings_menu():
         return InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Bot Name",callback_data="a_set_bot_name")],[InlineKeyboardButton("💬 Welcome Message",callback_data="a_welcome")],[InlineKeyboardButton("📞 Support Username",callback_data="a_set_support")],[InlineKeyboardButton("💵 Currency",callback_data="a_set_currency"),InlineKeyboardButton("🕒 Timezone",callback_data="a_set_timezone")],[InlineKeyboardButton("🔔 Reminder Days",callback_data="a_set_reminder")],[InlineKeyboardButton("🎁 Referral Reward Days",callback_data="a_set_referral_days")],[InlineKeyboardButton("⬅ Back",callback_data="a_home")]])
@@ -420,8 +432,7 @@ class SellerBotManager:
     async def child_start(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
 
-        # The child-bot owner/seller should enter the admin panel directly.
-        # Do not show the subscriber welcome message or save the seller as a user.
+        # Child-bot owner/seller opens the admin panel directly.
         if update.effective_user.id == owner:
             context.user_data.clear()
             await update.effective_message.reply_text(
@@ -639,22 +650,17 @@ class SellerBotManager:
                 f"UPI ID: {s.get('upi_id') or 'Not Set'}"
             )
 
-            kb=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "📤 Upload Screenshot",
-                        callback_data="c_upload",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⬅ Back",
-                        callback_data="c_buy",
-                    )
-                ],
-            ])
+            gateway_cfg=await get_gateway_config("seller", owner, decrypt=True)
+            rows=[]
+            for gateway in SUPPORTED_GATEWAYS:
+                if (gateway_cfg.get("gateways") or {}).get(gateway,{}).get("enabled"):
+                    rows.append([InlineKeyboardButton(f"💳 Pay with {gateway.title()}",callback_data=f"c_pg_{gateway}_{plan['plan_id']}")])
+            if gateway_cfg.get("manual_enabled",True):
+                rows.append([InlineKeyboardButton("📤 Manual Screenshot Payment",callback_data="c_upload")])
+            rows.append([InlineKeyboardButton("⬅ Back",callback_data="c_buy")])
+            kb=InlineKeyboardMarkup(rows)
 
-            if s.get("upi_qr_file_id"):
+            if s.get("upi_qr_file_id") and gateway_cfg.get("manual_enabled",True):
                 await q.message.reply_photo(
                     s["upi_qr_file_id"],
                     caption=text,
@@ -662,6 +668,31 @@ class SellerBotManager:
                 )
             else:
                 await self.safe_query_message(q,text,kb)
+            return
+
+        if action.startswith("c_pg_"):
+            try:
+                _,_,gateway,plan_id=action.split("_",3)
+            except ValueError:
+                await q.answer("Invalid payment option",show_alert=True); return
+            plan=await get_plan(owner,plan_id)
+            if not plan:
+                await q.answer("Plan not found",show_alert=True); return
+            tx=await create_gateway_transaction(
+                scope="seller", owner_id=owner, payer_user_id=q.from_user.id,
+                gateway=gateway, amount=float(plan["price"]), currency="INR",
+                purpose="child_subscription", reference_id=plan_id,
+                metadata={"plan_id":plan_id,"plan_name":plan["name"],"description":f"{plan['name']} subscription"},
+            )
+            try:
+                checkout=await create_checkout(tx)
+            except GatewayError as exc:
+                await self.safe_query_message(q,f"❌ Gateway error: {exc}",back_keyboard); return
+            await self.safe_query_message(
+                q,
+                f"💳 {gateway.title()} Secure Payment\n\nPlan: {plan['name']}\nAmount: ₹{plan['price']:g}\nTransaction: {tx['transaction_id']}\n\nPayment verify hote hi subscription automatically activate hogi.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay Now",url=checkout.get("checkout_url"))],[InlineKeyboardButton("⬅ Back",callback_data="c_buy")]]),
+            )
             return
 
         if action=="c_upload":
@@ -1177,6 +1208,41 @@ class SellerBotManager:
                 logger.exception("Welcome preview failed for owner=%s",owner)
                 await q.message.reply_text(f"❌ Preview failed: {str(exc)[:300]}",reply_markup=self.welcome_menu())
             return
+        if a=="a_pg_home":
+            cfg=await get_gateway_config("seller",owner,decrypt=True)
+            rows=[]; lines=["🌐 Automatic Payment Gateways","",f"Default: {cfg.get('default_gateway','manual').title()}",f"Manual: {'ON' if cfg.get('manual_enabled',True) else 'OFF'}",""]
+            for gateway in SUPPORTED_GATEWAYS:
+                g=(cfg.get("gateways") or {}).get(gateway,{})
+                lines.append(f"{'✅' if g.get('enabled') else '❌'} {gateway.title()} ({g.get('mode','test')})")
+                rows.append([InlineKeyboardButton(gateway.title(),callback_data=f"a_pg_view_{gateway}")])
+            rows += [[InlineKeyboardButton("⚙ Default / Manual",callback_data="a_pg_default")],[InlineKeyboardButton("📜 History",callback_data="a_pg_history")],[InlineKeyboardButton("⬅ Back",callback_data="a_payment")]]
+            await q.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(rows)); return
+        if a.startswith("a_pg_view_"):
+            gateway=a.replace("a_pg_view_",""); cfg=await get_gateway_config("seller",owner,decrypt=True); g=(cfg.get("gateways") or {}).get(gateway,{})
+            await q.edit_message_text(f"💳 {gateway.title()}\n\nStatus: {'Enabled' if g.get('enabled') else 'Disabled'}\nMode: {g.get('mode','test').title()}\nCredentials: {'Set' if len(g)>2 else 'Not set'}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Enable/Disable",callback_data=f"a_pg_toggle_{gateway}")],[InlineKeyboardButton("🔑 Set Credentials",callback_data=f"a_pg_creds_{gateway}")],[InlineKeyboardButton("🧪 Test",callback_data=f"a_pg_mode_test_{gateway}"),InlineKeyboardButton("🚀 Live",callback_data=f"a_pg_mode_live_{gateway}")],[InlineKeyboardButton("⬅ Back",callback_data="a_pg_home")]])); return
+        if a.startswith("a_pg_toggle_"):
+            gateway=a.replace("a_pg_toggle_",""); cfg=await get_gateway_config("seller",owner,decrypt=True); g=(cfg.get("gateways") or {}).get(gateway,{})
+            await save_gateway_config("seller",owner,gateway,{"enabled":not bool(g.get("enabled"))}); await q.edit_message_text("✅ Gateway status updated",reply_markup=self.payment_menu()); return
+        if a.startswith("a_pg_mode_test_") or a.startswith("a_pg_mode_live_"):
+            mode="test" if a.startswith("a_pg_mode_test_") else "live"; gateway=a.rsplit("_",1)[-1]
+            await save_gateway_config("seller",owner,gateway,{"mode":mode}); await q.edit_message_text(f"✅ {gateway.title()} mode: {mode}",reply_markup=self.payment_menu()); return
+        if a.startswith("a_pg_creds_"):
+            gateway=a.replace("a_pg_creds_",""); context.user_data.clear(); context.user_data["wait_pg_credentials"]=gateway
+            help_text={"razorpay":"KEY_ID | KEY_SECRET | WEBHOOK_SECRET","cashfree":"CLIENT_ID | CLIENT_SECRET","phonepe":"CLIENT_ID | CLIENT_VERSION | CLIENT_SECRET | WEBHOOK_USERNAME | WEBHOOK_PASSWORD","paytm":"MID | MERCHANT_KEY | WEBSITE_NAME"}[gateway]
+            await q.edit_message_text(f"Send credentials:\n{help_text}",reply_markup=self.back("a_pg_home")); return
+        if a=="a_pg_default":
+            cfg=await get_gateway_config("seller",owner,decrypt=True); rows=[[InlineKeyboardButton("Manual Screenshot",callback_data="a_pg_setdefault_manual")]]
+            for gateway in SUPPORTED_GATEWAYS: rows.append([InlineKeyboardButton(gateway.title(),callback_data=f"a_pg_setdefault_{gateway}")])
+            rows += [[InlineKeyboardButton("🔄 Manual On/Off",callback_data="a_pg_manualtoggle")],[InlineKeyboardButton("⬅ Back",callback_data="a_pg_home")]]
+            await q.edit_message_text("Choose default payment method",reply_markup=InlineKeyboardMarkup(rows)); return
+        if a=="a_pg_manualtoggle":
+            cfg=await get_gateway_config("seller",owner,decrypt=True); await set_gateway_preferences("seller",owner,manual_enabled=not cfg.get("manual_enabled",True)); await q.edit_message_text("✅ Manual payment updated",reply_markup=self.payment_menu()); return
+        if a.startswith("a_pg_setdefault_"):
+            gateway=a.replace("a_pg_setdefault_",""); await set_gateway_preferences("seller",owner,default_gateway=gateway); await q.edit_message_text(f"✅ Default: {gateway.title()}",reply_markup=self.payment_menu()); return
+        if a=="a_pg_history":
+            items=await gateway_history("seller",owner,25); text="📜 Gateway History\n\n"+"\n".join(f"• {x.get('gateway','-').title()} ₹{x.get('amount',0):g} — {x.get('status')}" for x in items)
+            await q.edit_message_text(text if items else "No gateway payments yet",reply_markup=self.back("a_pg_home")); return
+
         if a=="a_payment":
             s=await get_seller_settings(owner); await q.edit_message_text(f"💳 Payment Settings\n\nUPI Name: {s.get('upi_name') or 'Not Set'}\nUPI ID: {s.get('upi_id') or 'Not Set'}\nQR: {'Added' if s.get('upi_qr_file_id') else 'Not Added'}",reply_markup=self.payment_menu()); return
         state={"a_set_upi_id":("wait_upi_id","Send UPI ID","a_payment"),"a_set_upi_name":("wait_upi_name","Send UPI Name","a_payment"),"a_set_bot_name":("wait_bot_name","Send Bot Name","a_settings"),"a_set_support":("wait_support","Send Support Username","a_settings"),"a_set_currency":("wait_currency","Send Currency","a_settings"),"a_set_timezone":("wait_timezone","Send Timezone","a_settings"),"a_set_reminder":("wait_reminder","Send Reminder Days","a_settings"),"a_set_referral_days":("wait_referral_days","Send free reward days per successful referral","a_settings")}
@@ -1561,6 +1627,26 @@ class SellerBotManager:
     async def text_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context); text=update.effective_message.text.strip()
         if update.effective_user.id==owner:
+            gateway=context.user_data.get("wait_pg_credentials")
+            if gateway:
+                values=[x.strip() for x in text.split("|")]
+                try:
+                    if gateway=="razorpay" and len(values)==3:
+                        payload={"key_id":values[0],"key_secret":values[1],"webhook_secret":values[2]}
+                    elif gateway=="cashfree" and len(values)==2:
+                        payload={"client_id":values[0],"client_secret":values[1]}
+                    elif gateway=="phonepe" and len(values)==5:
+                        payload={"client_id":values[0],"client_version":values[1],"client_secret":values[2],"webhook_username":values[3],"webhook_password":values[4]}
+                    elif gateway=="paytm" and len(values)==3:
+                        payload={"mid":values[0],"merchant_key":values[1],"website_name":values[2]}
+                    else:
+                        raise ValueError("Invalid credential format")
+                    await save_gateway_config("seller",owner,gateway,payload)
+                    context.user_data.clear()
+                    await update.effective_message.reply_text("✅ Gateway credentials saved securely.",reply_markup=self.payment_menu())
+                except Exception as exc:
+                    await update.effective_message.reply_text(f"❌ {exc}")
+                return
             if context.user_data.get("wait_coupon_create"):
                 try:
                     code,ctype,value,limit=[x.strip() for x in text.split("|",3)]
