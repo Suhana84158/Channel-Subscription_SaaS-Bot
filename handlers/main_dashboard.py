@@ -28,7 +28,7 @@ def owner_dashboard_keyboard():
             InlineKeyboardButton("🏪 Sellers Management", callback_data="main_owner_sellers"),
         ],
         [
-            InlineKeyboardButton("🤖 Child Bots", callback_data="main_owner_bots"),
+            InlineKeyboardButton("🤖 Clone Bots", callback_data="main_owner_bots"),
             InlineKeyboardButton("💳 Pending Payments", callback_data="admin_pending_payments"),
         ],
         [
@@ -75,7 +75,7 @@ def seller_dashboard_keyboard(record=None):
         ])
     else:
         rows.append([
-            InlineKeyboardButton("➕ Create / Connect Child Bot", callback_data="seller_connect")
+            InlineKeyboardButton("➕ Create / Connect Clone Bot", callback_data="seller_connect")
         ])
         rows.extend([
             [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
@@ -102,7 +102,7 @@ async def owner_dashboard_text():
         "👑 Owner Dashboard\n\n"
         "Platform overview:\n\n"
         f"🏪 Total Sellers: {sellers}\n"
-        f"🤖 Connected Child Bots: {bots}\n"
+        f"🤖 Connected Clone Bots: {bots}\n"
         f"👥 Main Bot Users: {users}\n"
         f"📨 Pending Main Payments: {pending}\n"
         f"💰 Main Bot Revenue: ₹{revenue:g}\n\n"
@@ -117,7 +117,7 @@ async def seller_dashboard_text(user_id: int):
         return (
             "🏪 Seller Dashboard\n\n"
             "No child bot connected yet.\n\n"
-            "Tap “Create / Connect Child Bot”, create a bot from @BotFather, "
+            "Tap “Create / Connect clone Bot”, create a bot from @BotFather, "
             "then send its token securely."
         ), None
 
@@ -132,7 +132,7 @@ async def seller_dashboard_text(user_id: int):
         f"📢 Channels/Groups: {child_stats.get('channels',0)}\n"
         f"📨 Pending Payments: {child_stats.get('pending',0)}\n"
         f"💰 Revenue: ₹{child_stats.get('revenue',0):g}\n\n"
-        "Open your child bot and send /admin for plan, payment, user, "
+        "Open your clone bot and send /admin for plan, payment, user, "
         "broadcast and channel controls."
     ), record
 
@@ -292,14 +292,14 @@ async def main_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "main_child_setup":
         record = await get_bot(user_id)
         await query.edit_message_text(
-            "📖 Child Bot Setup Guide\n\n"
+            "📖 Clone Bot Setup Guide\n\n"
             "1. Open @BotFather\n"
             "2. Send /newbot\n"
             "3. Choose bot name and username\n"
             "4. Copy the token\n"
-            "5. Return here and tap Create / Connect Child Bot\n"
+            "5. Return here and tap Create / Connect Clone Bot\n"
             "6. Send the token\n"
-            "7. Open the new child bot and send /admin\n\n"
+            "7. Open the new clone bot and send /admin\n\n"
             "Security: Send only your own BotFather token.",
             reply_markup=InlineKeyboardMarkup([
                 [
@@ -347,7 +347,7 @@ async def main_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             ])
         if count == 0:
-            lines.append("No child bots connected.")
+            lines.append("No clone bots connected.")
         keyboard.append([InlineKeyboardButton("⬅ Owner Dashboard", callback_data="main_owner_dashboard")])
         await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
         return
