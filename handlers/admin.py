@@ -27,6 +27,17 @@ from database.subscriptions import (
     activate_subscription,
     renew_subscription,
 )
+from database.seller_data import (
+    c as seller_collection,
+    USERS as SELLER_USERS,
+    SUBS as SELLER_SUBS,
+    get_user as get_seller_user,
+    get_subscription as get_seller_subscription,
+    activate_subscription as activate_seller_subscription,
+)
+from database.seller_bots import get_bot as get_seller_bot
+from services.bot_manager import bot_manager
+
 from services.channel_service import (
     revoke_channel_access,
     grant_channel_access,
@@ -184,6 +195,55 @@ async def show_user_details(query, user):
     )
 
 
+def seller_user_action_keyboard(owner_id:int,user_id:int,banned:bool):
+    prefix=f"owner_su_{int(owner_id)}_{int(user_id)}"
+    rows=[
+        [InlineKeyboardButton("🎁 Give Subscription",callback_data=prefix+"_give")],
+        [InlineKeyboardButton("⏳ Extend Subscription",callback_data=prefix+"_extend")],
+        [InlineKeyboardButton("❌ Remove Subscription",callback_data=prefix+"_remove")],
+    ]
+    rows.append([InlineKeyboardButton("✅ Unban User" if banned else "🚫 Ban User",callback_data=prefix+("_unban" if banned else "_ban"))])
+    rows.append([InlineKeyboardButton("⬅ Back",callback_data="admin_users")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def build_seller_user_details_text(owner_id:int,user:dict):
+    sub=await get_seller_subscription(int(owner_id),int(user["user_id"])) or {}
+    bot_record=await get_seller_bot(int(owner_id)) or {}
+    return (
+        "👤 Clone Bot User Details\n\n"
+        f"🏪 Seller ID: {owner_id}\n"
+        f"🤖 Clone Bot: @{bot_record.get('bot_username','Not connected')}\n"
+        f"🆔 User ID: {user.get('user_id')}\n"
+        f"👤 Name: {' '.join(x for x in [user.get('first_name'),user.get('last_name')] if x) or '-'}\n"
+        f"📛 Username: @{user.get('username') if user.get('username') else 'None'}\n"
+        f"🚫 Banned: {'Yes' if user.get('banned') else 'No'}\n"
+        f"📅 Joined: {format_time(user.get('joined_at'))}\n\n"
+        f"💎 Plan: {sub.get('plan') or 'No Plan'}\n"
+        f"📅 Expiry: {format_time(sub.get('expiry_date'))}\n"
+        f"📌 Status: {'✅ Active' if sub.get('active') else '❌ Inactive'}"
+    )
+
+
+async def show_seller_user_details(query,owner_id:int,user:dict):
+    await query.edit_message_text(
+        await build_seller_user_details_text(owner_id,user),
+        reply_markup=seller_user_action_keyboard(owner_id,user["user_id"],bool(user.get("banned"))),
+    )
+
+
+async def find_seller_users(search:str):
+    value=search.strip()
+    if value.startswith("@"):
+        query={"username_normalized":value[1:].lower()}
+    else:
+        try:
+            query={"user_id":int(value)}
+        except ValueError:
+            query={"username_normalized":value.lower()}
+    return await seller_collection(SELLER_USERS).find(query).limit(20).to_list(length=20)
+
+
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Keep /admin backward-compatible, but open the Owner Dashboard."""
     if not await is_admin(update.effective_user.id):
@@ -267,6 +327,37 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         user = await get_user(user_id)
         await show_user_details(query, user)
+
+    elif query.data.startswith("owner_su_"):
+        parts=query.data.split("_")
+        if len(parts)!=5:
+            await query.answer("Invalid user action",show_alert=True)
+            return
+        seller_owner_id=int(parts[2]); user_id=int(parts[3]); action=parts[4]
+        user=await get_seller_user(seller_owner_id,user_id)
+        if not user:
+            await query.edit_message_text("❌ Clone bot user not found.",reply_markup=back_keyboard())
+            return
+        if action=="view":
+            await show_seller_user_details(query,seller_owner_id,user)
+            return
+        if action in {"give","extend"}:
+            context.user_data.clear()
+            context.user_data["owner_seller_sub_action"]={"owner_id":seller_owner_id,"user_id":user_id,"action":action}
+            await query.edit_message_text(
+                ("🎁 Give" if action=="give" else "⏳ Extend")+" Clone Bot Subscription\n\nSend duration, for example: 30m, 1h, 1d, 30d.",
+                reply_markup=back_keyboard(),
+            )
+            return
+        if action=="remove":
+            await seller_collection(SELLER_SUBS).update_one({"owner_id":seller_owner_id,"user_id":user_id},{"$set":{"active":False}})
+        elif action=="ban":
+            await seller_collection(SELLER_USERS).update_one({"owner_id":seller_owner_id,"user_id":user_id},{"$set":{"banned":True,"ban_reason":"Banned by platform owner"}})
+        elif action=="unban":
+            await seller_collection(SELLER_USERS).update_one({"owner_id":seller_owner_id,"user_id":user_id},{"$set":{"banned":False,"ban_reason":""}})
+        user=await get_seller_user(seller_owner_id,user_id)
+        await show_seller_user_details(query,seller_owner_id,user)
+        return
 
     elif query.data == "admin_add_channel":
         context.user_data.clear()
@@ -643,6 +734,31 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("✅ UPI Name updated successfully.")
         return
 
+    if context.user_data.get("owner_seller_sub_action"):
+        data=context.user_data["owner_seller_sub_action"]
+        try:
+            duration_minutes,_=parse_plan_time(text.lower())
+            owner_id=int(data["owner_id"]); user_id=int(data["user_id"])
+            current=await get_seller_subscription(owner_id,user_id) or {}
+            plan_name=current.get("plan") or "Owner Assigned"
+            expiry=await activate_seller_subscription(owner_id,user_id,plan_name,duration_minutes,amount=0,duration_text=text.lower())
+            delivery=await bot_manager.deliver_subscription_access(owner_id,user_id)
+            context.user_data.clear()
+            await update.message.reply_text(
+                "✅ Clone bot user subscription updated successfully.\n\n"
+                f"🏪 Seller ID: {owner_id}\n"
+                f"👤 User ID: {user_id}\n"
+                f"⏳ Duration added: {text.lower()}\n"
+                f"📅 New expiry: {format_time(expiry)}\n"
+                f"🔗 New invite links sent: {delivery.get('sent',0)}\n"
+                f"✅ Already joined chats: {delivery.get('already_member',0)}\n"
+                f"⚠️ Failed links: {delivery.get('failed',0)}",
+                reply_markup=back_keyboard(),
+            )
+        except Exception as exc:
+            await update.message.reply_text(f"❌ Could not update subscription.\n\nError: {exc}")
+        return
+
     if context.user_data.get("give_sub_user") or context.user_data.get("extend_sub_user"):
         duration_text = text.lower()
         try:
@@ -684,95 +800,42 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if context.user_data.get("waiting_user_search"):
-        search = text
+        search=text.strip()
+        main_user=None
         if search.startswith("@"):
-            user = await get_user_by_username(search)
+            main_user=await get_user_by_username(search)
         else:
             try:
-                user = await get_user(int(search))
+                main_user=await get_user(int(search))
             except Exception:
-                user = None
+                main_user=None
+        seller_users=await find_seller_users(search)
+        context.user_data["waiting_user_search"]=False
 
-        context.user_data["waiting_user_search"] = False
-        if not user:
-            await update.message.reply_text(
-                "❌ User not found.",
-                reply_markup=back_keyboard(),
-            )
+        if seller_users:
+            if len(seller_users)==1:
+                item=seller_users[0]
+                class FakeQuery:
+                    async def edit_message_text(self,text,reply_markup=None,**kwargs):
+                        return await update.message.reply_text(text,reply_markup=reply_markup)
+                await show_seller_user_details(FakeQuery(),int(item["owner_id"]),item)
+                return
+            rows=[]
+            for item in seller_users:
+                bot_record=await get_seller_bot(int(item["owner_id"])) or {}
+                label=f"@{bot_record.get('bot_username','clone_bot')} — {item.get('user_id')}"
+                rows.append([InlineKeyboardButton(label[:60],callback_data=f"owner_su_{item['owner_id']}_{item['user_id']}_view")])
+            rows.append([InlineKeyboardButton("⬅ Back",callback_data="admin_users")])
+            await update.message.reply_text("Multiple clone-bot user records found. Choose one:",reply_markup=InlineKeyboardMarkup(rows))
             return
 
-        details = await build_user_details_text(user)
-        banned = bool(user.get("banned"))
-        await update.message.reply_text(
-            details,
-            reply_markup=user_action_keyboard(user["user_id"], banned),
-        )
-        return
-
-    if context.user_data.get("waiting_plans"):
-        pending_channel = context.user_data.get("pending_channel")
-        if not pending_channel:
-            context.user_data["waiting_plans"] = False
-            await update.message.reply_text("❌ Channel data missing. Please try again.")
+        if main_user:
+            details=await build_user_details_text(main_user)
+            await update.message.reply_text(details,reply_markup=user_action_keyboard(main_user["user_id"],bool(main_user.get("banned"))))
             return
 
-        try:
-            plans = parse_plans(text)
-            await add_channel(
-                chat_id=pending_channel["chat_id"],
-                title=pending_channel["title"],
-                plans=plans,
-            )
-            context.user_data["waiting_plans"] = False
-            context.user_data.pop("pending_channel", None)
-            result = (
-                "✅ Channel/Group added successfully!\n\n"
-                f"Title: {pending_channel['title']}\n"
-                f"ID: {pending_channel['chat_id']}\n\nPlans:\n"
-            )
-            for plan in plans:
-                result += f"• {plan['duration_text']} = ₹{plan['price']}\n"
-            await update.message.reply_text(result)
-        except Exception:
-            await update.message.reply_text(
-                "❌ Invalid plan format.\n\n"
-                "Use this format:\n5m:10, 1h:20, 1d:99"
-            )
-
-
-async def receive_upi_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ User not found in the main bot or any seller clone bot.",reply_markup=back_keyboard())
         return
-
-    if not context.user_data.get("waiting_upi_qr"):
-        return
-
-    if not update.message.photo:
-        await update.message.reply_text("❌ Please send a QR image.")
-        return
-
-    file_id = update.message.photo[-1].file_id
-
-    await set_setting("upi_qr_file_id", file_id)
-
-    context.user_data.clear()
-
-    await update.message.reply_text(
-        "✅ QR Code updated successfully."
-    )
-
-async def add_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ You are not authorized.")
-        return
-
-    context.user_data.clear()
-    context.user_data["waiting_channel"] = True
-
-    await update.message.reply_text(
-        "📢 Forward any message from your channel/group.\n\n"
-        "⚠ Bot must be admin there."
-    )
 
 
 async def receive_channel_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -881,7 +944,7 @@ def admin_handlers():
         CommandHandler("removeadmin", remove_admin_command),
         CommandHandler("addchannel", add_channel_start),
         CommandHandler("removechannel", remove_channel_command),
-        CallbackQueryHandler(admin_buttons, pattern=r"^(admin_|user_|set_upi_)"),
+        CallbackQueryHandler(admin_buttons, pattern=r"^(admin_|user_|owner_su_|set_upi_)"),
         MessageHandler(filters.FORWARDED, receive_channel_forward),
         MessageHandler(filters.TEXT & ~filters.COMMAND, receive_admin_text),
     ]
