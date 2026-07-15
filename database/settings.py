@@ -21,6 +21,9 @@ DEFAULT_SETTINGS = {
     "auto_remove": True,
     "reminder_days": 1,
     "maintenance_mode": False,
+    "official_channel_url": "",
+    "official_group_url": "",
+    "official_support_url": "",
 }
 
 
