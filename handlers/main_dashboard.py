@@ -544,10 +544,25 @@ async def owner_broadcast_receiver(update: Update, context: ContextTypes.DEFAULT
             if target=="sellers":
                 ids={int(x["owner_id"]) for x in await get_all_sellers() if x.get("owner_id")}
             elif target=="main_users":
-                seller_ids={int(x["owner_id"]) for x in await get_all_sellers() if x.get("owner_id")}
-                docs=await users_collection().find({}, {"user_id":1}).to_list(length=None)
-                ids={int(x["user_id"]) for x in docs if x.get("user_id")} - seller_ids
-            ids.discard(update.effective_user.id)
+                # Every Telegram account that has started/interacted with the
+                # main bot is stored in the main `users` collection. Do not
+                # remove sellers here: sellers are also main-bot users.
+                docs=await users_collection().find(
+                    {"is_bot": {"$ne": True}},
+                    {"user_id": 1},
+                ).to_list(length=None)
+                ids={
+                    int(doc["user_id"])
+                    for doc in docs
+                    if doc.get("user_id")
+                }
+
+            # For Sellers Only, avoid sending the owner's own broadcast back
+            # to the same chat. For Main Bot Users, include every saved user,
+            # exactly as requested, including seller and owner accounts that
+            # have started the main bot.
+            if target != "main_users":
+                ids.discard(update.effective_user.id)
             for uid in ids:
                 try:
                     await context.bot.copy_message(uid,message.chat_id,message.message_id); sent+=1
