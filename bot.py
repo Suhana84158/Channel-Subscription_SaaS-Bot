@@ -39,7 +39,6 @@ from handlers.seller_subscription_management import handlers as seller_subscript
 from handlers.platform_features import handlers as platform_feature_handlers
 from handlers.official_links import handlers as official_links_handlers
 from handlers.payment_gateways import handlers as payment_gateway_handlers
-from handlers.deleting_messages import deleting_messages_handlers
 from services.bot_manager import bot_manager
 from scheduler_jobs.seller_subscriptions import run_seller_subscription_reminders
 
@@ -112,8 +111,6 @@ def register_handlers(application: Application):
         application.add_handler(handler, group=-25)
     for handler in payment_gateway_handlers():
         application.add_handler(handler, group=-6)
-    for handler in deleting_messages_handlers():
-        application.add_handler(handler, group=-7)
     application.add_handler(plans_handler())
     application.add_handler(profile_callback())
     application.add_handler(payment_handler())
