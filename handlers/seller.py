@@ -42,6 +42,7 @@ def seller_keyboard(record=None):
         [InlineKeyboardButton("🗑 Remove Bot", callback_data="seller_remove")],
         [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
         [InlineKeyboardButton("🌐 Child Bot Payment Gateways", callback_data="pgcfg_seller_home")],
+        [InlineKeyboardButton("🗑 Deleting Messages", callback_data="dm_home")],
         [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
         [InlineKeyboardButton("🏪 Seller Dashboard", callback_data="main_seller_dashboard")],
         [InlineKeyboardButton("⬅ Main Menu", callback_data="main_home")],
