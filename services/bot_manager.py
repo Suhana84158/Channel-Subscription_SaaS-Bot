@@ -46,6 +46,7 @@ WELCOME_RUNTIME_VERSION="2026-07-13-main-role-dashboard-fix-13"
 MAIN_BOT_USERNAME=os.getenv("MAIN_BOT_USERNAME","Local_supplier3_bot").lstrip("@")
 
 from services.message_moderation import moderate_seller_message
+from handlers.deleting_messages import deleting_messages_handlers
 
 @dataclass
 class RunningSellerBot:
@@ -72,6 +73,7 @@ class SellerBotManager:
             [InlineKeyboardButton("📨 Pending Payments",callback_data="a_pending")],
             [InlineKeyboardButton("📜 Payment History",callback_data="a_history")],
             [InlineKeyboardButton("⚙️ Bot Settings",callback_data="a_settings")],
+            [InlineKeyboardButton("🗑 Deleting Messages",callback_data="dm_home")],
             [InlineKeyboardButton("📢 Broadcast",callback_data="a_broadcast"), InlineKeyboardButton("🗓 Scheduled",callback_data="a_broadcast_schedule")],
             [InlineKeyboardButton("🎟 Coupons",callback_data="a_coupons"), InlineKeyboardButton("🔁 Retry Failed",callback_data="a_retry_failed")],
             [InlineKeyboardButton("👤 Seller Profile",callback_data="a_seller_profile")],
@@ -2776,6 +2778,8 @@ class SellerBotManager:
         )
         app.add_handler(CallbackQueryHandler(self.child_callback,pattern=r"^c_")); app.add_handler(CallbackQueryHandler(self.admin_callback,pattern=r"^a_"))
         app.add_handler(CallbackQueryHandler(self.support_callback,pattern=r"^support_"))
+        for handler in deleting_messages_handlers():
+            app.add_handler(handler,group=-7)
         app.add_handler(MessageHandler(filters.ALL,moderate_seller_message),group=-20)
         app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,self.broadcast_message_handler),group=-3)
         app.add_handler(MessageHandler(filters.FORWARDED,self.forward_handler),group=-2)
