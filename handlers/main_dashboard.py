@@ -1,6 +1,9 @@
 import os
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+import asyncio
+import io
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
 from telegram.ext import ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.error import RetryAfter, TelegramError
 
 from database.admins import is_admin
 from database.payments import count_pending_payments, total_revenue
@@ -377,14 +380,88 @@ async def seller_owner_view(query, owner_id: int):
 
 async def owner_broadcast_menu(query):
     await query.edit_message_text(
-        "📢 Owner Broadcast\n\nChoose audience. After choosing, send one text, photo, video, document, voice, audio, GIF, sticker or forwarded message.",
+        "📢 Broadcast Center\n\nChoose an audience. You can send text, photo, video, document, audio, voice, GIF, sticker, or a forwarded message.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🏪 Sellers Only", callback_data="owner_broadcast_sellers")],
-            [InlineKeyboardButton("👥 Main Bot Users (Non-Sellers)", callback_data="owner_broadcast_main_users")],
-            [InlineKeyboardButton("🤖 All Clone Bot Members", callback_data="owner_broadcast_clone_users")],
+            [InlineKeyboardButton("👥 Main Bot Users", callback_data="owner_broadcast_main_users")],
+            [InlineKeyboardButton("🤖 Selected Clone Bot", callback_data="owner_broadcast_selected")],
+            [InlineKeyboardButton("🌍 All Clone Bots", callback_data="owner_broadcast_clone_users")],
+            [InlineKeyboardButton("📜 Broadcast History", callback_data="owner_broadcast_history")],
             [InlineKeyboardButton("⬅ Owner Dashboard", callback_data="main_owner_dashboard")],
         ]),
     )
+
+
+async def owner_clone_bot_list(query):
+    records = await get_database()["seller_bots"].find(
+        {}, {"owner_id": 1, "bot_name": 1, "bot_username": 1, "active": 1, "runtime_status": 1}
+    ).sort("updated_at", -1).to_list(length=50)
+    if not records:
+        await query.edit_message_text(
+            "🤖 Selected Clone Bot\n\nNo Clone Bots are connected yet.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Broadcast Center", callback_data="owner_broadcast_menu")]]),
+        )
+        return
+    rows=[]
+    for record in records:
+        owner_id=int(record["owner_id"])
+        title=record.get("bot_name") or record.get("bot_username") or str(owner_id)
+        rows.append([InlineKeyboardButton(f"🤖 {title[:30]}", callback_data=f"owner_broadcast_pick_{owner_id}")])
+    rows.append([InlineKeyboardButton("⬅ Broadcast Center", callback_data="owner_broadcast_menu")])
+    await query.edit_message_text(
+        "🤖 Select a Clone Bot\n\nChoose the Clone Bot whose registered users should receive the broadcast.",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def _prepare_cross_bot_payload(message, bot):
+    payload={"kind":"text", "text":message.text or "", "caption":message.caption or ""}
+    media=None
+    if message.photo:
+        payload["kind"]="photo"; media=message.photo[-1]
+    elif message.video:
+        payload["kind"]="video"; media=message.video
+    elif message.document:
+        payload["kind"]="document"; media=message.document
+    elif message.animation:
+        payload["kind"]="animation"; media=message.animation
+    elif message.audio:
+        payload["kind"]="audio"; media=message.audio
+    elif message.voice:
+        payload["kind"]="voice"; media=message.voice
+    elif message.sticker:
+        payload["kind"]="sticker"; media=message.sticker
+    if media:
+        tg_file=await bot.get_file(media.file_id)
+        payload["bytes"]=bytes(await tg_file.download_as_bytearray())
+        payload["filename"]=getattr(media,"file_name",None) or f"broadcast_{payload['kind']}"
+    return payload
+
+
+async def _send_cross_bot(bot, chat_id, payload):
+    kind=payload["kind"]
+    if kind=="text":
+        return await bot.send_message(chat_id=chat_id,text=payload.get("text") or "(Empty message)")
+    raw=io.BytesIO(payload["bytes"]); raw.name=payload.get("filename") or f"broadcast_{kind}"
+    media=InputFile(raw,filename=raw.name)
+    caption=payload.get("caption") or None
+    if kind=="photo": return await bot.send_photo(chat_id=chat_id,photo=media,caption=caption)
+    if kind=="video": return await bot.send_video(chat_id=chat_id,video=media,caption=caption)
+    if kind=="document": return await bot.send_document(chat_id=chat_id,document=media,caption=caption)
+    if kind=="animation": return await bot.send_animation(chat_id=chat_id,animation=media,caption=caption)
+    if kind=="audio": return await bot.send_audio(chat_id=chat_id,audio=media,caption=caption)
+    if kind=="voice": return await bot.send_voice(chat_id=chat_id,voice=media,caption=caption)
+    if kind=="sticker": return await bot.send_sticker(chat_id=chat_id,sticker=media)
+    raise ValueError("Unsupported broadcast type")
+
+
+async def _clone_runtime(owner_id):
+    running=bot_manager.get_running(int(owner_id))
+    if running:
+        return running.application.bot
+    started=await bot_manager.start_bot(int(owner_id))
+    running=bot_manager.get_running(int(owner_id)) if started else None
+    return running.application.bot if running else None
 
 
 async def owner_broadcast_receiver(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -405,69 +482,91 @@ async def owner_broadcast_receiver(update: Update, context: ContextTypes.DEFAULT
         if not seller:
             await update.effective_message.reply_text(
                 "❌ Seller not found. Send a valid Seller ID or @username.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅ Seller Management",callback_data="main_owner_sellers")]
-                ]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Seller Management",callback_data="main_owner_sellers")]]),
             )
             raise ApplicationHandlerStop
         context.user_data.clear()
         owner_id=int(seller["owner_id"])
-        # Send the same Seller Details page without asking for another search.
         record=await get_bot(owner_id)
         name=seller.get("first_name") or "-"
         username=f"@{seller.get('username')}" if seller.get("username") else "-"
         suspended=bool(seller.get("suspended"))
-        text=(
-            "🏪 Seller Details\n\n"
-            f"🆔 Seller ID: {owner_id}\n"
-            f"👤 Name: {name}\n"
-            f"📝 Username: {username}\n"
-            f"✅ Approved: {'Yes' if seller.get('approved') else 'No'}\n"
-            f"🚫 Suspended: {'Yes' if suspended else 'No'}\n\n"
-            f"🤖 Clone Bot: @{record.get('bot_username') if record else '-'}\n"
-            f"📌 Bot Status: {'Active' if record and record.get('active') else 'Paused / Not connected'}\n"
-            f"⚙ Runtime: {(record or {}).get('runtime_status','-')}"
-        )
-        keyboard=[
-            [InlineKeyboardButton("⏳ Extend Subscription",callback_data=f"sub_mgmt_extend_{owner_id}")],
-            [InlineKeyboardButton("✅ Unsuspend Seller" if suspended else "🚫 Suspend Seller",callback_data=f"main_seller_unsuspend_{owner_id}" if suspended else f"main_seller_suspend_{owner_id}")],
-        ]
+        text=("🏪 Seller Details\n\n" f"🆔 Seller ID: {owner_id}\n" f"👤 Name: {name}\n" f"📝 Username: {username}\n" f"✅ Approved: {'Yes' if seller.get('approved') else 'No'}\n" f"🚫 Suspended: {'Yes' if suspended else 'No'}\n\n" f"🤖 Clone Bot: @{record.get('bot_username') if record else '-'}\n" f"📌 Bot Status: {'Active' if record and record.get('active') else 'Paused / Not connected'}\n" f"⚙ Runtime: {(record or {}).get('runtime_status','-')}")
+        keyboard=[[InlineKeyboardButton("⏳ Extend Subscription",callback_data=f"sub_mgmt_extend_{owner_id}")],[InlineKeyboardButton("✅ Unsuspend Seller" if suspended else "🚫 Suspend Seller",callback_data=f"main_seller_unsuspend_{owner_id}" if suspended else f"main_seller_suspend_{owner_id}")]]
         if record:
             keyboard.append([InlineKeyboardButton("⏸ Pause Clone Bot" if record.get("active") else "▶ Resume Clone Bot",callback_data=f"main_seller_pausebot_{owner_id}" if record.get("active") else f"main_seller_resumebot_{owner_id}")])
             keyboard.append([InlineKeyboardButton("⏹ Stop Clone Bot Runtime",callback_data=f"main_seller_stopbot_{owner_id}")])
-        keyboard += [
-            [InlineKeyboardButton("⬅ Seller Management",callback_data="main_owner_sellers")],
-            [InlineKeyboardButton("⬅ Owner Dashboard",callback_data="main_owner_dashboard")],
-        ]
+        keyboard += [[InlineKeyboardButton("⬅ Seller Management",callback_data="main_owner_sellers")],[InlineKeyboardButton("⬅ Owner Dashboard",callback_data="main_owner_dashboard")]]
         await update.effective_message.reply_text(text,reply_markup=InlineKeyboardMarkup(keyboard))
         raise ApplicationHandlerStop
 
     target=context.user_data.get("owner_broadcast_target")
     if not target:
         return
+
+    message=update.effective_message
+    progress=await message.reply_text("⏳ Preparing broadcast...")
+    sent=failed=blocked=0
+    target_label=target.replace("_"," ").title()
     db=get_database()
-    ids=set()
-    if target=="sellers":
-        ids={int(x["owner_id"]) for x in await get_all_sellers() if x.get("owner_id")}
-    elif target=="main_users":
-        seller_ids={int(x["owner_id"]) for x in await get_all_sellers() if x.get("owner_id")}
-        docs=await users_collection().find({}, {"user_id":1}).to_list(length=None)
-        ids={int(x["user_id"]) for x in docs if x.get("user_id")} - seller_ids
-    elif target=="clone_users":
-        ids={int(x) for x in await db["seller_users"].distinct("user_id") if x}
-    ids.discard(update.effective_user.id)
-    sent=failed=0
-    for uid in ids:
-        try:
-            await context.bot.copy_message(uid, update.effective_chat.id, update.effective_message.message_id)
-            sent+=1
-        except Exception:
-            failed+=1
-    context.user_data.pop("owner_broadcast_target",None)
-    await update.effective_message.reply_text(
-        f"✅ Broadcast completed\n\nAudience: {target.replace('_',' ').title()}\nSent: {sent}\nFailed/blocked: {failed}",
-        reply_markup=owner_dashboard_keyboard(),
-    )
+
+    try:
+        if target.startswith("selected:") or target=="clone_users":
+            payload=await _prepare_cross_bot_payload(message,context.bot)
+            owner_ids=[int(target.split(":",1)[1])] if target.startswith("selected:") else [int(x) for x in await db["seller_bots"].distinct("owner_id") if x]
+            total=0
+            for clone_owner in owner_ids:
+                users=[int(x) for x in await db["seller_users"].distinct("user_id",{"owner_id":clone_owner}) if x and int(x)!=update.effective_user.id]
+                total+=len(users)
+                clone_bot=await _clone_runtime(clone_owner)
+                if not clone_bot:
+                    failed+=len(users)
+                    continue
+                for uid in users:
+                    try:
+                        await _send_cross_bot(clone_bot,uid,payload)
+                        sent+=1
+                    except RetryAfter as exc:
+                        await asyncio.sleep(float(exc.retry_after)+0.5)
+                        try:
+                            await _send_cross_bot(clone_bot,uid,payload); sent+=1
+                        except Exception: failed+=1
+                    except TelegramError as exc:
+                        if "blocked" in str(exc).lower() or "chat not found" in str(exc).lower(): blocked+=1
+                        else: failed+=1
+                    except Exception:
+                        failed+=1
+                    await asyncio.sleep(0.04)
+                await progress.edit_text(f"⏳ Broadcast in progress...\n\nDelivered: {sent}\nFailed/Blocked: {failed+blocked}")
+            target_label="Selected Clone Bot" if target.startswith("selected:") else "All Clone Bots"
+        else:
+            ids=set()
+            if target=="sellers":
+                ids={int(x["owner_id"]) for x in await get_all_sellers() if x.get("owner_id")}
+            elif target=="main_users":
+                seller_ids={int(x["owner_id"]) for x in await get_all_sellers() if x.get("owner_id")}
+                docs=await users_collection().find({}, {"user_id":1}).to_list(length=None)
+                ids={int(x["user_id"]) for x in docs if x.get("user_id")} - seller_ids
+            ids.discard(update.effective_user.id)
+            for uid in ids:
+                try:
+                    await context.bot.copy_message(uid,message.chat_id,message.message_id); sent+=1
+                except RetryAfter as exc:
+                    await asyncio.sleep(float(exc.retry_after)+0.5)
+                    try: await context.bot.copy_message(uid,message.chat_id,message.message_id); sent+=1
+                    except Exception: failed+=1
+                except TelegramError as exc:
+                    if "blocked" in str(exc).lower() or "chat not found" in str(exc).lower(): blocked+=1
+                    else: failed+=1
+                except Exception: failed+=1
+                await asyncio.sleep(0.04)
+
+        await db["platform_broadcast_history"].insert_one({"owner_id":update.effective_user.id,"target":target_label,"sent":sent,"failed":failed,"blocked":blocked,"created_at":datetime.now(timezone.utc)})
+        await progress.edit_text(f"✅ Broadcast completed\n\nAudience: {target_label}\nDelivered: {sent}\nFailed: {failed}\nBlocked/Unavailable: {blocked}",reply_markup=owner_dashboard_keyboard())
+    except Exception as exc:
+        await progress.edit_text(f"❌ Broadcast failed.\n\nError: {str(exc)[:250]}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Broadcast Center",callback_data="owner_broadcast_menu")]]))
+    finally:
+        context.user_data.pop("owner_broadcast_target",None)
     raise ApplicationHandlerStop
 
 
@@ -482,6 +581,64 @@ async def main_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Owner access only.")
             return
         await owner_broadcast_menu(query)
+        return
+
+    if action == "owner_broadcast_selected":
+        if not await is_admin(user_id):
+            await query.edit_message_text("❌ Owner access only.")
+            return
+        await owner_clone_bot_list(query)
+        return
+
+    if action.startswith("owner_broadcast_pick_"):
+        if not await is_admin(user_id):
+            await query.edit_message_text("❌ Owner access only.")
+            return
+        clone_owner=int(action.replace("owner_broadcast_pick_",""))
+        record=await get_bot(clone_owner)
+        seller=await get_seller(clone_owner) or {}
+        members=await get_database()["seller_users"].count_documents({"owner_id":clone_owner})
+        await query.edit_message_text(
+            "🤖 Clone Bot Broadcast\n\n"
+            f"Seller: {seller.get('first_name') or '-'}\n"
+            f"Seller ID: {clone_owner}\n"
+            f"Bot: @{(record or {}).get('bot_username','-')}\n"
+            f"Registered Users: {members}\n\nContinue and send a broadcast to this Clone Bot's users?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Continue",callback_data=f"owner_broadcast_sendselected_{clone_owner}")],
+                [InlineKeyboardButton("⬅ Select Another Bot",callback_data="owner_broadcast_selected")],
+                [InlineKeyboardButton("❌ Cancel",callback_data="owner_broadcast_menu")],
+            ]),
+        )
+        return
+
+    if action.startswith("owner_broadcast_sendselected_"):
+        if not await is_admin(user_id):
+            await query.edit_message_text("❌ Owner access only.")
+            return
+        clone_owner=int(action.replace("owner_broadcast_sendselected_",""))
+        context.user_data.clear()
+        context.user_data["owner_broadcast_target"]=f"selected:{clone_owner}"
+        await query.edit_message_text(
+            "📢 Send the broadcast message now.\n\nSupported: text, photo, video, document, voice, audio, GIF, sticker, and forwarded messages.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="owner_broadcast_menu")]]),
+        )
+        return
+
+    if action == "owner_broadcast_history":
+        if not await is_admin(user_id):
+            await query.edit_message_text("❌ Owner access only.")
+            return
+        items=await get_database()["platform_broadcast_history"].find({"owner_id":user_id}).sort("created_at",-1).limit(10).to_list(length=10)
+        lines=["📜 Broadcast History",""]
+        if not items:
+            lines.append("No broadcasts have been sent yet.")
+        for item in items:
+            created=item.get("created_at")
+            if created and getattr(created,"tzinfo",None) is None: created=created.replace(tzinfo=timezone.utc)
+            when=created.astimezone(timezone.utc).strftime("%d-%m-%Y %I:%M %p UTC") if created else "-"
+            lines.append(f"• {item.get('target','Broadcast')}\n  Delivered: {item.get('sent',0)} | Failed: {item.get('failed',0)} | Blocked: {item.get('blocked',0)}\n  {when}")
+        await query.edit_message_text("\n\n".join(lines),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Broadcast Center",callback_data="owner_broadcast_menu")]]))
         return
 
     if action in {"owner_broadcast_sellers","owner_broadcast_main_users","owner_broadcast_clone_users"}:
