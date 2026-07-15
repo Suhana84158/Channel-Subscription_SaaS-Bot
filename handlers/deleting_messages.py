@@ -31,7 +31,7 @@ def home_keyboard(s):
         [InlineKeyboardButton("🛡 Safety Settings", callback_data="dm_safety")],
         [InlineKeyboardButton("📊 Statistics", callback_data="dm_stats")],
         [InlineKeyboardButton("♻️ Reset Settings", callback_data="dm_reset_confirm")],
-        [InlineKeyboardButton("⬅ Seller Dashboard", callback_data="main_seller_dashboard")],
+        [InlineKeyboardButton("⬅ Admin Panel", callback_data="a_home")],
     ])
 
 
@@ -110,7 +110,10 @@ async def render(q, owner_id, page="home"):
 async def deleting_messages_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
     await q.answer()
-    owner_id=q.from_user.id
+    owner_id=int(context.application.bot_data.get("seller_owner_id") or q.from_user.id)
+    if q.from_user.id != owner_id:
+        await q.answer("Only the clone bot admin can use this panel.", show_alert=True)
+        return
     action=q.data
 
     pages={"dm_home":"home","dm_commands":"commands","dm_links":"links","dm_forwarded":"forwarded","dm_service":"service","dm_safety":"safety"}
@@ -165,18 +168,21 @@ async def deleting_messages_callback(update: Update, context: ContextTypes.DEFAU
 async def receive_custom_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("dm_waiting_domain"):
         return
+    owner_id=int(context.application.bot_data.get("seller_owner_id") or update.effective_user.id)
+    if update.effective_user.id != owner_id:
+        return
     text=(update.effective_message.text or "").strip()
     if text.lower()=="/cancel":
         context.user_data.pop("dm_waiting_domain",None)
         await update.effective_message.reply_text("Cancelled.")
         return
     try:
-        await add_custom_domain(update.effective_user.id,text)
+        await add_custom_domain(owner_id,text)
     except ValueError as exc:
         await update.effective_message.reply_text(f"❌ {exc}\nTry again or send /cancel.")
         return
     context.user_data.pop("dm_waiting_domain",None)
-    s=await get_deleting_message_settings(update.effective_user.id)
+    s=await get_deleting_message_settings(owner_id)
     await update.effective_message.reply_text("✅ Custom domain added.",reply_markup=links_keyboard(s))
 
 
