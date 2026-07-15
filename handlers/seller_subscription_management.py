@@ -7,6 +7,7 @@ from config import ADMIN_IDS
 from database.admins import is_admin
 from database.sellers import get_seller, sellers_collection
 from database.platform_features import reserve_payment_fingerprint, audit
+from handlers.official_links import build_official_links_keyboard
 from database.seller_subscriptions import (
     assign_plan_with_history, extend_plan_with_history, create_plan_request, create_seller_payment,
     current_plan_text, decide_seller_payment, delete_paid_plan, get_config,
@@ -146,8 +147,14 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pay=await decide_seller_payment(pid,status,q.from_user.id)
         if not pay: await q.answer("Already processed",show_alert=True); return
         if status=="approved": await assign_plan_with_history(pay["owner_id"],pay["plan_id"],pay["duration_days"],"payment",pay["amount"],q.from_user.id)
-        try: await context.bot.send_message(pay["owner_id"],f"{'✅ Approved' if status=='approved' else '❌ Rejected'}\n\nPlan: {pay['plan_name']}\nAmount: ₹{pay['amount']:g}")
-        except Exception: pass
+        try:
+            await context.bot.send_message(
+                pay["owner_id"],
+                f"{'✅ Approved' if status=='approved' else '❌ Rejected'}\n\nPlan: {pay['plan_name']}\nAmount: ₹{pay['amount']:g}",
+                reply_markup=(await build_official_links_keyboard()) if status=="approved" else None,
+            )
+        except Exception:
+            pass
         await q.edit_message_text(f"✅ Payment {status}.",reply_markup=back("sub_mgmt_pending")); return
     if a=="sub_mgmt_seller_control":
         context.user_data.clear(); context.user_data["sub_wait"]="seller_lookup"
@@ -253,6 +260,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Plan: {plan.get('name',pending['plan_id'])}\n"
                 f"Added Validity: {pending['days']} days\n"
                 f"New Expiry: {expiry.strftime('%d %b %Y, %I:%M %p UTC') if expiry else '-'}",
+                reply_markup=await build_official_links_keyboard(),
             )
         except Exception:
             pass

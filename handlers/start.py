@@ -19,6 +19,7 @@ def owner_welcome_keyboard():
             InlineKeyboardButton("💳 Payments", callback_data="admin_pending_payments"),
             InlineKeyboardButton("📊 Statistics", callback_data="admin_stats"),
         ],
+        [InlineKeyboardButton("🌐 Official Links", callback_data="official_links_open")],
         [InlineKeyboardButton("🆘 Help & Commands", callback_data="main_help")],
     ])
 
@@ -41,6 +42,7 @@ def seller_welcome_keyboard(has_bot: bool):
         [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
         [InlineKeyboardButton("📊 View Current Plan", callback_data="seller_current_plan")],
         [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
+        [InlineKeyboardButton("🌐 Official Links", callback_data="official_links_open")],
         [InlineKeyboardButton("🆘 Help & Commands", callback_data="main_help")],
     ])
     return InlineKeyboardMarkup(rows)
