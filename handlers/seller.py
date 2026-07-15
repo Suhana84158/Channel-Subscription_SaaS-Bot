@@ -17,6 +17,14 @@ def limit_keyboard():
     ])
 
 
+
+
+def seller_plan_page_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
+        [InlineKeyboardButton("⬅ Back", callback_data="main_seller_dashboard")],
+    ])
+
 def seller_keyboard(record=None):
     if not record:
         return InlineKeyboardMarkup([
@@ -44,7 +52,7 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer(); owner_id=q.from_user.id; action=q.data
     record=await get_bot(owner_id)
     if action=="seller_current_plan":
-        await q.edit_message_text(await current_plan_text(owner_id), reply_markup=seller_keyboard(record)); return
+        await q.edit_message_text(await current_plan_text(owner_id), reply_markup=seller_plan_page_keyboard()); return
     if action=="seller_upgrade_plan":
         cfg=await get_config(); plans=[p for p in cfg.get("paid_plans",[]) if p.get("active",True)]
         rows=[]; lines=["💎 Buy / Change Seller Plan", ""]
@@ -124,9 +132,37 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if action=="seller_plan_history":
-        items=await subscription_history(owner_id,15); lines=["📜 Your Plan History",""]
-        for h in items: lines.append(f"• {h.get('action')} | {h.get('new_plan',h.get('target_plan_id','-'))} | {h.get('created_at').strftime('%d-%m-%Y')}")
-        await q.edit_message_text("\n".join(lines),reply_markup=seller_keyboard(record)); return
+        items=await subscription_history(owner_id,15)
+        lines=["📜 Your Plan History", ""]
+        if not items:
+            lines.append("No plan history is available yet.")
+        else:
+            for item in items:
+                created_at=item.get("created_at")
+                if created_at:
+                    try:
+                        date_text=created_at.strftime("%d-%m-%Y")
+                    except Exception:
+                        date_text=str(created_at)
+                else:
+                    date_text="-"
+                action_text=str(item.get("action") or "Updated").replace("_", " ").title()
+                plan_text=(
+                    item.get("new_plan")
+                    or item.get("target_plan_id")
+                    or item.get("plan_name")
+                    or "-"
+                )
+                lines.append(
+                    f"• {action_text}\n"
+                    f"  Plan: {plan_text}\n"
+                    f"  Date: {date_text}"
+                )
+        await q.edit_message_text(
+            "\n\n".join(lines),
+            reply_markup=seller_plan_page_keyboard(),
+        )
+        return
     if action in {"seller_connect","seller_replace"}:
         if action=="seller_connect" and not record:
             plan,_=await effective_plan(owner_id)
