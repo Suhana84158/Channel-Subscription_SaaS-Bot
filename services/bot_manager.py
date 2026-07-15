@@ -47,6 +47,9 @@ MAIN_BOT_USERNAME=os.getenv("MAIN_BOT_USERNAME","Local_supplier3_bot").lstrip("@
 
 from services.message_moderation import moderate_seller_message
 from handlers.deleting_messages import deleting_messages_handlers
+from services.protected_bot import ProtectedExtBot
+from handlers.content_protection import content_protection_handlers
+from database.content_protection import get_content_protection_settings
 
 @dataclass
 class RunningSellerBot:
@@ -74,6 +77,7 @@ class SellerBotManager:
             [InlineKeyboardButton("📜 Payment History",callback_data="a_history")],
             [InlineKeyboardButton("⚙️ Bot Settings",callback_data="a_settings")],
             [InlineKeyboardButton("🗑 Deleting Messages",callback_data="dm_home")],
+            [InlineKeyboardButton("🔒 Content Protection",callback_data="cp_home")],
             [InlineKeyboardButton("📢 Broadcast",callback_data="a_broadcast"), InlineKeyboardButton("🗓 Scheduled",callback_data="a_broadcast_schedule")],
             [InlineKeyboardButton("🎟 Coupons",callback_data="a_coupons"), InlineKeyboardButton("🔁 Retry Failed",callback_data="a_retry_failed")],
             [InlineKeyboardButton("👤 Seller Profile",callback_data="a_seller_profile")],
@@ -2761,7 +2765,8 @@ class SellerBotManager:
                 pass
 
     def build_app(self,token,owner):
-        app=Application.builder().token(token).build(); app.bot_data["seller_owner_id"]=owner
+        protected_bot=ProtectedExtBot(token=token,owner_id=owner)
+        app=Application.builder().bot(protected_bot).build(); app.bot_data["seller_owner_id"]=owner
         app.add_handler(CommandHandler("start",self.child_start))
         app.add_handler(CommandHandler("help",self.help_command))
         app.add_handler(CommandHandler("admin",self.admin))
@@ -2779,6 +2784,8 @@ class SellerBotManager:
         app.add_handler(CallbackQueryHandler(self.child_callback,pattern=r"^c_")); app.add_handler(CallbackQueryHandler(self.admin_callback,pattern=r"^a_"))
         app.add_handler(CallbackQueryHandler(self.support_callback,pattern=r"^support_"))
         for handler in deleting_messages_handlers():
+            app.add_handler(handler,group=-7)
+        for handler in content_protection_handlers():
             app.add_handler(handler,group=-7)
         app.add_handler(MessageHandler(filters.ALL,moderate_seller_message),group=-20)
         app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,self.broadcast_message_handler),group=-3)
@@ -2799,7 +2806,7 @@ class SellerBotManager:
             if not token: await set_runtime_status(owner_id,"token_missing","Missing encrypted token"); return False
             app:Optional[Application]=None
             try:
-                await ensure_seller_defaults(owner_id,record.get("bot_name","Subscription Bot")); app=self.build_app(token,owner_id); await app.initialize(); await app.start(); await app.updater.start_polling(drop_pending_updates=True,allowed_updates=Update.ALL_TYPES)
+                await ensure_seller_defaults(owner_id,record.get("bot_name","Subscription Bot")); app=self.build_app(token,owner_id); protection=await get_content_protection_settings(owner_id); app.bot.set_content_protection(bool(protection.get("enabled",False))); await app.initialize(); await app.start(); await app.updater.start_polling(drop_pending_updates=True,allowed_updates=Update.ALL_TYPES)
                 self._running[owner_id]=RunningSellerBot(owner_id,int(record["bot_id"]),app); await set_runtime_status(owner_id,"running",None); return True
             except Exception as exc:
                 logger.exception("Seller bot start failed owner=%s",owner_id); await set_runtime_status(owner_id,"error",str(exc)[:500])
