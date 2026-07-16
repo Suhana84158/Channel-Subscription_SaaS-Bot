@@ -1,6 +1,7 @@
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import InvalidToken, TelegramError
 from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from datetime import datetime, timezone, timedelta
 
 from database.seller_bots import (
     count_owner_bots,
@@ -27,6 +28,7 @@ from database.seller_data import (
 from database.seller_referrals import seller_referral_stats
 from database.platform_features import get_policy
 from database.mongo import get_database
+from database.sellers import get_or_create_seller
 
 
 def main_seller_keyboard():
@@ -92,6 +94,129 @@ def selected_bot_markup(record):
 
 def selected_back(bot_id: int):
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data=f"seller_select_{int(bot_id)}")]])
+
+
+def selected_profile_markup(bot_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💎 Buy / Change Plan", callback_data="seller_upgrade_plan")],
+        [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
+        [InlineKeyboardButton("⬅ Back", callback_data=f"seller_select_{int(bot_id)}")],
+    ])
+
+
+def _aware_utc(value):
+    if not value:
+        return None
+    if getattr(value, "tzinfo", None) is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _limit_display(value):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return str(value or 0)
+    return "Unlimited" if value < 0 else f"{value:,}"
+
+
+def _money(value):
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError):
+        number = 0.0
+    return f"{number:,.2f}".rstrip("0").rstrip(".")
+
+
+async def selected_seller_profile_text(owner_id: int, record: dict, user) -> str:
+    seller = await get_or_create_seller(user)
+    plan, assignment = await effective_plan(owner_id)
+    db = get_database()
+    now = datetime.now(timezone.utc)
+
+    expiry = _aware_utc((assignment or {}).get("expiry_date"))
+    activated = _aware_utc((assignment or {}).get("created_at") or (assignment or {}).get("updated_at"))
+    if expiry and expiry > now:
+        remaining = expiry - now
+        days = remaining.days
+        hours = remaining.seconds // 3600
+        minutes = (remaining.seconds % 3600) // 60
+        remaining_text = f"{days}d {hours}h {minutes}m"
+        expiry_text = expiry.strftime("%d-%m-%Y %I:%M %p UTC")
+        plan_status = "✅ Active"
+    elif str(plan.get("plan_id", "")).lower() == "free" or str(plan.get("name", "")).lower() == "free":
+        remaining_text = "No expiry"
+        expiry_text = "No expiry"
+        plan_status = "🆓 Free Plan"
+    else:
+        remaining_text = "Expired"
+        expiry_text = expiry.strftime("%d-%m-%Y %I:%M %p UTC") if expiry else "-"
+        plan_status = "❌ Expired"
+
+    activated_text = activated.strftime("%d-%m-%Y %I:%M %p UTC") if activated else "-"
+    joined = _aware_utc((seller or {}).get("created_at"))
+    joined_text = joined.strftime("%d-%m-%Y") if joined else "-"
+
+    bots_used = await count_owner_bots(owner_id)
+    active_subscribers = await db["seller_subscriptions"].count_documents({
+        "owner_id": owner_id, "active": True, "expiry_date": {"$gt": now}
+    })
+    channels_used = await db["seller_channels"].count_documents({"owner_id": owner_id, "active": True})
+    plans_used = await db["seller_plans"].count_documents({"owner_id": owner_id})
+    total_users = await db["seller_users"].count_documents({"owner_id": owner_id})
+    pending = await db["seller_payments"].count_documents({"owner_id": owner_id, "status": "pending"})
+
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_rows = await db["seller_payments"].aggregate([
+        {"$match": {"owner_id": owner_id, "status": "approved", "created_at": {"$gte": today_start}}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
+    ]).to_list(length=1)
+    total_rows = await db["seller_payments"].aggregate([
+        {"$match": {"owner_id": owner_id, "status": "approved"}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
+    ]).to_list(length=1)
+    today_revenue = today_rows[0].get("total", 0) if today_rows else 0
+    total_revenue = total_rows[0].get("total", 0) if total_rows else 0
+
+    username = f"@{user.username}" if getattr(user, "username", None) else "Not set"
+    name = (seller or {}).get("first_name") or getattr(user, "full_name", None) or "Unknown"
+    bot_username = record.get("bot_username") or str(record.get("bot_id"))
+    runtime = str(record.get("runtime_status") or "stopped").lower()
+    if record.get("runtime_error"):
+        runtime_text = "🔴 Error"
+    elif runtime == "running":
+        runtime_text = "🟢 Running"
+    else:
+        runtime_text = "🟡 Stopped"
+    bot_status = "🟢 Active" if record.get("active") else "🟡 Paused"
+
+    return (
+        "👤 Seller Profile\n\n"
+        f"🆔 Seller ID: {owner_id}\n"
+        f"👤 Name: {name}\n"
+        f"📛 Username: {username}\n"
+        f"📅 Joined: {joined_text}\n\n"
+        "💎 Plan Details\n"
+        f"📦 Plan: {plan.get('name', 'Free')}\n"
+        f"Status: {plan_status}\n"
+        f"📅 Activated: {activated_text}\n"
+        f"⏳ Expiry: {expiry_text}\n"
+        f"⌛ Remaining: {remaining_text}\n\n"
+        "📊 Seller Usage & Limits\n"
+        f"🤖 Clone Bots: {bots_used:,} / {_limit_display(plan.get('bot_limit', 1))}\n"
+        f"👥 Active Subscribers: {active_subscribers:,} / {_limit_display(plan.get('active_subscriber_limit', 25))}\n"
+        f"📢 Channels / Groups: {channels_used:,} / {_limit_display(plan.get('channel_limit', 1))}\n"
+        f"📦 Subscription Plans: {plans_used:,} / {_limit_display(plan.get('plan_limit', 2))}\n\n"
+        "📈 Seller Statistics\n"
+        f"👥 Total Users: {total_users:,}\n"
+        f"💳 Pending Payments: {pending:,}\n"
+        f"💰 Today Revenue: ₹{_money(today_revenue)}\n"
+        f"💰 Total Revenue: ₹{_money(total_revenue)}\n\n"
+        "🤖 Selected Clone Bot\n"
+        f"Bot: @{bot_username}\n"
+        f"Status: {bot_status}\n"
+        f"Runtime: {runtime_text}"
+    )
 
 
 def payment_settings_markup(bot_id: int):
@@ -165,17 +290,11 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_id = int(action.rsplit("_", 1)[1])
         record = await get_bot_by_bot_id(bot_id)
         if not record or int(record.get("owner_id", 0)) != owner_id:
-            await q.answer("Clone bot not found.", show_alert=True); return
-        plan, _ = await effective_plan(owner_id)
-        used = await count_owner_bots(owner_id)
-        limit = int(plan.get("bot_limit", 1))
-        limit_text = "Unlimited" if limit < 0 else str(limit)
-        username = f"@{q.from_user.username}" if q.from_user.username else q.from_user.full_name
+            await q.answer("Clone bot not found.", show_alert=True)
+            return
         await q.edit_message_text(
-            f"👤 Seller Profile\n\nSeller: {username}\nSeller ID: {owner_id}\n"
-            f"Plan: {plan.get('name','Free')}\nClone Bots: {used}/{limit_text}\n"
-            f"Selected Bot: @{record.get('bot_username')}",
-            reply_markup=selected_back(bot_id),
+            await selected_seller_profile_text(owner_id, record, q.from_user),
+            reply_markup=selected_profile_markup(bot_id),
         )
         return
 
