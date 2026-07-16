@@ -35,7 +35,7 @@ def main_seller_keyboard():
 
 def limit_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💎 Upgrade Plan", callback_data="seller_upgrade_plan")],
+        [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
         [InlineKeyboardButton("📊 View Current Plan", callback_data="seller_current_plan")],
         [InlineKeyboardButton("⬅ Back", callback_data="seller_bots_list")],
     ])
@@ -58,10 +58,9 @@ async def clone_list_markup(owner_id: int):
             f"{status} @{username}",
             callback_data=f"seller_select_{record['bot_id']}",
         )])
-    plan, _ = await effective_plan(owner_id)
-    limit = int(plan.get("bot_limit", 1))
-    if limit < 0 or len(bots) < limit:
-        rows.append([InlineKeyboardButton("➕ Create New Clone Bot", callback_data="seller_connect")])
+    # Keep this button visible even when the seller has reached the bot limit.
+    # Clicking it then opens the plan-limit warning with upgrade options.
+    rows.append([InlineKeyboardButton("➕ Create New Clone Bot", callback_data="seller_connect")])
     rows.append([InlineKeyboardButton("⬅ Back", callback_data="main_home")])
     return InlineKeyboardMarkup(rows)
 
