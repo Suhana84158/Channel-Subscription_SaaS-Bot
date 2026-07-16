@@ -5,9 +5,9 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFi
 from telegram.ext import ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.error import RetryAfter, TelegramError
 
-from database.admins import is_admin
+from database.admins import is_admin, get_all_admins
 from database.payments import count_pending_payments, total_revenue
-from database.seller_bots import get_bot, total_bots, set_bot_active
+from database.seller_bots import get_bot, get_bots, total_bots, set_bot_active
 from database.seller_data import stats as seller_stats
 from database.seller_referrals import seller_referral_stats
 from database.sellers import (
@@ -22,6 +22,7 @@ from database.users import total_users, users_collection
 from services.bot_manager import bot_manager
 from database.seller_subscriptions import effective_plan, seller_usage
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from database.mongo import get_database
 
 
@@ -322,62 +323,136 @@ async def list_sellers(query):
     )
 
 
-async def seller_owner_view(query, owner_id: int):
+async def _seller_owner_details(owner_id: int):
     seller = await get_seller(owner_id)
-    record = await get_bot(owner_id)
-
     if not seller:
-        await query.edit_message_text(
-            "❌ Seller not found.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅ Sellers", callback_data="main_owner_sellers")]
-            ]),
+        return None, None
+
+    bots = await get_bots(owner_id)
+    plan, assignment = await effective_plan(owner_id)
+    db = get_database()
+    now = datetime.now(timezone.utc)
+    ist = ZoneInfo("Asia/Kolkata")
+    local_now = now.astimezone(ist)
+    start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start_local.astimezone(timezone.utc)
+
+    total_users_count = active_count = channel_count = plan_count = 0
+    pending_count = success_count = 0
+    today_revenue = total_revenue_value = 0.0
+    bot_lines = []
+    running_count = paused_count = 0
+
+    for index, bot in enumerate(bots, 1):
+        scope = int(bot.get("data_owner_id") or owner_id)
+        users = await db["seller_users"].count_documents({"owner_id": scope})
+        active = await db["seller_subscriptions"].count_documents({
+            "owner_id": scope, "active": True, "expiry_date": {"$gt": now}
+        })
+        channels = await db["seller_channels"].count_documents({"owner_id": scope, "active": True})
+        plans = await db["seller_plans"].count_documents({"owner_id": scope, "active": {"$ne": False}})
+        pending = await db["seller_payments"].count_documents({"owner_id": scope, "status": "pending"})
+        successful = await db["seller_payments"].count_documents({"owner_id": scope, "status": "approved"})
+        revenue_pipeline = await db["seller_payments"].aggregate([
+            {"$match": {"owner_id": scope, "status": "approved"}},
+            {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$amount", 0]}}}},
+        ]).to_list(length=1)
+        today_pipeline = await db["seller_payments"].aggregate([
+            {"$match": {"owner_id": scope, "status": "approved", "$or": [
+                {"processed_at": {"$gte": start_utc}}, {"created_at": {"$gte": start_utc}}
+            ]}},
+            {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$amount", 0]}}}},
+        ]).to_list(length=1)
+        revenue = float(revenue_pipeline[0].get("total", 0)) if revenue_pipeline else 0.0
+        today = float(today_pipeline[0].get("total", 0)) if today_pipeline else 0.0
+
+        total_users_count += users
+        active_count += active
+        channel_count += channels
+        plan_count += plans
+        pending_count += pending
+        success_count += successful
+        total_revenue_value += revenue
+        today_revenue += today
+
+        runtime = str(bot.get("runtime_status") or "stopped")
+        is_running = bool(bot.get("active")) and runtime.lower() == "running"
+        if is_running: running_count += 1
+        else: paused_count += 1
+        bot_lines.append(
+            f"🤖 {index}. @{bot.get('bot_username','-')} — {'🟢 Running' if is_running else '⏸ Stopped'}\n"
+            f"   👥 Users: {users} | 💎 Active: {active} | 💰 Revenue: ₹{revenue:g}"
         )
-        return
+
+    expiry = (assignment or {}).get("expiry_date")
+    if expiry and expiry.tzinfo is None: expiry = expiry.replace(tzinfo=timezone.utc)
+    activated = (assignment or {}).get("created_at")
+    if activated and activated.tzinfo is None: activated = activated.replace(tzinfo=timezone.utc)
+    remaining = "Unlimited"
+    plan_status = "✅ Active"
+    if expiry:
+        seconds = int((expiry - now).total_seconds())
+        if seconds <= 0:
+            remaining, plan_status = "Expired", "❌ Expired"
+        else:
+            days, rem = divmod(seconds, 86400); hours = rem // 3600
+            remaining = f"{days}d {hours}h"
+
+    def limit_value(key, default):
+        value = int(plan.get(key, default) or 0)
+        return "Unlimited" if value < 0 else str(value)
 
     name = seller.get("first_name") or "-"
     username = f"@{seller.get('username')}" if seller.get("username") else "-"
     suspended = bool(seller.get("suspended"))
-
     text = (
         "🏪 Seller Details\n\n"
-        f"🆔 Seller ID: {owner_id}\n"
-        f"👤 Name: {name}\n"
-        f"📝 Username: {username}\n"
-        f"✅ Approved: {'Yes' if seller.get('approved') else 'No'}\n"
-        f"🚫 Suspended: {'Yes' if suspended else 'No'}\n\n"
-        f"🤖 Child Bot: @{record.get('bot_username') if record else '-'}\n"
-        f"📌 Bot Status: "
-        f"{'Active' if record and record.get('active') else 'Paused / Not connected'}\n"
-        f"⚙ Runtime: {(record or {}).get('runtime_status','-')}"
+        f"🆔 Seller ID: {owner_id}\n👤 Name: {name}\n📝 Username: {username}\n"
+        f"✅ Approved: {'Yes' if seller.get('approved') else 'No'}\n🚫 Suspended: {'Yes' if suspended else 'No'}\n\n"
+        "💎 Plan Details\n"
+        f"📦 Plan: {plan.get('name','Free')}\n📌 Status: {plan_status}\n"
+        f"📅 Activated: {activated.astimezone(ist).strftime('%d-%m-%Y') if activated else '-'}\n"
+        f"⏳ Expiry: {expiry.astimezone(ist).strftime('%d-%m-%Y %I:%M %p') if expiry else 'No expiry'}\n"
+        f"⌛ Remaining: {remaining}\n\n"
+        "📊 Usage & Limitations — All Clone Bots\n"
+        f"🤖 Clone Bots: {len(bots)} / {limit_value('bot_limit',1)}\n"
+        f"👥 Active Subscribers: {active_count} / {limit_value('active_subscriber_limit',25)}\n"
+        f"📢 Channels / Groups: {channel_count} / {limit_value('channel_limit',1)}\n"
+        f"📦 Subscription Plans: {plan_count} / {limit_value('plan_limit',2)}\n\n"
+        "📈 Seller Statistics — Combined\n"
+        f"🤖 Running Bots: {running_count} | Stopped: {paused_count}\n"
+        f"👥 Total Users: {total_users_count}\n💳 Pending Payments: {pending_count}\n"
+        f"✅ Successful Payments: {success_count}\n💰 Today Revenue: ₹{today_revenue:g}\n"
+        f"💰 Total Revenue: ₹{total_revenue_value:g}\n\n"
+        "🤖 Clone Bot Breakdown\n" + ("\n\n".join(bot_lines) if bot_lines else "No clone bots connected.")
     )
 
+    first_bot = bots[0] if bots else None
     keyboard = [
         [InlineKeyboardButton("⏳ Extend Subscription", callback_data=f"sub_mgmt_extend_{owner_id}")],
-        [
-            InlineKeyboardButton(
-                "✅ Unsuspend Seller" if suspended else "🚫 Suspend Seller",
-                callback_data=(
-                    f"main_seller_unsuspend_{owner_id}"
-                    if suspended else f"main_seller_suspend_{owner_id}"
-                ),
-            )
-        ],
+        [InlineKeyboardButton("✅ Unsuspend Seller" if suspended else "🚫 Suspend Seller",
+            callback_data=f"main_seller_unsuspend_{owner_id}" if suspended else f"main_seller_suspend_{owner_id}")],
+        [InlineKeyboardButton("💬 Message Seller", callback_data=f"main_owner_message_seller_{owner_id}")],
     ]
-
-    if record:
-        if record.get("active"):
-            keyboard.append([InlineKeyboardButton("⏸ Pause Clone Bot", callback_data=f"main_seller_pausebot_{owner_id}")])
-        else:
-            keyboard.append([InlineKeyboardButton("▶ Resume Clone Bot", callback_data=f"main_seller_resumebot_{owner_id}")])
-        keyboard.append([InlineKeyboardButton("⏹ Stop Clone Bot Runtime", callback_data=f"main_seller_stopbot_{owner_id}")])
-
-    keyboard.extend([
+    if first_bot:
+        keyboard.append([InlineKeyboardButton("⏸ Pause First Clone Bot" if first_bot.get("active") else "▶ Resume First Clone Bot",
+            callback_data=f"main_seller_pausebot_{owner_id}" if first_bot.get("active") else f"main_seller_resumebot_{owner_id}")])
+        keyboard.append([InlineKeyboardButton("⏹ Stop First Bot Runtime", callback_data=f"main_seller_stopbot_{owner_id}")])
+    keyboard += [
         [InlineKeyboardButton("⬅ Sellers", callback_data="main_owner_sellers")],
         [InlineKeyboardButton("⬅ Owner Dashboard", callback_data="main_owner_dashboard")],
-    ])
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def seller_owner_view(query, owner_id: int):
+    text, keyboard = await _seller_owner_details(owner_id)
+    if text is None:
+        await query.edit_message_text("❌ Seller not found.", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅ Sellers", callback_data="main_owner_sellers")]
+        ]))
+        return
+    await query.edit_message_text(text, reply_markup=keyboard)
 
 
 async def owner_broadcast_menu(query):
@@ -467,8 +542,61 @@ async def _clone_runtime(owner_id):
 
 
 async def owner_broadcast_receiver(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
+    sender_id = update.effective_user.id
+    message = update.effective_message
+
+    reply_owner_id = context.user_data.get("seller_reply_owner_id")
+    if reply_owner_id:
+        seller = await get_seller(sender_id) or {}
+        try:
+            header = await context.bot.send_message(
+                chat_id=int(reply_owner_id),
+                text=("💬 Reply from Seller\n\n"
+                      f"👤 Seller: @{seller.get('username') or '-'}\n"
+                      f"🆔 Seller ID: {sender_id}\n\nSeller's message is below:"),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💬 Reply to Seller", callback_data=f"main_owner_message_seller_{sender_id}")
+                ]]),
+            )
+            await context.bot.copy_message(int(reply_owner_id), message.chat_id, message.message_id)
+            await message.reply_text("✅ Your reply was sent to the owner.")
+            await get_database()["seller_owner_messages"].insert_one({
+                "seller_id": sender_id, "owner_id": int(reply_owner_id), "direction": "seller_to_owner",
+                "source_message_id": message.message_id, "created_at": datetime.now(timezone.utc)
+            })
+        except Exception as exc:
+            await message.reply_text(f"❌ Reply could not be sent: {str(exc)[:180]}")
+        finally:
+            context.user_data.pop("seller_reply_owner_id", None)
+        raise ApplicationHandlerStop
+
+    if not await is_admin(sender_id):
         return
+
+    target_seller = context.user_data.get("owner_message_seller_id")
+    if target_seller:
+        try:
+            await context.bot.send_message(
+                chat_id=int(target_seller),
+                text="📢 Message from Bot Owner\n\nThe owner's message is below:",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💬 Reply to Owner", callback_data=f"main_seller_reply_owner_{sender_id}"),
+                    InlineKeyboardButton("✅ Mark as Read", callback_data="main_seller_message_read"),
+                ]]),
+            )
+            await context.bot.copy_message(int(target_seller), message.chat_id, message.message_id)
+            await message.reply_text("✅ Message delivered to the seller.", reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅ Seller Details", callback_data=f"main_seller_view_{target_seller}")
+            ]]))
+            await get_database()["seller_owner_messages"].insert_one({
+                "seller_id": int(target_seller), "owner_id": sender_id, "direction": "owner_to_seller",
+                "source_message_id": message.message_id, "created_at": datetime.now(timezone.utc)
+            })
+        except Exception as exc:
+            await message.reply_text(f"❌ Message could not be delivered: {str(exc)[:180]}")
+        finally:
+            context.user_data.pop("owner_message_seller_id", None)
+        raise ApplicationHandlerStop
 
     if context.user_data.get("owner_seller_search"):
         import re
@@ -488,18 +616,9 @@ async def owner_broadcast_receiver(update: Update, context: ContextTypes.DEFAULT
             )
             raise ApplicationHandlerStop
         context.user_data.clear()
-        owner_id=int(seller["owner_id"])
-        record=await get_bot(owner_id)
-        name=seller.get("first_name") or "-"
-        username=f"@{seller.get('username')}" if seller.get("username") else "-"
-        suspended=bool(seller.get("suspended"))
-        text=("🏪 Seller Details\n\n" f"🆔 Seller ID: {owner_id}\n" f"👤 Name: {name}\n" f"📝 Username: {username}\n" f"✅ Approved: {'Yes' if seller.get('approved') else 'No'}\n" f"🚫 Suspended: {'Yes' if suspended else 'No'}\n\n" f"🤖 Clone Bot: @{record.get('bot_username') if record else '-'}\n" f"📌 Bot Status: {'Active' if record and record.get('active') else 'Paused / Not connected'}\n" f"⚙ Runtime: {(record or {}).get('runtime_status','-')}")
-        keyboard=[[InlineKeyboardButton("⏳ Extend Subscription",callback_data=f"sub_mgmt_extend_{owner_id}")],[InlineKeyboardButton("✅ Unsuspend Seller" if suspended else "🚫 Suspend Seller",callback_data=f"main_seller_unsuspend_{owner_id}" if suspended else f"main_seller_suspend_{owner_id}")]]
-        if record:
-            keyboard.append([InlineKeyboardButton("⏸ Pause Clone Bot" if record.get("active") else "▶ Resume Clone Bot",callback_data=f"main_seller_pausebot_{owner_id}" if record.get("active") else f"main_seller_resumebot_{owner_id}")])
-            keyboard.append([InlineKeyboardButton("⏹ Stop Clone Bot Runtime",callback_data=f"main_seller_stopbot_{owner_id}")])
-        keyboard += [[InlineKeyboardButton("⬅ Seller Management",callback_data="main_owner_sellers")],[InlineKeyboardButton("⬅ Owner Dashboard",callback_data="main_owner_dashboard")]]
-        await update.effective_message.reply_text(text,reply_markup=InlineKeyboardMarkup(keyboard))
+        owner_id = int(seller["owner_id"])
+        text, keyboard = await _seller_owner_details(owner_id)
+        await update.effective_message.reply_text(text, reply_markup=keyboard)
         raise ApplicationHandlerStop
 
     target=context.user_data.get("owner_broadcast_target")
@@ -653,6 +772,41 @@ async def main_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📢 Send the broadcast message now.\n\nSupported: text, photo, video, document, voice, audio, GIF, sticker and forwarded message.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="owner_broadcast_menu")]]),
         )
+        return
+
+    if action.startswith("main_owner_message_seller_"):
+        if not await is_admin(user_id):
+            await query.answer("Owner access only.", show_alert=True)
+            return
+        seller_id = int(action.replace("main_owner_message_seller_", ""))
+        context.user_data.clear()
+        context.user_data["owner_message_seller_id"] = seller_id
+        await query.edit_message_text(
+            "💬 Message Seller\n\nSend your warning, notice, text, photo, video, document, voice, or other message now.\n\nIt will be delivered through this SaaS bot.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data=f"main_seller_view_{seller_id}")
+            ]]),
+        )
+        return
+
+    if action.startswith("main_seller_reply_owner_"):
+        owner_id = int(action.replace("main_seller_reply_owner_", ""))
+        context.user_data.clear()
+        context.user_data["seller_reply_owner_id"] = owner_id
+        await query.edit_message_text(
+            "💬 Reply to Owner\n\nSend your reply now. Text and media are supported.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data="main_home")
+            ]]),
+        )
+        return
+
+    if action == "main_seller_message_read":
+        await query.answer("Marked as read ✅", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         return
 
     if action == "main_owner_dashboard":
