@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Conflict, InvalidToken, TelegramError
-from telegram.ext import Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, ApplicationHandlerStop, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from database.seller_subscriptions import effective_plan, plan_limit_warning, current_plan_text, get_config, seller_access_state, usage_warning
 from database.payment_gateways import (
@@ -51,6 +51,9 @@ from handlers.deleting_messages import deleting_messages_handlers
 from services.protected_bot import ProtectedExtBot
 from handlers.content_protection import content_protection_handlers
 from database.content_protection import get_content_protection_settings
+
+from database.subscription_guard import save_invite, active_invites_for_user, deactivate_invite
+from services.subscription_guard import subscription_guard_chat_member, subscription_guard_new_members
 
 @dataclass
 class RunningSellerBot:
@@ -1271,6 +1274,7 @@ class SellerBotManager:
                             chat_id=ch["chat_id"],
                             member_limit=1,
                         )
+                        await save_invite(owner, user_id, ch["chat_id"], invite.invite_link)
                         link_lines.append(
                             f"📢 {ch.get('title','Premium Channel')}\n{invite.invite_link}"
                         )
@@ -1330,6 +1334,7 @@ class SellerBotManager:
                     links=[]
                     for ch in channels:
                         inv=await context.bot.create_chat_invite_link(ch["chat_id"],member_limit=1)
+                        await save_invite(owner, uid, ch["chat_id"], inv.invite_link)
                         links.append(f"{ch.get('title','Channel')}: {inv.invite_link}")
                     await context.bot.send_message(uid,"🔁 Fresh invite link(s):\n\n"+"\n".join(links),disable_web_page_preview=True)
                     await resolve_failed_delivery(item["_id"]); sent+=1
@@ -1814,6 +1819,7 @@ class SellerBotManager:
                             ch["chat_id"],
                             member_limit=1,
                         )
+                        await save_invite(owner, p["user_id"], ch["chat_id"], inv.invite_link)
                         links.append(
                             f"{ch.get('title')}: {inv.invite_link}"
                         )
@@ -2812,6 +2818,7 @@ class SellerBotManager:
                     member_limit=1,
                     name=f"Subscription access {user_id}",
                 )
+                await save_invite(owner_id, user_id, chat_id, invite.invite_link)
                 links.append(f"📢 {ch.get('title','Premium Channel/Group')}\n{invite.invite_link}")
             except TelegramError as exc:
                 failed+=1
@@ -2838,6 +2845,15 @@ class SellerBotManager:
 
         for sub in await expired_subscriptions(owner):
             uid=sub["user_id"]
+
+            for invite_doc in await active_invites_for_user(owner, uid):
+                try:
+                    await context.bot.revoke_chat_invite_link(
+                        int(invite_doc["chat_id"]), invite_doc["invite_link"]
+                    )
+                except Exception:
+                    pass
+                await deactivate_invite(owner, invite_doc["invite_link"])
 
             for ch in await get_channels(owner):
                 try:
@@ -2906,6 +2922,8 @@ class SellerBotManager:
             app.add_handler(handler,group=-7)
         for handler in content_protection_handlers():
             app.add_handler(handler,group=-7)
+        app.add_handler(ChatMemberHandler(subscription_guard_chat_member, ChatMemberHandler.CHAT_MEMBER), group=-30)
+        app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, subscription_guard_new_members), group=-29)
         app.add_handler(MessageHandler(filters.ALL,moderate_seller_message),group=-20)
         app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,self.broadcast_message_handler),group=-3)
         app.add_handler(MessageHandler(filters.FORWARDED,self.forward_handler),group=-2)
