@@ -18,6 +18,7 @@ from database.payment_gateways import (
 )
 from services.payment_gateways import create_checkout, test_gateway_connection, GatewayError
 from database.seller_bots import get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status
+from database.mongo import get_database
 from database.seller_referrals import seller_referral_stats
 from database.live_support import (
     count_support_blocks, delete_support_topic, get_live_support_settings,
@@ -69,24 +70,80 @@ class SellerBotManager:
         ])
     @staticmethod
     def admin_menu():
+        """Compact clone-bot seller panel. Existing callbacks are preserved."""
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📦 Manage Plans",callback_data="a_plans")],
-            [InlineKeyboardButton("📢 Channels / Groups",callback_data="a_channels")],
-            [InlineKeyboardButton("💳 Payment Settings",callback_data="a_payment")],
-            [InlineKeyboardButton("📨 Pending Payments",callback_data="a_pending")],
-            [InlineKeyboardButton("📜 Payment History",callback_data="a_history")],
-            [InlineKeyboardButton("⚙️ Bot Settings",callback_data="a_settings")],
-            [InlineKeyboardButton("🗑 Deleting Messages",callback_data="dm_home")],
-            [InlineKeyboardButton("🔒 Content Protection",callback_data="cp_home")],
-            [InlineKeyboardButton("📢 Broadcast",callback_data="a_broadcast"), InlineKeyboardButton("🗓 Scheduled",callback_data="a_broadcast_schedule")],
-            [InlineKeyboardButton("🎟 Coupons",callback_data="a_coupons"), InlineKeyboardButton("🔁 Retry Failed",callback_data="a_retry_failed")],
-            [InlineKeyboardButton("👤 Seller Profile",callback_data="a_seller_profile")],
-            [InlineKeyboardButton("🤝 Seller Referral",callback_data="a_seller_referral")],
-            [InlineKeyboardButton("💬 Live Support",callback_data="a_live_support")],
-            [InlineKeyboardButton("📜 Terms & Policy",callback_data="a_terms")],
-            [InlineKeyboardButton("🆘 Help & Commands",callback_data="a_help")],
-            [InlineKeyboardButton("👥 User Management",callback_data="a_users")],[InlineKeyboardButton("📊 Statistics",callback_data="a_stats")],
+            [InlineKeyboardButton("👤 Seller Profile", callback_data="a_seller_profile")],
+            [InlineKeyboardButton("📦 Manage Plans", callback_data="a_plans"), InlineKeyboardButton("💳 Payment Settings", callback_data="a_payment")],
+            [InlineKeyboardButton("📨 Pending Payments", callback_data="a_pending"), InlineKeyboardButton("📜 Payment History", callback_data="a_history")],
+            [InlineKeyboardButton("📢 Channels / Groups", callback_data="a_channels"), InlineKeyboardButton("⚙️ Bot Settings", callback_data="a_settings")],
+            [InlineKeyboardButton("👥 User Management", callback_data="a_users")],
+            [InlineKeyboardButton("📣 Broadcast", callback_data="a_broadcast"), InlineKeyboardButton("📊 Statistics", callback_data="a_stats")],
+            [InlineKeyboardButton("🗑 Deleting Messages", callback_data="dm_home"), InlineKeyboardButton("🔒 Content Protection", callback_data="cp_home")],
+            [InlineKeyboardButton("💬 Live Support", callback_data="a_live_support")],
+            [InlineKeyboardButton("🗓 Scheduled", callback_data="a_broadcast_schedule"), InlineKeyboardButton("🎟 Coupons", callback_data="a_coupons")],
+            [InlineKeyboardButton("🔁 Retry Failed", callback_data="a_retry_failed"), InlineKeyboardButton("🤝 Seller Referral", callback_data="a_seller_referral")],
+            [InlineKeyboardButton("📜 Terms & Policy", callback_data="a_terms")],
+            [InlineKeyboardButton("🆘 Help & Commands", callback_data="a_help")],
         ])
+
+    async def admin_panel_text(self, owner_id:int, seller_user=None):
+        """Build the live summary shown above the clone-bot admin buttons."""
+        try:
+            plan, _assignment = await effective_plan(owner_id)
+            bot_record = await get_bot(owner_id) or {}
+            settings = await get_seller_settings(owner_id)
+            db = get_database()
+            now_utc = datetime.now(timezone.utc)
+            try:
+                local_tz = ZoneInfo(settings.get("timezone") or "Asia/Kolkata")
+            except (ZoneInfoNotFoundError, ValueError):
+                local_tz = ZoneInfo("Asia/Kolkata")
+            local_now = now_utc.astimezone(local_tz)
+            local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            start_utc = local_start.astimezone(timezone.utc)
+
+            active_users = await db["seller_subscriptions"].count_documents({
+                "owner_id": owner_id,
+                "active": True,
+                "expiry_date": {"$gt": now_utc},
+            })
+            revenue_rows = await db["seller_payments"].aggregate([
+                {"$match": {
+                    "owner_id": owner_id,
+                    "status": "approved",
+                    "$or": [
+                        {"processed_at": {"$gte": start_utc}},
+                        {"updated_at": {"$gte": start_utc}},
+                        {"created_at": {"$gte": start_utc}},
+                    ],
+                }},
+                {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
+            ]).to_list(length=1)
+            today_revenue = revenue_rows[0].get("total", 0) if revenue_rows else 0
+
+            seller_username = getattr(seller_user, "username", None)
+            seller_label = f"@{seller_username}" if seller_username else str(getattr(seller_user, "full_name", None) or owner_id)
+            clone_username = (bot_record.get("bot_username") or "Not configured").lstrip("@")
+            clone_label = f"@{clone_username}" if clone_username != "Not configured" else clone_username
+            currency = settings.get("currency") or "INR"
+            symbol = "₹" if str(currency).upper() == "INR" else f"{currency} "
+            runtime_status = str(bot_record.get("runtime_status") or "").lower()
+            online = self.is_running(owner_id) or runtime_status in {"running", "online", "started"}
+            status_text = "🟢 Online" if online else "🔴 Offline"
+
+            return (
+                "🛠 <b>ADMIN PANEL</b>\n\n"
+                f"👤 Seller: <b>{html.escape(seller_label)}</b>\n"
+                f"🤖 Clone Bot: <b>{html.escape(clone_label)}</b>\n"
+                f"💎 Plan: <b>{html.escape(str(plan.get('name', 'Free')))}</b>\n"
+                f"👥 Active Users: <b>{active_users:,}</b>\n"
+                f"💰 Today Revenue: <b>{symbol}{float(today_revenue or 0):,.2f}</b>\n"
+                f"{status_text}"
+            )
+        except Exception:
+            logger.exception("Failed to build seller admin summary owner=%s", owner_id)
+            return "🛠 <b>ADMIN PANEL</b>\n\n⚠️ Live summary is temporarily unavailable."
+
     @staticmethod
     def back(target="a_home"): return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back",callback_data=target)]])
     @staticmethod
@@ -538,8 +595,9 @@ class SellerBotManager:
         if update.effective_user.id == owner:
             context.user_data.clear()
             await update.effective_message.reply_text(
-                "🛠 Seller Admin Panel",
+                await self.admin_panel_text(owner, update.effective_user),
                 reply_markup=self.admin_menu(),
+                parse_mode="HTML",
             )
             return
 
@@ -649,7 +707,12 @@ class SellerBotManager:
 
     async def admin(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         if not await self.auth(update,context): await update.effective_message.reply_text("❌ Not authorized"); return
-        context.user_data.clear(); await update.effective_message.reply_text("🛠 Seller Admin Panel",reply_markup=self.admin_menu())
+        context.user_data.clear()
+        await update.effective_message.reply_text(
+            await self.admin_panel_text(self.owner(context), update.effective_user),
+            reply_markup=self.admin_menu(),
+            parse_mode="HTML",
+        )
 
     async def show_plans(self,q,owner,select=False):
         plans=await get_plans(owner,True)
@@ -999,7 +1062,14 @@ class SellerBotManager:
         q=update.callback_query; await q.answer(); owner=self.owner(context)
         if q.from_user.id!=owner: await q.edit_message_text("❌ Not authorized"); return
         a=q.data
-        if a=="a_home": context.user_data.clear(); await q.edit_message_text("🛠 Seller Admin Panel",reply_markup=self.admin_menu()); return
+        if a=="a_home":
+            context.user_data.clear()
+            await q.edit_message_text(
+                await self.admin_panel_text(owner, q.from_user),
+                reply_markup=self.admin_menu(),
+                parse_mode="HTML",
+            )
+            return
         if a=="a_seller_profile":
             plan,assignment=await effective_plan(owner)
             usage=await stats(owner)
