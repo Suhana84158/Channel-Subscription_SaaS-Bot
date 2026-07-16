@@ -26,6 +26,7 @@ from database.seller_data import (
 )
 from database.seller_referrals import seller_referral_stats
 from database.platform_features import get_policy
+from database.mongo import get_database
 
 
 def main_seller_keyboard():
@@ -95,6 +96,7 @@ def selected_back(bot_id: int):
 
 def payment_settings_markup(bot_id: int):
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 Automatic Gateways", callback_data="pgcfg_seller_home")],
         [InlineKeyboardButton("🏦 Set UPI ID", callback_data=f"seller_set_upi_id_{bot_id}")],
         [InlineKeyboardButton("👤 Set UPI Name", callback_data=f"seller_set_upi_name_{bot_id}")],
         [InlineKeyboardButton("🖼 Upload QR", callback_data=f"seller_set_qr_{bot_id}")],
@@ -104,10 +106,12 @@ def payment_settings_markup(bot_id: int):
 
 def bot_settings_markup(bot_id: int):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Set Bot Name", callback_data=f"seller_set_bot_name_{bot_id}")],
-        [InlineKeyboardButton("🆘 Set Support Username", callback_data=f"seller_set_support_{bot_id}")],
-        [InlineKeyboardButton("💱 Set Currency", callback_data=f"seller_set_currency_{bot_id}")],
-        [InlineKeyboardButton("🕒 Set Timezone", callback_data=f"seller_set_timezone_{bot_id}")],
+        [InlineKeyboardButton("🤖 Bot Name", callback_data=f"seller_set_bot_name_{bot_id}")],
+        [InlineKeyboardButton("💬 Welcome Message", callback_data=f"seller_set_welcome_{bot_id}")],
+        [InlineKeyboardButton("📞 Support Username", callback_data=f"seller_set_support_{bot_id}")],
+        [InlineKeyboardButton("💵 Currency", callback_data=f"seller_set_currency_{bot_id}"), InlineKeyboardButton("🕒 Timezone", callback_data=f"seller_set_timezone_{bot_id}")],
+        [InlineKeyboardButton("🔔 Reminder Days", callback_data=f"seller_set_reminder_{bot_id}")],
+        [InlineKeyboardButton("🎁 Referral Reward Days", callback_data=f"seller_set_referral_days_{bot_id}")],
         [InlineKeyboardButton("⬅ Back", callback_data=f"seller_select_{bot_id}")],
     ])
 
@@ -116,8 +120,38 @@ def channels_markup(bot_id: int):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Channel/Group", callback_data=f"seller_channel_add_{bot_id}")],
         [InlineKeyboardButton("📋 Channel List", callback_data=f"seller_channel_list_{bot_id}")],
+        [InlineKeyboardButton("🔗 Resend Invite Links to Active Subscribers", callback_data=f"seller_channel_resend_{bot_id}")],
         [InlineKeyboardButton("⬅ Back", callback_data=f"seller_select_{bot_id}")],
     ])
+
+
+async def selected_panel_text(owner_id: int, record, user) -> str:
+    plan, _ = await effective_plan(owner_id)
+    db = get_database()
+    now = __import__('datetime').datetime.now(__import__('datetime').timezone.utc)
+    bot_limit = int(plan.get('bot_limit', 1))
+    user_limit = int(plan.get('subscriber_limit', plan.get('user_limit', 0) or 0))
+    channel_limit = int(plan.get('channel_limit', 1))
+    plan_limit = int(plan.get('plan_limit', 2))
+    bots_used = await count_owner_bots(owner_id)
+    users_used = await db['seller_subscriptions'].count_documents({'owner_id': owner_id, 'active': True, 'expiry_date': {'$gt': now}})
+    channels_used = await db['seller_channels'].count_documents({'owner_id': owner_id, 'active': True})
+    plans_used = await db['seller_plans'].count_documents({'owner_id': owner_id})
+    def lim(v): return 'Unlimited' if int(v) < 0 else str(int(v))
+    seller = f"@{user.username}" if getattr(user, 'username', None) else getattr(user, 'full_name', str(owner_id))
+    runtime = str(record.get('runtime_status') or 'stopped').lower()
+    running = runtime == 'running'
+    status = '🟢 Active' if record.get('active') else '🟡 Paused'
+    runtime_text = '🟢 Running' if running else ('🟡 Stopped' if not record.get('runtime_error') else '🔴 Error')
+    return (
+        f"🤖 @{record.get('bot_username') or record.get('bot_id')}\n\n"
+        f"Status: {status}\nRuntime: {runtime_text}\n\n"
+        f"👤 Seller: {seller}\n💎 Plan: {plan.get('name','Free')}\n"
+        f"🤖 Clone Bots: {bots_used}/{lim(bot_limit)}\n"
+        f"👥 Active Subscribers: {users_used}/{lim(user_limit)}\n"
+        f"📢 Channels / Groups: {channels_used}/{lim(channel_limit)}\n"
+        f"📦 Subscription Plans: {plans_used}/{lim(plan_limit)}"
+    )
 
 
 async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -204,6 +238,9 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "seller_set_support_": ("support_username", "Send support @username or Telegram link."),
         "seller_set_currency_": ("currency", "Send currency code, for example INR."),
         "seller_set_timezone_": ("timezone", "Send timezone, for example Asia/Kolkata."),
+        "seller_set_welcome_": ("welcome_message", "Send the new welcome message text."),
+        "seller_set_reminder_": ("reminder_days", "Send reminder days, for example 1."),
+        "seller_set_referral_days_": ("referral_reward_days", "Send referral reward days, for example 7."),
     }
     for prefix, (field, prompt) in setting_actions.items():
         if action.startswith(prefix):
@@ -233,6 +270,39 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts=action.split("_"); bot_id=int(parts[3]); chat_id=int(parts[4]); await remove_channel(owner_id,chat_id)
         await q.edit_message_text("✅ Channel/group removed.", reply_markup=channels_markup(bot_id)); return
 
+    if action.startswith("seller_channel_resend_"):
+        bot_id = int(action.rsplit("_", 1)[1])
+        record = await get_bot_by_bot_id(bot_id)
+        if not record or int(record.get("owner_id", 0)) != owner_id:
+            await q.answer("Clone bot not found.", show_alert=True); return
+        running = bot_manager.get_running(bot_id) or bot_manager.get_running(owner_id)
+        channels = await get_channels(owner_id)
+        db = get_database()
+        now = __import__('datetime').datetime.now(__import__('datetime').timezone.utc)
+        subs = await db['seller_subscriptions'].find({'owner_id': owner_id, 'active': True, 'expiry_date': {'$gt': now}}).to_list(length=5000)
+        if not running:
+            await q.edit_message_text("❌ Clone bot is not running. Resume it first.", reply_markup=channels_markup(bot_id)); return
+        if not channels:
+            await q.edit_message_text("❌ No channel/group connected.", reply_markup=channels_markup(bot_id)); return
+        sent = failed = 0
+        for sub in subs:
+            uid = int(sub.get('user_id', 0))
+            if not uid: continue
+            links=[]
+            for ch in channels:
+                try:
+                    link = await running.application.bot.create_chat_invite_link(int(ch['chat_id']), member_limit=1)
+                    links.append(f"{ch.get('title','Channel/Group')}: {link.invite_link}")
+                except Exception:
+                    pass
+            if not links: failed += 1; continue
+            try:
+                await running.application.bot.send_message(uid, "🔗 Your fresh invite links:\n\n" + "\n".join(links))
+                sent += 1
+            except Exception:
+                failed += 1
+        await q.edit_message_text(f"✅ Invite link resend completed.\n\nSent: {sent}\nFailed: {failed}", reply_markup=channels_markup(bot_id)); return
+
     if action == "seller_bots_list":
         bots = await get_bots(owner_id)
         plan, _ = await effective_plan(owner_id)
@@ -252,10 +322,7 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data["selected_clone_bot_id"] = bot_id
         await q.edit_message_text(
-            f"🤖 @{record.get('bot_username')}\n\n"
-            f"Status: {'🟢 Active' if record.get('active') else '⏸ Paused'}\n"
-            f"Runtime: {record.get('runtime_status', 'unknown')}\n\n"
-            "Manage the selected clone bot below.",
+            await selected_panel_text(owner_id, record, q.from_user),
             reply_markup=selected_bot_markup(record),
         )
         return
@@ -376,12 +443,12 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await bot_manager.stop_bot(bot_id)
                 await set_bot_active(bot_id, False)
                 record = await get_bot_by_bot_id(bot_id)
-                await q.edit_message_text("⏸ Clone bot paused.", reply_markup=selected_bot_markup(record))
+                await q.edit_message_text(await selected_panel_text(owner_id, record, q.from_user), reply_markup=selected_bot_markup(record))
             elif prefix == "seller_resume_":
                 await set_bot_active(bot_id, True)
                 await bot_manager.start_bot(bot_id)
                 record = await get_bot_by_bot_id(bot_id)
-                await q.edit_message_text("▶️ Clone bot resumed.", reply_markup=selected_bot_markup(record))
+                await q.edit_message_text(await selected_panel_text(owner_id, record, q.from_user), reply_markup=selected_bot_markup(record))
             else:
                 await bot_manager.stop_bot(bot_id, "removed")
                 await delete_bot(owner_id, bot_id)
@@ -396,7 +463,14 @@ async def receive_seller_token(update: Update, context: ContextTypes.DEFAULT_TYP
 
     field = context.user_data.get("seller_edit_field")
     if field:
-        await set_seller_setting(owner_id, field, text)
+        value = text
+        if field in {"reminder_days", "referral_reward_days"}:
+            try:
+                value = max(0, int(text))
+            except ValueError:
+                await update.effective_message.reply_text("❌ Please send a valid whole number.")
+                return
+        await set_seller_setting(owner_id, field, value)
         context.user_data.clear()
         settings = await get_seller_settings(owner_id)
         await update.effective_message.reply_text(
