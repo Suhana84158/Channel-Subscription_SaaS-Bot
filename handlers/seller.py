@@ -20,6 +20,12 @@ from database.seller_subscriptions import (
     subscription_history,
 )
 from services.bot_manager import bot_manager
+from database.seller_data import (
+    get_seller_settings, set_seller_setting, stats as seller_stats,
+    get_channels, add_channel, remove_channel,
+)
+from database.seller_referrals import seller_referral_stats
+from database.platform_features import get_policy
 
 
 def main_seller_keyboard():
@@ -66,26 +72,51 @@ async def clone_list_markup(owner_id: int):
 
 
 def selected_bot_markup(record):
-    username = record.get("bot_username") or str(record["bot_id"])
-    bot_url = f"https://t.me/{username}"
     bot_id = int(record["bot_id"])
     active = bool(record.get("active"))
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 Seller Profile", callback_data="main_seller_profile")],
-        [InlineKeyboardButton("🤖 My Bot", callback_data=f"seller_my_bot_{bot_id}")],
-        [InlineKeyboardButton("💳 Payment Settings", url=f"{bot_url}?start=admin_payment")],
-        [InlineKeyboardButton("⚙️ Bot Settings", url=f"{bot_url}?start=admin_settings")],
-        [InlineKeyboardButton("📊 Statistics", url=f"{bot_url}?start=admin_stats")],
-        [InlineKeyboardButton("📢 Channels / Groups", url=f"{bot_url}?start=admin_channels")],
-        [InlineKeyboardButton("🤝 Seller Referral", callback_data="main_seller_referral")],
-        [InlineKeyboardButton("📜 Terms & Policy", url=f"{bot_url}?start=admin_terms")],
-        [InlineKeyboardButton(
-            "⏸ Pause Bot" if active else "▶️ Resume Bot",
-            callback_data=f"seller_{'pause' if active else 'resume'}_{bot_id}",
-        )],
+        [InlineKeyboardButton("👤 Seller Profile", callback_data=f"seller_selected_profile_{bot_id}")],
+        [InlineKeyboardButton("⏸ Pause Bot" if active else "▶️ Resume Bot", callback_data=f"seller_{'pause' if active else 'resume'}_{bot_id}")],
         [InlineKeyboardButton("🔄 Replace Token", callback_data=f"seller_replace_{bot_id}")],
         [InlineKeyboardButton("🗑 Remove Bot", callback_data=f"seller_remove_{bot_id}")],
+        [InlineKeyboardButton("💳 Payment Settings", callback_data=f"seller_selected_payment_{bot_id}")],
+        [InlineKeyboardButton("⚙️ Bot Settings", callback_data=f"seller_selected_settings_{bot_id}")],
+        [InlineKeyboardButton("📊 Statistics", callback_data=f"seller_selected_stats_{bot_id}")],
+        [InlineKeyboardButton("📢 Channels / Groups", callback_data=f"seller_selected_channels_{bot_id}")],
+        [InlineKeyboardButton("🤝 Seller Referral", callback_data=f"seller_selected_referral_{bot_id}")],
+        [InlineKeyboardButton("📜 Terms & Policy", callback_data=f"seller_selected_terms_{bot_id}")],
         [InlineKeyboardButton("⬅ Clone Bot List", callback_data="seller_bots_list")],
+    ])
+
+
+def selected_back(bot_id: int):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data=f"seller_select_{int(bot_id)}")]])
+
+
+def payment_settings_markup(bot_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏦 Set UPI ID", callback_data=f"seller_set_upi_id_{bot_id}")],
+        [InlineKeyboardButton("👤 Set UPI Name", callback_data=f"seller_set_upi_name_{bot_id}")],
+        [InlineKeyboardButton("🖼 Upload QR", callback_data=f"seller_set_qr_{bot_id}")],
+        [InlineKeyboardButton("⬅ Back", callback_data=f"seller_select_{bot_id}")],
+    ])
+
+
+def bot_settings_markup(bot_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Set Bot Name", callback_data=f"seller_set_bot_name_{bot_id}")],
+        [InlineKeyboardButton("🆘 Set Support Username", callback_data=f"seller_set_support_{bot_id}")],
+        [InlineKeyboardButton("💱 Set Currency", callback_data=f"seller_set_currency_{bot_id}")],
+        [InlineKeyboardButton("🕒 Set Timezone", callback_data=f"seller_set_timezone_{bot_id}")],
+        [InlineKeyboardButton("⬅ Back", callback_data=f"seller_select_{bot_id}")],
+    ])
+
+
+def channels_markup(bot_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Channel/Group", callback_data=f"seller_channel_add_{bot_id}")],
+        [InlineKeyboardButton("📋 Channel List", callback_data=f"seller_channel_list_{bot_id}")],
+        [InlineKeyboardButton("⬅ Back", callback_data=f"seller_select_{bot_id}")],
     ])
 
 
@@ -94,6 +125,113 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     owner_id = int(q.from_user.id)
     action = q.data
+
+    # Selected clone-bot management pages stay inside the main SaaS bot.
+    if action.startswith("seller_selected_profile_"):
+        bot_id = int(action.rsplit("_", 1)[1])
+        record = await get_bot_by_bot_id(bot_id)
+        if not record or int(record.get("owner_id", 0)) != owner_id:
+            await q.answer("Clone bot not found.", show_alert=True); return
+        plan, _ = await effective_plan(owner_id)
+        used = await count_owner_bots(owner_id)
+        limit = int(plan.get("bot_limit", 1))
+        limit_text = "Unlimited" if limit < 0 else str(limit)
+        username = f"@{q.from_user.username}" if q.from_user.username else q.from_user.full_name
+        await q.edit_message_text(
+            f"👤 Seller Profile\n\nSeller: {username}\nSeller ID: {owner_id}\n"
+            f"Plan: {plan.get('name','Free')}\nClone Bots: {used}/{limit_text}\n"
+            f"Selected Bot: @{record.get('bot_username')}",
+            reply_markup=selected_back(bot_id),
+        )
+        return
+
+    if action.startswith("seller_selected_payment_"):
+        bot_id = int(action.rsplit("_", 1)[1]); settings = await get_seller_settings(owner_id)
+        await q.edit_message_text(
+            f"💳 Payment Settings\n\nUPI Name: {settings.get('upi_name') or 'Not Set'}\n"
+            f"UPI ID: {settings.get('upi_id') or 'Not Set'}\nQR: {'Added' if settings.get('upi_qr_file_id') else 'Not Added'}",
+            reply_markup=payment_settings_markup(bot_id),
+        ); return
+
+    if action.startswith("seller_selected_settings_"):
+        bot_id = int(action.rsplit("_", 1)[1]); settings = await get_seller_settings(owner_id)
+        await q.edit_message_text(
+            "⚙️ Bot Settings\n\n"
+            f"Bot Name: {settings.get('bot_name') or '-'}\nSupport: {settings.get('support_username') or '-'}\n"
+            f"Currency: {settings.get('currency') or 'INR'}\nTimezone: {settings.get('timezone') or 'Asia/Kolkata'}",
+            reply_markup=bot_settings_markup(bot_id),
+        ); return
+
+    if action.startswith("seller_selected_stats_"):
+        bot_id = int(action.rsplit("_", 1)[1]); data = await seller_stats(owner_id)
+        await q.edit_message_text(
+            "📊 Statistics\n\n"
+            f"Users: {data.get('users',0)}\nPlans: {data.get('plans',0)}\n"
+            f"Channels/Groups: {data.get('channels',0)}\nPending Payments: {data.get('pending',0)}\n"
+            f"Revenue: ₹{data.get('revenue',0):g}",
+            reply_markup=selected_back(bot_id),
+        ); return
+
+    if action.startswith("seller_selected_channels_"):
+        bot_id = int(action.rsplit("_", 1)[1])
+        await q.edit_message_text("📢 Channels / Groups", reply_markup=channels_markup(bot_id)); return
+
+    if action.startswith("seller_selected_referral_"):
+        bot_id = int(action.rsplit("_", 1)[1]); data = await seller_referral_stats(owner_id)
+        bot_username = (await context.bot.get_me()).username
+        link = f"https://t.me/{bot_username}?start=ref_{owner_id}"
+        await q.edit_message_text(
+            f"🤝 Seller Referral\n\nReferral Link:\n{link}\n\nTotal Referrals: {data.get('total',0)}\nRewarded: {data.get('rewarded',0)}",
+            reply_markup=selected_back(bot_id), disable_web_page_preview=True,
+        ); return
+
+    if action.startswith("seller_selected_terms_"):
+        bot_id = int(action.rsplit("_", 1)[1]); policy = await get_policy(owner_id)
+        parts=[]
+        for key in ("terms","privacy","refund","support"):
+            value=(policy or {}).get(key)
+            if value: parts.append(f"{key.title()}:\n{value}")
+        await q.edit_message_text(
+            "📜 Terms & Policy\n\n" + ("\n\n".join(parts) if parts else "No policy configured."),
+            reply_markup=selected_back(bot_id),
+        ); return
+
+    # Payment and bot-setting edit actions.
+    setting_actions = {
+        "seller_set_upi_id_": ("upi_id", "Send the UPI ID."),
+        "seller_set_upi_name_": ("upi_name", "Send the UPI account/name."),
+        "seller_set_bot_name_": ("bot_name", "Send the bot display name."),
+        "seller_set_support_": ("support_username", "Send support @username or Telegram link."),
+        "seller_set_currency_": ("currency", "Send currency code, for example INR."),
+        "seller_set_timezone_": ("timezone", "Send timezone, for example Asia/Kolkata."),
+    }
+    for prefix, (field, prompt) in setting_actions.items():
+        if action.startswith(prefix):
+            bot_id = int(action.rsplit("_", 1)[1])
+            context.user_data.clear(); context.user_data.update({"seller_edit_field": field, "selected_clone_bot_id": bot_id})
+            await q.edit_message_text(prompt, reply_markup=selected_back(bot_id)); return
+
+    if action.startswith("seller_set_qr_"):
+        bot_id=int(action.rsplit("_",1)[1]); context.user_data.clear(); context.user_data.update({"seller_waiting_qr":True,"selected_clone_bot_id":bot_id})
+        await q.edit_message_text("🖼 Send the UPI QR image now.", reply_markup=selected_back(bot_id)); return
+
+    if action.startswith("seller_channel_add_"):
+        bot_id=int(action.rsplit("_",1)[1]); context.user_data.clear(); context.user_data.update({"seller_waiting_channel":True,"selected_clone_bot_id":bot_id})
+        await q.edit_message_text("Send channel/group in this format:\n-1001234567890 | Group Name", reply_markup=selected_back(bot_id)); return
+
+    if action.startswith("seller_channel_list_"):
+        bot_id=int(action.rsplit("_",1)[1]); items=await get_channels(owner_id); lines=["📋 Channel / Group List",""]
+        rows=[]
+        if not items: lines.append("No channel or group connected.")
+        for item in items:
+            lines.append(f"• {item.get('title','Chat')} ({item.get('chat_id')})")
+            rows.append([InlineKeyboardButton(f"🗑 Remove {str(item.get('title','Chat'))[:24]}", callback_data=f"seller_channel_remove_{bot_id}_{item.get('chat_id')}")])
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data=f"seller_selected_channels_{bot_id}")])
+        await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if action.startswith("seller_channel_remove_"):
+        parts=action.split("_"); bot_id=int(parts[3]); chat_id=int(parts[4]); await remove_channel(owner_id,chat_id)
+        await q.edit_message_text("✅ Channel/group removed.", reply_markup=channels_markup(bot_id)); return
 
     if action == "seller_bots_list":
         bots = await get_bots(owner_id)
@@ -252,9 +390,37 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def receive_seller_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    owner_id = int(update.effective_user.id)
+    text = (update.effective_message.text or "").strip()
+    bot_id = int(context.user_data.get("selected_clone_bot_id") or 0)
+
+    field = context.user_data.get("seller_edit_field")
+    if field:
+        await set_seller_setting(owner_id, field, text)
+        context.user_data.clear()
+        settings = await get_seller_settings(owner_id)
+        await update.effective_message.reply_text(
+            "✅ Setting updated.\n\n"
+            f"Bot Name: {settings.get('bot_name') or '-'}\nSupport: {settings.get('support_username') or '-'}\n"
+            f"Currency: {settings.get('currency') or 'INR'}\nTimezone: {settings.get('timezone') or 'Asia/Kolkata'}",
+            reply_markup=bot_settings_markup(bot_id) if field not in {"upi_id","upi_name"} else payment_settings_markup(bot_id),
+        )
+        return
+
+    if context.user_data.get("seller_waiting_channel"):
+        try:
+            raw_id, title = [x.strip() for x in text.split("|", 1)]
+            chat_id = int(raw_id)
+            await add_channel(owner_id, chat_id, title, "group_or_channel")
+            context.user_data.clear()
+            await update.effective_message.reply_text("✅ Channel/group added.", reply_markup=channels_markup(bot_id))
+        except Exception:
+            await update.effective_message.reply_text("❌ Invalid format. Use: -1001234567890 | Group Name")
+        return
+
     if not context.user_data.get("waiting_seller_token"):
         return
-    token = update.effective_message.text.strip()
+    token = text
     owner_id = int(update.effective_user.id)
     replace_bot_id = context.user_data.get("replace_clone_bot_id")
     try:
@@ -279,8 +445,19 @@ async def receive_seller_token(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.effective_message.reply_text(f"❌ Invalid token or Telegram error: {exc}")
 
 
+async def receive_seller_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("seller_waiting_qr") or not update.effective_message.photo:
+        return
+    owner_id=int(update.effective_user.id); bot_id=int(context.user_data.get("selected_clone_bot_id") or 0)
+    file_id=update.effective_message.photo[-1].file_id
+    await set_seller_setting(owner_id,"upi_qr_file_id",file_id)
+    context.user_data.clear()
+    await update.effective_message.reply_text("✅ UPI QR updated.", reply_markup=payment_settings_markup(bot_id))
+
+
 def seller_handlers():
     return [
-        CallbackQueryHandler(seller_callback, pattern=r"^seller_(bots_list|select_\d+|connect|replace_\d+|my_bot_\d+|pause_\d+|resume_\d+|remove_\d+|upgrade_plan|current_plan|plan_history|buy_.*|manual_.*)$"),
+        CallbackQueryHandler(seller_callback, pattern=r"^seller_(bots_list|select_\d+|connect|replace_\d+|pause_\d+|resume_\d+|remove_\d+|upgrade_plan|current_plan|plan_history|buy_.*|manual_.*|selected_.*|set_.*|channel_.*)$"),
+        MessageHandler(filters.PHOTO, receive_seller_qr),
         MessageHandler(filters.TEXT & ~filters.COMMAND, receive_seller_token),
     ]
