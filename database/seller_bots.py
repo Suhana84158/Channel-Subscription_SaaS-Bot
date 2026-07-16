@@ -10,18 +10,53 @@ def seller_bots_collection():
 
 
 async def initialize_seller_bot_indexes():
-    await seller_bots_collection().create_index("owner_id", unique=True)
-    await seller_bots_collection().create_index("bot_id", unique=True)
-    await seller_bots_collection().create_index("bot_username_normalized", unique=True)
-    await seller_bots_collection().create_index("active")
+    col = seller_bots_collection()
+    # Old builds used a unique owner_id index, which blocked multiple clone bots.
+    for index in await col.list_indexes().to_list(length=None):
+        key = index.get("key", {})
+        if index.get("unique") and list(key.items()) == [("owner_id", 1)]:
+            try:
+                await col.drop_index(index["name"])
+            except Exception:
+                pass
+    await col.create_index("owner_id")
+    await col.create_index("bot_id", unique=True)
+    await col.create_index("bot_username_normalized", unique=True)
+    await col.create_index("active")
+    await col.create_index([("owner_id", 1), ("created_at", 1)])
+
+    # Preserve the existing first bot's old owner-scoped data.
+    cursor = col.find({"data_owner_id": {"$exists": False}})
+    async for record in cursor:
+        await col.update_one(
+            {"_id": record["_id"]},
+            {"$set": {"data_owner_id": int(record["owner_id"])}}
+        )
 
 
 async def get_bot(owner_id: int):
-    return await seller_bots_collection().find_one({"owner_id": owner_id})
+    """Backward-compatible: return seller's first/oldest clone bot."""
+    return await seller_bots_collection().find_one(
+        {"owner_id": int(owner_id)}, sort=[("created_at", 1)]
+    )
+
+
+async def get_bots(owner_id: int):
+    return await seller_bots_collection().find(
+        {"owner_id": int(owner_id)}
+    ).sort("created_at", 1).to_list(length=None)
+
+
+async def count_owner_bots(owner_id: int):
+    return await seller_bots_collection().count_documents({"owner_id": int(owner_id)})
 
 
 async def get_bot_by_bot_id(bot_id: int):
-    return await seller_bots_collection().find_one({"bot_id": bot_id})
+    return await seller_bots_collection().find_one({"bot_id": int(bot_id)})
+
+
+async def get_bot_by_data_owner_id(data_owner_id: int):
+    return await seller_bots_collection().find_one({"data_owner_id": int(data_owner_id)})
 
 
 async def get_bot_by_username(bot_username: str):
@@ -32,11 +67,21 @@ async def get_bot_by_username(bot_username: str):
 
 async def save_bot(owner_id: int, bot_id: int, bot_name: str, bot_username: str, bot_token: str):
     now = datetime.now(timezone.utc)
+    existing = await get_bot_by_bot_id(bot_id)
+    # First bot keeps old owner_id scope so all existing plans/users/settings remain intact.
+    first_bot = await get_bot(owner_id)
+    data_owner_id = (
+        int(existing.get("data_owner_id")) if existing and existing.get("data_owner_id") is not None
+        else int(owner_id) if not first_bot
+        else int(bot_id)
+    )
     await seller_bots_collection().update_one(
-        {"owner_id": owner_id},
+        {"bot_id": int(bot_id)},
         {
             "$set": {
-                "bot_id": bot_id,
+                "owner_id": int(owner_id),
+                "data_owner_id": data_owner_id,
+                "bot_id": int(bot_id),
                 "bot_name": bot_name,
                 "bot_username": bot_username,
                 "bot_username_normalized": bot_username.lstrip("@").lower(),
@@ -50,11 +95,13 @@ async def save_bot(owner_id: int, bot_id: int, bot_name: str, bot_username: str,
         },
         upsert=True,
     )
-    return await get_bot(owner_id)
+    return await get_bot_by_bot_id(bot_id)
 
 
-async def get_decrypted_bot_token(owner_id: int):
-    record = await get_bot(owner_id)
+async def get_decrypted_bot_token(bot_id: int):
+    record = await get_bot_by_bot_id(bot_id)
+    if not record:
+        record = await get_bot(bot_id)
     if not record:
         return None
     encrypted = record.get("bot_token_encrypted")
@@ -68,9 +115,11 @@ async def get_all_active_bots():
     }).to_list(length=None)
 
 
-async def set_bot_active(owner_id: int, active: bool):
+async def set_bot_active(bot_id: int, active: bool):
+    record = await get_bot_by_bot_id(bot_id) or await get_bot(bot_id)
+    query = {"bot_id": int(record["bot_id"])} if record else {"bot_id": int(bot_id)}
     await seller_bots_collection().update_one(
-        {"owner_id": owner_id},
+        query,
         {"$set": {
             "active": bool(active),
             "status": "active" if active else "paused",
@@ -79,9 +128,11 @@ async def set_bot_active(owner_id: int, active: bool):
     )
 
 
-async def set_runtime_status(owner_id: int, status: str, error=None):
+async def set_runtime_status(bot_id: int, status: str, error=None):
+    record = await get_bot_by_bot_id(bot_id) or await get_bot(bot_id)
+    query = {"bot_id": int(record["bot_id"])} if record else {"bot_id": int(bot_id)}
     await seller_bots_collection().update_one(
-        {"owner_id": owner_id},
+        query,
         {"$set": {
             "runtime_status": status,
             "runtime_error": error,
@@ -90,12 +141,16 @@ async def set_runtime_status(owner_id: int, status: str, error=None):
     )
 
 
-async def delete_bot(owner_id: int):
-    return await seller_bots_collection().delete_one({"owner_id": owner_id})
+async def delete_bot(owner_id: int, bot_id: int | None = None):
+    query = {"owner_id": int(owner_id)}
+    if bot_id is not None:
+        query["bot_id"] = int(bot_id)
+        return await seller_bots_collection().delete_one(query)
+    return await seller_bots_collection().delete_many(query)
 
 
 async def bot_exists(owner_id: int):
-    return await seller_bots_collection().count_documents({"owner_id": owner_id}) > 0
+    return await count_owner_bots(owner_id) > 0
 
 
 async def total_bots():
