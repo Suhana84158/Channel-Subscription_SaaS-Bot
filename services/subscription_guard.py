@@ -7,10 +7,8 @@ from telegram.ext import ContextTypes
 
 from database.seller_data import get_channels, get_subscription
 from database.subscription_guard import (
-    add_whitelist,
-    is_whitelisted,
-    log_guard_event,
-    mark_invite_used,
+    add_whitelist, get_guard_settings, is_whitelisted, log_guard_event,
+    mark_invite_used, record_join_attempt,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,13 +46,33 @@ async def _remove_member(bot, chat_id: int, user_id: int):
     await bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
 
 
+async def _alert_seller(context: ContextTypes.DEFAULT_TYPE, owner_id: int, event, user, attempts: int):
+    settings = await get_guard_settings(owner_id)
+    if not settings.get("notify_seller", True):
+        return
+    username = f"@{user.username}" if user.username else user.full_name
+    try:
+        await context.bot.send_message(
+            owner_id,
+            "🚨 <b>Subscription Guard Alert</b>\n\n"
+            f"Unauthorized user removed.\n\n👤 User: {username}\n"
+            f"🆔 User ID: <code>{user.id}</code>\n📢 Chat: {event.chat.title or event.chat.id}\n"
+            f"🔁 Attempts: {attempts}\n❌ Reason: No active subscription",
+            parse_mode="HTML",
+        )
+    except TelegramError:
+        pass
+
+
 async def subscription_guard_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     event = update.chat_member
     if not event:
         return
-
     owner_id = int(context.application.bot_data.get("seller_owner_id") or 0)
     if not owner_id or not await _connected_chat(owner_id, event.chat.id):
+        return
+    settings = await get_guard_settings(owner_id)
+    if not settings.get("enabled", True):
         return
 
     old_status = getattr(event.old_chat_member, "status", "")
@@ -66,22 +84,20 @@ async def subscription_guard_chat_member(update: Update, context: ContextTypes.D
     user = event.new_chat_member.user
     if user.is_bot:
         return
-
     actor = event.from_user
-    if actor and actor.id != user.id and await _is_admin(context.bot, event.chat.id, actor.id):
+    if settings.get("whitelist_admin_added", True) and actor and actor.id != user.id and await _is_admin(context.bot, event.chat.id, actor.id):
         await add_whitelist(owner_id, event.chat.id, user.id, actor.id)
         await log_guard_event(owner_id, event.chat.id, user.id, "whitelisted", "Added by chat admin/owner")
         return
-
-    if await _is_admin(context.bot, event.chat.id, user.id):
-        return
-    if await is_whitelisted(owner_id, event.chat.id, user.id):
+    if await _is_admin(context.bot, event.chat.id, user.id) or await is_whitelisted(owner_id, event.chat.id, user.id):
+        await log_guard_event(owner_id, event.chat.id, user.id, "admin_skipped", "Admin/owner/whitelist")
         return
 
     invite = getattr(event, "invite_link", None)
-    if invite and getattr(invite, "invite_link", None):
+    if settings.get("auto_revoke_invites", True) and invite and getattr(invite, "invite_link", None):
         try:
             await context.bot.revoke_chat_invite_link(event.chat.id, invite.invite_link)
+            await log_guard_event(owner_id, event.chat.id, user.id, "invite_revoked", "Used invite link revoked")
         except TelegramError:
             pass
         await mark_invite_used(owner_id, invite.invite_link)
@@ -89,46 +105,55 @@ async def subscription_guard_chat_member(update: Update, context: ContextTypes.D
     if await _active(owner_id, user.id):
         await log_guard_event(owner_id, event.chat.id, user.id, "allowed", "Active subscription")
         return
+    if not settings.get("unauthorized_join_protection", True):
+        await log_guard_event(owner_id, event.chat.id, user.id, "allowed_unprotected", "Protection disabled")
+        return
 
+    attempts = await record_join_attempt(owner_id, event.chat.id, user.id)
     try:
         await _remove_member(context.bot, event.chat.id, user.id)
-        await log_guard_event(owner_id, event.chat.id, user.id, "removed", "No active subscription")
+        await log_guard_event(owner_id, event.chat.id, user.id, "removed", "No active subscription", attempts=attempts)
+        await _alert_seller(context, owner_id, event, user, attempts)
         try:
             await context.bot.send_message(
                 user.id,
-                "🚫 You were removed from the premium group/channel because no active subscription was found.\n\nPlease buy or renew a plan, then use the fresh invite link sent by this bot.",
+                "🚫 You were removed because no active subscription was found.\n\nPlease buy or renew a plan, then use a fresh invite link sent by this bot.",
             )
         except TelegramError:
             pass
     except TelegramError as exc:
         logger.warning("Subscription guard remove failed owner=%s chat=%s user=%s: %s", owner_id, event.chat.id, user.id, exc)
-        await log_guard_event(owner_id, event.chat.id, user.id, "remove_failed", str(exc))
+        await log_guard_event(owner_id, event.chat.id, user.id, "remove_failed", str(exc), attempts=attempts)
 
 
 async def subscription_guard_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    chat = update.effective_chat
-    actor = update.effective_user
+    message, chat, actor = update.effective_message, update.effective_chat, update.effective_user
     if not message or not chat or not message.new_chat_members:
         return
-
     owner_id = int(context.application.bot_data.get("seller_owner_id") or 0)
     if not owner_id or not await _connected_chat(owner_id, chat.id):
         return
-
+    settings = await get_guard_settings(owner_id)
+    if not settings.get("enabled", True):
+        return
     actor_is_admin = bool(actor and await _is_admin(context.bot, chat.id, actor.id))
     for user in message.new_chat_members:
         if user.is_bot:
             continue
-        if actor_is_admin and actor.id != user.id:
+        if settings.get("whitelist_admin_added", True) and actor_is_admin and actor.id != user.id:
             await add_whitelist(owner_id, chat.id, user.id, actor.id)
+            await log_guard_event(owner_id, chat.id, user.id, "whitelisted", "Added by chat admin/owner")
             continue
         if await _is_admin(context.bot, chat.id, user.id) or await is_whitelisted(owner_id, chat.id, user.id):
             continue
         if await _active(owner_id, user.id):
+            await log_guard_event(owner_id, chat.id, user.id, "allowed", "Active subscription")
             continue
+        if not settings.get("unauthorized_join_protection", True):
+            continue
+        attempts = await record_join_attempt(owner_id, chat.id, user.id)
         try:
             await _remove_member(context.bot, chat.id, user.id)
-            await log_guard_event(owner_id, chat.id, user.id, "removed", "No active subscription")
+            await log_guard_event(owner_id, chat.id, user.id, "removed", "No active subscription", attempts=attempts)
         except TelegramError as exc:
             logger.warning("Subscription guard fallback failed owner=%s chat=%s user=%s: %s", owner_id, chat.id, user.id, exc)

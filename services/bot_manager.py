@@ -54,6 +54,7 @@ from database.content_protection import get_content_protection_settings
 
 from database.subscription_guard import save_invite, active_invites_for_user, deactivate_invite
 from services.subscription_guard import subscription_guard_chat_member, subscription_guard_new_members
+from handlers.subscription_guard import subscription_guard_handlers
 
 @dataclass
 class RunningSellerBot:
@@ -87,6 +88,7 @@ class SellerBotManager:
             [InlineKeyboardButton("📣 Broadcast", callback_data="a_broadcast"), InlineKeyboardButton("📊 Statistics", callback_data="a_stats")],
             [InlineKeyboardButton("🗑 Deleting Messages", callback_data="dm_home"), InlineKeyboardButton("🔒 Content Protection", callback_data="cp_home")],
             [InlineKeyboardButton("💬 Live Support", callback_data="a_live_support")],
+            [InlineKeyboardButton("🛡 Subscription Guard", callback_data="sg_home")],
             [InlineKeyboardButton("🗓 Scheduled", callback_data="a_broadcast_schedule"), InlineKeyboardButton("🎟 Coupons", callback_data="a_coupons")],
             [InlineKeyboardButton("🔁 Retry Failed", callback_data="a_retry_failed"), InlineKeyboardButton("🤝 Seller Referral", callback_data="a_seller_referral")],
             [InlineKeyboardButton("📜 Terms & Policy", callback_data="a_terms")],
@@ -2921,6 +2923,8 @@ class SellerBotManager:
         for handler in deleting_messages_handlers():
             app.add_handler(handler,group=-7)
         for handler in content_protection_handlers():
+            app.add_handler(handler,group=-7)
+        for handler in subscription_guard_handlers():
             app.add_handler(handler,group=-7)
         app.add_handler(ChatMemberHandler(subscription_guard_chat_member, ChatMemberHandler.CHAT_MEMBER), group=-30)
         app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, subscription_guard_new_members), group=-29)
