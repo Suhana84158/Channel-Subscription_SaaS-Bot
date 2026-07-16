@@ -2,7 +2,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
 from database.admins import is_admin
-from database.seller_bots import get_bot
+from database.seller_bots import get_bot, count_owner_bots
 from database.sellers import get_or_create_seller, get_seller
 from database.seller_referrals import register_seller_referral, reward_seller_referral
 from database.users import get_or_create_user
@@ -25,26 +25,14 @@ def owner_welcome_keyboard():
 
 
 def seller_welcome_keyboard(has_bot: bool):
-    rows = []
-
-    if has_bot:
-        rows.extend([
-            [InlineKeyboardButton("🏪 Seller Dashboard", callback_data="main_seller_dashboard")],
-            [InlineKeyboardButton("🤖 Manage My Child Bot", callback_data="seller_my_bot")],
-        ])
-    else:
-        rows.extend([
-            [InlineKeyboardButton("➕ Create / Connect Child Bot", callback_data="seller_connect")],
-            [InlineKeyboardButton("🏪 Seller Dashboard", callback_data="main_seller_dashboard")],
-        ])
-
-    rows.extend([
+    rows = [
+        [InlineKeyboardButton("🤖 Manage My Clone Bots", callback_data="seller_bots_list")],
+        [InlineKeyboardButton("➕ Create New Clone Bot", callback_data="seller_connect")],
         [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
         [InlineKeyboardButton("📊 View Current Plan", callback_data="seller_current_plan")],
         [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
         [InlineKeyboardButton("🌐 Official Links", callback_data="official_links_open")],
-        [InlineKeyboardButton("🆘 Help & Commands", callback_data="main_help")],
-    ])
+    ]
     return InlineKeyboardMarkup(rows)
 
 
@@ -54,7 +42,7 @@ async def role_welcome(user_id: int):
             "🚀 Main Bot Platform\n\n"
             "👑 Welcome, Owner!\n\n"
             "From this dashboard you can control:\n"
-            "• Sellers and their connected child bots\n"
+            "• Sellers and their connected clone bots\n"
             "• Main-bot users and subscriptions\n"
             "• Payments and transactions\n"
             "• Broadcasts, channels and system settings\n\n"
@@ -79,7 +67,7 @@ async def role_welcome(user_id: int):
             f"Connected Bot: @{bot.get('bot_username')}\n"
             f"Status: {'🟢 Active' if bot.get('active') else '⏸ Paused'}"
             if bot
-            else "No child bot connected yet. Tap the button below to create one."
+            else "No clone bot connected yet. Tap the button below to create one."
         ),
         seller_welcome_keyboard(bool(bot)),
     )
