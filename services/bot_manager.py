@@ -17,7 +17,7 @@ from database.payment_gateways import (
     save_gateway_config, set_gateway_preferences, gateway_history,
 )
 from services.payment_gateways import create_checkout, test_gateway_connection, GatewayError
-from database.seller_bots import get_all_active_bots, get_bot, get_decrypted_bot_token, set_runtime_status
+from database.seller_bots import get_all_active_bots, get_bot, get_bot_by_bot_id, get_bot_by_data_owner_id, get_decrypted_bot_token, set_runtime_status
 from database.mongo import get_database
 from database.seller_referrals import seller_referral_stats
 from database.live_support import (
@@ -59,7 +59,11 @@ class RunningSellerBot:
 class SellerBotManager:
     def __init__(self): self._running:Dict[int,RunningSellerBot]={}; self._lock=asyncio.Lock()
     def is_running(self,owner_id:int)->bool:return owner_id in self._running
-    def get_running(self,owner_id:int): return self._running.get(int(owner_id))
+    def get_running(self,owner_id:int):
+        owner_id=int(owner_id)
+        direct=self._running.get(owner_id)
+        if direct:return direct
+        return next((r for r in self._running.values() if int(r.owner_id)==owner_id),None)
 
     @staticmethod
     def main_menu():
@@ -90,7 +94,7 @@ class SellerBotManager:
         """Build the live summary shown above the clone-bot admin buttons."""
         try:
             plan, _assignment = await effective_plan(owner_id)
-            bot_record = await get_bot(owner_id) or {}
+            bot_record = await get_bot_by_data_owner_id(owner_id) or {}
             settings = await get_seller_settings(owner_id)
             db = get_database()
             now_utc = datetime.now(timezone.utc)
@@ -562,7 +566,8 @@ class SellerBotManager:
         return p[0],p[1].lower(),cls.parse_duration(p[1]),float(p[2])
 
     def owner(self,context): return int(context.application.bot_data["seller_owner_id"])
-    async def auth(self,update,context): return update.effective_user.id==self.owner(context)
+    def seller_account(self,context): return int(context.application.bot_data.get("seller_account_id", self.owner(context)))
+    async def auth(self,update,context): return update.effective_user.id==self.seller_account(context)
 
     async def safe_query_message(self,q,text,reply_markup=None):
         """Edit text messages; reply with a new message when the button is on media."""
@@ -591,14 +596,55 @@ class SellerBotManager:
     async def child_start(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
 
-        # Child-bot owner/seller opens the admin panel directly.
-        if update.effective_user.id == owner:
+        # Clone-bot seller opens the selected section directly from main-bot deep links.
+        if update.effective_user.id == self.seller_account(context):
             context.user_data.clear()
-            await update.effective_message.reply_text(
-                await self.admin_panel_text(owner, update.effective_user),
-                reply_markup=self.admin_menu(),
-                parse_mode="HTML",
-            )
+            target = context.args[0] if context.args else "admin_panel"
+            if target == "admin_payment":
+                settings = await get_seller_settings(owner)
+                await update.effective_message.reply_text(
+                    f"💳 Payment Settings\n\nUPI Name: {settings.get('upi_name') or 'Not Set'}\n"
+                    f"UPI ID: {settings.get('upi_id') or 'Not Set'}\n"
+                    f"QR: {'Added' if settings.get('upi_qr_file_id') else 'Not Added'}",
+                    reply_markup=self.payment_menu(),
+                )
+            elif target == "admin_settings":
+                settings = await get_seller_settings(owner)
+                await update.effective_message.reply_text(
+                    "⚙️ Bot Settings\n\n"
+                    f"Bot Name: {settings.get('bot_name') or '-'}\n"
+                    f"Support: {settings.get('support_username') or '-'}\n"
+                    f"Currency: {settings.get('currency') or 'INR'}\n"
+                    f"Timezone: {settings.get('timezone') or 'Asia/Kolkata'}",
+                    reply_markup=self.settings_menu(),
+                )
+            elif target == "admin_channels":
+                await update.effective_message.reply_text("📢 Channels / Groups", reply_markup=self.channels_menu())
+            elif target == "admin_stats":
+                data = await stats(owner)
+                await update.effective_message.reply_text(
+                    "📊 Statistics\n\n"
+                    f"Users: {data.get('users',0)}\nPlans: {data.get('plans',0)}\n"
+                    f"Channels/Groups: {data.get('channels',0)}\n"
+                    f"Pending Payments: {data.get('pending',0)}\nRevenue: ₹{data.get('revenue',0):g}",
+                    reply_markup=self.admin_menu(),
+                )
+            elif target == "admin_terms":
+                policy = await get_policy(owner)
+                parts=[]
+                for key in ("terms","privacy","refund","support"):
+                    value=(policy or {}).get(key)
+                    if value: parts.append(f"{key.title()}:\n{value}")
+                await update.effective_message.reply_text(
+                    "📜 Terms & Policy\n\n" + ("\n\n".join(parts) if parts else "No policy configured."),
+                    reply_markup=self.admin_menu(),
+                )
+            else:
+                await update.effective_message.reply_text(
+                    await self.admin_panel_text(owner, update.effective_user),
+                    reply_markup=self.admin_menu(),
+                    parse_mode="HTML",
+                )
             return
 
         try:
@@ -621,7 +667,7 @@ class SellerBotManager:
                     except (TypeError,ValueError):
                         pass
 
-            record=await get_bot(owner)
+            record=await get_bot_by_data_owner_id(owner)
             settings=await ensure_seller_defaults(
                 owner,
                 (record or {}).get("bot_name","Subscription Bot"),
@@ -775,7 +821,7 @@ class SellerBotManager:
         back_keyboard=self.back("c_home")
 
         if action=="c_home":
-            record=await get_bot(owner)
+            record=await get_bot_by_data_owner_id(owner)
             settings=await ensure_seller_defaults(
                 owner,
                 (record or {}).get("bot_name","Subscription Bot"),
@@ -1073,7 +1119,7 @@ class SellerBotManager:
         if a=="a_seller_profile":
             plan,assignment=await effective_plan(owner)
             usage=await stats(owner)
-            bot_record=await get_bot(owner) or {}
+            bot_record=await get_bot_by_data_owner_id(owner) or {}
             expiry=(assignment or {}).get("expiry_date")
             if expiry and getattr(expiry,"tzinfo",None) is None:
                 expiry=expiry.replace(tzinfo=timezone.utc)
@@ -1292,7 +1338,7 @@ class SellerBotManager:
             await q.edit_message_text(f"🔁 Retry completed\n\nSent: {sent}\nStill failed: {still_failed}",reply_markup=self.admin_menu()); return
         if a.startswith("a_channel_del_"): await remove_channel(owner,int(a.replace("a_channel_del_",""))); await q.edit_message_text("✅ Removed",reply_markup=self.channels_menu()); return
         if a=="a_welcome":
-            s=await ensure_seller_defaults(owner,(await get_bot(owner) or {}).get("bot_name","Subscription Bot"))
+            s=await ensure_seller_defaults(owner,(await get_bot_by_data_owner_id(owner) or {}).get("bot_name","Subscription Bot"))
             text=("💬 Welcome Message\n\n"
                   f"📝 Text: {'✅' if s.get('welcome_message') else '❌'}\n"
                   f"🖼 Media: {'✅' if s.get('welcome_media_file_id') else '❌'}\n"
@@ -1454,7 +1500,7 @@ class SellerBotManager:
             await q.edit_message_text("✅ Welcome media removed.",reply_markup=self.welcome_menu()); return
         if a=="a_welcome_remove_buttons": await set_seller_setting(owner,"welcome_buttons",[]); await q.edit_message_text("✅ Welcome buttons removed.",reply_markup=self.welcome_menu()); return
         if a=="a_welcome_preview":
-            s=await ensure_seller_defaults(owner,(await get_bot(owner) or {}).get("bot_name","Subscription Bot"))
+            s=await ensure_seller_defaults(owner,(await get_bot_by_data_owner_id(owner) or {}).get("bot_name","Subscription Bot"))
             try:
                 await q.message.reply_text("👀 Preview — users will see the message below:")
                 await self.send_welcome(q.message,context,s,q.from_user)
@@ -2729,7 +2775,8 @@ class SellerBotManager:
         """Send fresh invite links only for chats the user has not joined yet."""
         running=self.get_running(int(owner_id))
         if not running:
-            started=await self.start_bot(int(owner_id))
+            record=await get_bot_by_data_owner_id(int(owner_id))
+            started=await self.start_bot(int(record["bot_id"])) if record else False
             running=self.get_running(int(owner_id)) if started else None
         if not running:
             return {"sent":0,"already_member":0,"failed":0,"error":"Clone bot is not running"}
@@ -2834,9 +2881,11 @@ class SellerBotManager:
             except Exception:
                 pass
 
-    def build_app(self,token,owner):
-        protected_bot=ProtectedExtBot(token=token,owner_id=owner)
-        app=Application.builder().bot(protected_bot).build(); app.bot_data["seller_owner_id"]=owner
+    def build_app(self,token,data_owner_id,seller_account_id):
+        protected_bot=ProtectedExtBot(token=token,owner_id=int(data_owner_id))
+        app=Application.builder().bot(protected_bot).build()
+        app.bot_data["seller_owner_id"]=int(data_owner_id)
+        app.bot_data["seller_account_id"]=int(seller_account_id)
         app.add_handler(CommandHandler("start",self.child_start))
         app.add_handler(CommandHandler("help",self.help_command))
         app.add_handler(CommandHandler("admin",self.admin))
@@ -2864,22 +2913,37 @@ class SellerBotManager:
         app.add_handler(MessageHandler(filters.PHOTO,self.photo_handler),group=0)
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,self.text_handler))
         app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,self.route_live_support_message),group=10)
-        if app.job_queue: app.job_queue.run_repeating(self.expiry_job,interval=300,first=60,name=f"seller_expiry_{owner}")
+        if app.job_queue: app.job_queue.run_repeating(self.expiry_job,interval=300,first=60,name=f"seller_expiry_{data_owner_id}")
         return app
 
-    async def start_bot(self,owner_id:int)->bool:
+    async def start_bot(self,bot_id:int)->bool:
+        bot_id=int(bot_id)
         async with self._lock:
-            if owner_id in self._running:return True
-            record=await get_bot(owner_id)
+            if bot_id in self._running:return True
+            record=await get_bot_by_bot_id(bot_id)
+            if not record:
+                record=await get_bot(bot_id)
             if not record or not record.get("active"):return False
-            token=await get_decrypted_bot_token(owner_id)
-            if not token: await set_runtime_status(owner_id,"token_missing","Missing encrypted token"); return False
+            bot_id=int(record["bot_id"])
+            if bot_id in self._running:return True
+            token=await get_decrypted_bot_token(bot_id)
+            if not token:
+                await set_runtime_status(bot_id,"token_missing","Missing encrypted token")
+                return False
             app:Optional[Application]=None
+            data_owner_id=int(record.get("data_owner_id") or record["owner_id"])
+            seller_account_id=int(record["owner_id"])
             try:
-                await ensure_seller_defaults(owner_id,record.get("bot_name","Subscription Bot")); app=self.build_app(token,owner_id); protection=await get_content_protection_settings(owner_id); app.bot.set_content_protection(bool(protection.get("enabled",False))); await app.initialize(); await app.start(); await app.updater.start_polling(drop_pending_updates=True,allowed_updates=Update.ALL_TYPES)
-                self._running[owner_id]=RunningSellerBot(owner_id,int(record["bot_id"]),app); await set_runtime_status(owner_id,"running",None); return True
+                await ensure_seller_defaults(data_owner_id,record.get("bot_name","Subscription Bot"))
+                app=self.build_app(token,data_owner_id,seller_account_id)
+                await app.initialize(); await app.start()
+                await app.updater.start_polling(drop_pending_updates=True,allowed_updates=Update.ALL_TYPES)
+                self._running[bot_id]=RunningSellerBot(data_owner_id,bot_id,app)
+                await set_runtime_status(bot_id,"running",None)
+                return True
             except Exception as exc:
-                logger.exception("Seller bot start failed owner=%s",owner_id); await set_runtime_status(owner_id,"error",str(exc)[:500])
+                logger.exception("Seller bot start failed bot_id=%s",bot_id)
+                await set_runtime_status(bot_id,"error",str(exc)[:500])
                 if app: await self._safe_shutdown(app)
                 return False
 
@@ -2892,19 +2956,34 @@ class SellerBotManager:
         except Exception: pass
         try: await app.shutdown()
         except Exception: pass
-    async def stop_bot(self,owner_id:int,runtime_status="paused"):
+
+    async def stop_bot(self,bot_id:int,runtime_status="paused"):
+        bot_id=int(bot_id)
         async with self._lock:
-            r=self._running.pop(owner_id,None)
+            r=self._running.pop(bot_id,None)
+            if r is None:
+                matched_id=next((rid for rid,item in self._running.items()
+                    if int(item.owner_id)==bot_id or int(item.application.bot_data.get("seller_account_id",-1))==bot_id),None)
+                if matched_id is not None:
+                    bot_id=int(matched_id)
+                    r=self._running.pop(bot_id,None)
             if r: await self._safe_shutdown(r.application)
-            await set_runtime_status(owner_id,runtime_status,None); return True
-    async def restart_bot(self,owner_id): await self.stop_bot(owner_id,"restarting"); return await self.start_bot(owner_id)
+            await set_runtime_status(bot_id,runtime_status,None)
+            return True
+
+    async def restart_bot(self,bot_id):
+        await self.stop_bot(bot_id,"restarting")
+        return await self.start_bot(bot_id)
+
     async def restore_active_bots(self):
         started=failed=0
         for r in await get_all_active_bots():
-            if await self.start_bot(int(r["owner_id"])):started+=1
-            else:failed+=1
+            if await self.start_bot(int(r["bot_id"])): started+=1
+            else: failed+=1
         return {"started":started,"failed":failed}
+
     async def shutdown_all(self):
-        for oid in list(self._running): await self.stop_bot(oid,"service_stopped")
+        for bot_id in list(self._running):
+            await self.stop_bot(bot_id,"service_stopped")
 
 bot_manager=SellerBotManager()
