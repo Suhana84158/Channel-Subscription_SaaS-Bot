@@ -1,12 +1,17 @@
-from datetime import timezone
-
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, ContextTypes
 
+from database.seller_data import get_channels, get_seller_settings
 from database.subscription_guard import (
-    clear_guard_logs, get_guard_settings, guard_statistics, recent_guard_logs,
-    reset_guard_settings, set_guard_setting,
+    clear_guard_logs,
+    get_guard_settings,
+    guard_statistics,
+    recent_guard_logs,
+    reset_guard_settings,
+    set_guard_setting,
 )
+from services.subscription_guard import force_sync_known_users
+from utils.timezone import format_local_datetime
 
 LABELS = {
     "enabled": "Master Guard",
@@ -20,12 +25,17 @@ LABELS = {
 
 
 def _toggle(label: str, key: str, value: bool):
-    return InlineKeyboardButton(f"{'✅' if value else '❌'} {label}", callback_data=f"sg_toggle:{key}")
+    return InlineKeyboardButton(
+        f"{'✅' if value else '❌'} {label}",
+        callback_data=f"sg_toggle:{key}",
+    )
 
 
 def guard_menu(settings):
     return InlineKeyboardMarkup([
         [_toggle("Subscription Guard", "enabled", settings["enabled"])],
+        [InlineKeyboardButton("🧰 Subscription Enforcement", callback_data="sg_enforcement")],
+        [InlineKeyboardButton("🔄 Force Sync", callback_data="sg_sync_confirm")],
         [InlineKeyboardButton("📋 Guard Logs", callback_data="sg_logs"), InlineKeyboardButton("📊 Statistics", callback_data="sg_stats")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="sg_settings")],
         [InlineKeyboardButton("🧹 Clear Logs", callback_data="sg_clear_confirm")],
@@ -49,18 +59,23 @@ def home_text(settings):
     return (
         "🛡 <b>Subscription Guard</b>\n\n"
         f"Status: {'🟢 Enabled' if settings['enabled'] else '🔴 Disabled'}\n\n"
-        "Protects connected groups/channels by checking every new member. "
-        "Users without an active subscription are removed automatically.\n\n"
+        "Subscription Enforcement is included inside this page. It protects "
+        "connected groups by checking new joins and removing users whose access "
+        "is expired, inactive or banned.\n\n"
         "• Active subscribers are allowed\n"
-        "• Admins/owner are skipped\n"
-        "• Admin-added members can be whitelisted\n"
+        "• Admins/owner/whitelist are skipped\n"
         "• Used personal invite links can be revoked\n"
         "• Repeated unauthorized attempts are counted"
     )
 
 
 async def _edit(query, text, markup):
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+    await query.edit_message_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=markup,
+        disable_web_page_preview=True,
+    )
 
 
 async def subscription_guard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -85,16 +100,59 @@ async def subscription_guard_callback(update: Update, context: ContextTypes.DEFA
         return await _edit(query, "⚙️ <b>Subscription Guard Settings</b>\n\nChoose which protections should be active.", settings_menu(settings))
     if action == "sg_settings":
         return await _edit(query, "⚙️ <b>Subscription Guard Settings</b>\n\nChoose which protections should be active.", settings_menu(settings))
+    if action == "sg_enforcement":
+        channels = await get_channels(owner_id)
+        text = (
+            "🧰 <b>Subscription Enforcement</b>\n\n"
+            f"Connected chats: <b>{len(channels)}</b>\n\n"
+            "Automatic enforcement:\n"
+            "• Unauthorized join → remove\n"
+            "• Expired/inactive subscription → remove\n"
+            "• Banned user → remove\n"
+            "• Issued invite links → revoke\n"
+            "• Admin/owner/whitelist → skip\n\n"
+            "New joins are checked in real time. Force Sync checks every user already known to this clone bot."
+        )
+        return await _edit(query, text, InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Run Force Sync", callback_data="sg_sync_confirm")],
+            [InlineKeyboardButton("⬅ Subscription Guard", callback_data="sg_home")],
+        ]))
+    if action == "sg_sync_confirm":
+        return await _edit(query,
+            "🔄 <b>Run Force Sync?</b>\n\nThis checks all users recorded by this clone bot, removes expired/banned users from connected chats and revokes their active invite links.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Start Sync", callback_data="sg_sync")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="sg_home")],
+            ]),
+        )
+    if action == "sg_sync":
+        await _edit(query, "⏳ <b>Force Sync Running...</b>\n\nPlease wait.", None)
+        report = await force_sync_known_users(context.bot, owner_id)
+        text = (
+            "✅ <b>Force Sync Completed</b>\n\n"
+            f"Users Checked: {report['users_checked']}\n"
+            f"Expired/Inactive: {report['expired_or_inactive']}\n"
+            f"Banned Users: {report['banned']}\n"
+            f"Chat Removals: {report['removed']}\n"
+            f"Remove Failed: {report['remove_failed']}\n"
+            f"Invite Links Revoked: {report['invites_revoked']}\n\n"
+            "Note: Telegram bots cannot request a complete member list. Unknown users are still checked automatically whenever they join."
+        )
+        return await _edit(query, text, InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Run Again", callback_data="sg_sync_confirm")],
+            [InlineKeyboardButton("⬅ Subscription Guard", callback_data="sg_home")],
+        ]))
     if action == "sg_logs":
         logs = await recent_guard_logs(owner_id, 12)
+        seller_settings = await get_seller_settings(owner_id)
+        timezone_name = seller_settings.get("timezone") or "Asia/Kolkata"
         if not logs:
             text = "📋 <b>Guard Logs</b>\n\nNo guard events recorded yet."
         else:
             icons = {"allowed":"🟢", "removed":"🔴", "remove_failed":"⚠️", "whitelisted":"🟡", "admin_skipped":"🟡", "invite_revoked":"🔗"}
-            lines = ["📋 <b>Guard Logs</b>", ""]
+            lines = ["📋 <b>Guard Logs</b>", f"Timezone: <b>{timezone_name}</b>", ""]
             for row in logs:
-                created = row.get("created_at")
-                when = created.astimezone(timezone.utc).strftime("%d-%m %H:%M UTC") if created else "-"
+                when = format_local_datetime(row.get("created_at"), timezone_name, "%d-%m %I:%M %p")
                 action_name = str(row.get("action", "event"))
                 lines.append(f"{icons.get(action_name,'•')} <b>{action_name.replace('_',' ').title()}</b>")
                 lines.append(f"User: <code>{row.get('user_id','-')}</code> | Chat: <code>{row.get('chat_id','-')}</code>")
@@ -120,7 +178,6 @@ async def subscription_guard_callback(update: Update, context: ContextTypes.DEFA
         return await _edit(query, "🧹 <b>Clear Guard Logs?</b>\n\nThis clears logs and join-attempt counters for this clone bot.", InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, Clear", callback_data="sg_clear")],[InlineKeyboardButton("❌ Cancel", callback_data="sg_home")]]))
     if action == "sg_clear":
         await clear_guard_logs(owner_id)
-        await query.answer("Guard logs cleared.", show_alert=True)
         return await _edit(query, home_text(settings), guard_menu(settings))
     if action == "sg_reset_confirm":
         return await _edit(query, "♻️ <b>Reset Subscription Guard settings?</b>", InlineKeyboardMarkup([[InlineKeyboardButton("✅ Reset", callback_data="sg_reset")],[InlineKeyboardButton("❌ Cancel", callback_data="sg_settings")]]))
@@ -130,4 +187,7 @@ async def subscription_guard_callback(update: Update, context: ContextTypes.DEFA
 
 
 def subscription_guard_handlers():
-    return [CallbackQueryHandler(subscription_guard_callback, pattern=r"^sg_(home|logs|stats|settings|clear|clear_confirm|reset|reset_confirm|toggle:.+)$")]
+    return [CallbackQueryHandler(
+        subscription_guard_callback,
+        pattern=r"^sg_(home|enforcement|sync|sync_confirm|logs|stats|settings|clear|clear_confirm|reset|reset_confirm|toggle:.+)$",
+    )]
