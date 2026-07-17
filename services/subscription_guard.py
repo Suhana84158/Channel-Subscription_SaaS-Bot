@@ -5,10 +5,11 @@ from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
+from database.mongo import get_database
 from database.seller_data import get_channels, get_subscription
 from database.subscription_guard import (
     add_whitelist, get_guard_settings, is_whitelisted, log_guard_event,
-    mark_invite_used, record_join_attempt,
+    active_invites_for_user, deactivate_invite, mark_invite_used, record_join_attempt,
 )
 
 logger = logging.getLogger(__name__)
@@ -157,3 +158,74 @@ async def subscription_guard_new_members(update: Update, context: ContextTypes.D
             await log_guard_event(owner_id, chat.id, user.id, "removed", "No active subscription", attempts=attempts)
         except TelegramError as exc:
             logger.warning("Subscription guard fallback failed owner=%s chat=%s user=%s: %s", owner_id, chat.id, user.id, exc)
+
+
+async def revoke_user_invites(bot, owner_id: int, user_id: int) -> int:
+    """Revoke all active invite links created for one subscriber."""
+    revoked = 0
+    for invite in await active_invites_for_user(owner_id, user_id):
+        try:
+            await bot.revoke_chat_invite_link(
+                int(invite["chat_id"]),
+                str(invite["invite_link"]),
+            )
+            revoked += 1
+        except TelegramError:
+            pass
+        finally:
+            await deactivate_invite(owner_id, str(invite["invite_link"]))
+    return revoked
+
+
+async def enforce_user_access(bot, owner_id: int, user_id: int, reason: str) -> dict:
+    """Remove a user from every connected chat and revoke issued links."""
+    report = {"removed": 0, "remove_failed": 0, "invites_revoked": 0}
+    report["invites_revoked"] = await revoke_user_invites(bot, owner_id, user_id)
+    for channel in await get_channels(owner_id):
+        chat_id = int(channel["chat_id"])
+        if await _is_admin(bot, chat_id, user_id) or await is_whitelisted(owner_id, chat_id, user_id):
+            await log_guard_event(owner_id, chat_id, user_id, "admin_skipped", reason)
+            continue
+        try:
+            await _remove_member(bot, chat_id, user_id)
+            report["removed"] += 1
+            await log_guard_event(owner_id, chat_id, user_id, "removed", reason)
+        except TelegramError as exc:
+            report["remove_failed"] += 1
+            await log_guard_event(owner_id, chat_id, user_id, "remove_failed", str(exc))
+    return report
+
+
+async def force_sync_known_users(bot, owner_id: int) -> dict:
+    """Synchronize users known to this clone bot.
+
+    Telegram's Bot API cannot enumerate every group member. This safely checks
+    all users recorded by the bot and enforces access for expired/banned users.
+    New unknown joins remain protected by ChatMember updates.
+    """
+    db = get_database()
+    now = datetime.now(timezone.utc)
+    users = await db["seller_users"].find({"owner_id": int(owner_id)}).to_list(length=100000)
+    report = {
+        "users_checked": 0,
+        "expired_or_inactive": 0,
+        "banned": 0,
+        "removed": 0,
+        "remove_failed": 0,
+        "invites_revoked": 0,
+    }
+    for user in users:
+        user_id = int(user["user_id"])
+        report["users_checked"] += 1
+        sub = await get_subscription(owner_id, user_id)
+        expiry = _aware((sub or {}).get("expiry_date"))
+        banned = bool(user.get("banned"))
+        inactive = not (sub and sub.get("active") and expiry and expiry > now)
+        if not banned and not inactive:
+            continue
+        reason = "Banned user" if banned else "Expired or inactive subscription"
+        report["banned" if banned else "expired_or_inactive"] += 1
+        result = await enforce_user_access(bot, owner_id, user_id, reason)
+        for key in ("removed", "remove_failed", "invites_revoked"):
+            report[key] += result[key]
+    return report

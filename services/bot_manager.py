@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from typing import Dict, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from utils.timezone import format_local_datetime
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Conflict, InvalidToken, TelegramError
 from telegram.ext import Application, ApplicationHandlerStop, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -53,7 +55,9 @@ from handlers.content_protection import content_protection_handlers
 from database.content_protection import get_content_protection_settings
 
 from database.subscription_guard import save_invite, active_invites_for_user, deactivate_invite
-from services.subscription_guard import subscription_guard_chat_member, subscription_guard_new_members
+from services.subscription_guard import (
+    enforce_user_access, subscription_guard_chat_member, subscription_guard_new_members,
+)
 from handlers.subscription_guard import subscription_guard_handlers
 
 @dataclass
@@ -413,11 +417,11 @@ class SellerBotManager:
                 raise
 
     @staticmethod
-    def format_dt(value):
+    def format_dt(value, timezone_name="Asia/Kolkata"):
         if not value:
             return "-"
         try:
-            return value.astimezone(timezone.utc).strftime("%d-%m-%Y %I:%M:%S %p UTC")
+            return format_local_datetime(value, timezone_name, "%d-%m-%Y %I:%M:%S %p")
         except Exception:
             return str(value)
 
@@ -442,6 +446,9 @@ class SellerBotManager:
         if sub and expiry:
             sub["expiry_date"]=expiry
 
+        seller_settings=await get_seller_settings(owner)
+        timezone_name=seller_settings.get("timezone") or "Asia/Kolkata"
+
         text=(
             "👤 User Details\n\n"
             f"🆔 ID: {user.get('user_id')}\n"
@@ -449,9 +456,9 @@ class SellerBotManager:
             f"📝 Username: {username}\n"
             f"🚫 Banned: {'Yes' if user.get('banned') else 'No'}\n"
             f"📋 Reason: {user.get('ban_reason') or '-'}\n"
-            f"📅 Joined: {self.format_dt(user.get('joined_at'))}\n\n"
+            f"📅 Joined: {self.format_dt(user.get('joined_at'), timezone_name)}\n\n"
             f"💎 Plan: {(sub or {}).get('plan') or 'No Plan'}\n"
-            f"📅 Expiry: {self.format_dt((sub or {}).get('expiry_date'))}\n"
+            f"📅 Expiry: {self.format_dt((sub or {}).get('expiry_date'), timezone_name)}\n"
             f"📌 Status: {'Active' if active else 'No Subscription'}"
         )
         return text,user,sub
@@ -933,8 +940,10 @@ class SellerBotManager:
                     return value.astimezone(timezone.utc)
 
                 joined=aware_utc(user_record.get("joined_at"))
+                seller_settings=await get_seller_settings(owner)
+                timezone_name=seller_settings.get("timezone") or "Asia/Kolkata"
                 joined_text=(
-                    joined.strftime("%d %b %Y, %I:%M %p UTC")
+                    format_local_datetime(joined, timezone_name, "%d %b %Y, %I:%M %p")
                     if joined else "Unknown"
                 )
 
@@ -1001,11 +1010,11 @@ class SellerBotManager:
                         or sub.get("created_at")
                     )
                     start_text=(
-                        start.strftime("%d %b %Y, %I:%M %p UTC")
+                        format_local_datetime(start, timezone_name, "%d %b %Y, %I:%M %p")
                         if start else "Unknown"
                     )
-                    expiry_text=expiry.strftime(
-                        "%d %b %Y, %I:%M %p UTC"
+                    expiry_text=format_local_datetime(
+                        expiry, timezone_name, "%d %b %Y, %I:%M %p"
                     )
 
                     amount=sub.get("amount")
@@ -1030,7 +1039,7 @@ class SellerBotManager:
                         f"💎 Last Plan: {(sub or {}).get('plan') or '—'}",
                         f"💰 Amount: {(sub or {}).get('amount') or '—'}",
                         f"⏳ Duration: {(sub or {}).get('duration_text') or '—'}",
-                        f"📅 Expiry: {self.format_dt(expiry)}",
+                        f"📅 Expiry: {self.format_dt(expiry, timezone_name)}",
                     ])
 
                 await self.safe_query_message(
@@ -2046,6 +2055,7 @@ class SellerBotManager:
         if a.startswith("a_user_remove_"):
             user_id=int(a.replace("a_user_remove_",""))
             await remove_subscription(owner,user_id)
+            await enforce_user_access(context.bot, owner, user_id, "Subscription removed by admin")
             try:
                 await context.bot.send_message(
                     user_id,
@@ -2489,6 +2499,7 @@ class SellerBotManager:
             if context.user_data.get("wait_user_ban_reason"):
                 user_id=int(context.user_data["wait_user_ban_reason"])
                 await set_user_ban(owner,user_id,True,text)
+                await enforce_user_access(context.bot, owner, user_id, f"Banned by seller: {text}")
                 context.user_data.clear()
 
                 try:
