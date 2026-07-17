@@ -18,6 +18,7 @@ from database.payment_gateways import initialize_payment_gateway_indexes
 from database.seller_referrals import initialize_seller_referral_indexes
 from database.live_support import initialize_live_support_indexes
 from database.deleting_messages import initialize_deleting_message_indexes
+from database.performance import initialize_performance_indexes
 
 from handlers.start import start_command, start_callback_handler
 from handlers.help import help_handler, help_callback_handler
@@ -59,6 +60,7 @@ async def post_init(application: Application):
     await initialize_seller_referral_indexes()
     await initialize_live_support_indexes()
     await initialize_deleting_message_indexes()
+    await initialize_performance_indexes()
     configure_runtime(__import__("asyncio").get_running_loop(), application.bot)
 
     start_scheduler()
