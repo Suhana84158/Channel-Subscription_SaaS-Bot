@@ -29,6 +29,7 @@ from database.seller_referrals import seller_referral_stats
 from database.platform_features import get_policy
 from database.mongo import get_database
 from database.sellers import get_or_create_seller
+from utils.timezone_ui import timezone_guide, timezone_keyboard, timezone_from_key, normalize_timezone
 
 
 def main_seller_keyboard():
@@ -349,6 +350,34 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=selected_back(bot_id),
         ); return
 
+    if action.startswith("seller_tz_"):
+        parts = action.split("_")
+        if len(parts) < 4:
+            await q.answer("Invalid timezone selection.", show_alert=True)
+            return
+        bot_id = int(parts[2])
+        key = "_".join(parts[3:])
+        if key == "manual":
+            context.user_data.clear()
+            context.user_data.update({"seller_edit_field": "timezone", "selected_clone_bot_id": bot_id})
+            await q.edit_message_text(
+                timezone_guide((await get_seller_settings(owner_id)).get("timezone") or "Asia/Kolkata")
+                + "\n\nSend the timezone name now.",
+                reply_markup=selected_back(bot_id),
+            )
+            return
+        timezone_name = timezone_from_key(key)
+        if not timezone_name:
+            await q.answer("Invalid timezone selection.", show_alert=True)
+            return
+        await set_seller_setting(owner_id, "timezone", timezone_name)
+        context.user_data.clear()
+        await q.edit_message_text(
+            f"✅ Timezone updated!\n\nTimezone: {timezone_name}",
+            reply_markup=bot_settings_markup(bot_id),
+        )
+        return
+
     # Payment and bot-setting edit actions.
     setting_actions = {
         "seller_set_upi_id_": ("upi_id", "Send the UPI ID."),
@@ -356,7 +385,7 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "seller_set_bot_name_": ("bot_name", "Send the bot display name."),
         "seller_set_support_": ("support_username", "Send support @username or Telegram link."),
         "seller_set_currency_": ("currency", "Send currency code, for example INR."),
-        "seller_set_timezone_": ("timezone", "Send timezone, for example Asia/Kolkata."),
+        "seller_set_timezone_": ("timezone", "__TIMEZONE_PICKER__"),
         "seller_set_welcome_": ("welcome_message", "Send the new welcome message text."),
         "seller_set_reminder_": ("reminder_days", "Send reminder days, for example 1."),
         "seller_set_referral_days_": ("referral_reward_days", "Send referral reward days, for example 7."),
@@ -365,7 +394,15 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action.startswith(prefix):
             bot_id = int(action.rsplit("_", 1)[1])
             context.user_data.clear(); context.user_data.update({"seller_edit_field": field, "selected_clone_bot_id": bot_id})
-            await q.edit_message_text(prompt, reply_markup=selected_back(bot_id)); return
+            if field == "timezone":
+                settings = await get_seller_settings(owner_id)
+                await q.edit_message_text(
+                    timezone_guide(settings.get("timezone") or "Asia/Kolkata"),
+                    reply_markup=timezone_keyboard(f"seller_tz_{bot_id}_", f"seller_selected_settings_{bot_id}"),
+                )
+            else:
+                await q.edit_message_text(prompt, reply_markup=selected_back(bot_id))
+            return
 
     if action.startswith("seller_set_qr_"):
         bot_id=int(action.rsplit("_",1)[1]); context.user_data.clear(); context.user_data.update({"seller_waiting_qr":True,"selected_clone_bot_id":bot_id})
@@ -583,6 +620,15 @@ async def receive_seller_token(update: Update, context: ContextTypes.DEFAULT_TYP
     field = context.user_data.get("seller_edit_field")
     if field:
         value = text
+        if field == "timezone":
+            try:
+                value = normalize_timezone(text)
+            except Exception:
+                await update.effective_message.reply_text(
+                    "❌ Invalid timezone.\n\nUse the exact format, for example:\nAsia/Kolkata\n\nTimezone names are case-sensitive.",
+                    reply_markup=timezone_keyboard(f"seller_tz_{bot_id}_", f"seller_selected_settings_{bot_id}"),
+                )
+                return
         if field in {"reminder_days", "referral_reward_days"}:
             try:
                 value = max(0, int(text))

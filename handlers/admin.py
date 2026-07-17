@@ -37,6 +37,7 @@ from database.seller_data import (
 )
 from database.seller_bots import get_bot as get_seller_bot
 from services.bot_manager import bot_manager
+from utils.timezone_ui import timezone_guide, timezone_keyboard, timezone_from_key, normalize_timezone
 
 from services.channel_service import (
     revoke_channel_access,
@@ -690,16 +691,17 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if context.user_data.get("waiting_timezone"):
         try:
-            ZoneInfo(text)
+            timezone_name = normalize_timezone(text)
         except Exception:
             await update.message.reply_text(
-                "❌ Invalid timezone. Example: Asia/Kolkata"
+                "❌ Invalid timezone.\n\nUse the exact format, for example:\nAsia/Kolkata\n\nTimezone names are case-sensitive.",
+                reply_markup=timezone_keyboard("admin_tz_", "admin_settings"),
             )
             return
-        await set_setting("timezone", text)
+        await set_setting("timezone", timezone_name)
         context.user_data.clear()
         await update.message.reply_text(
-            f"✅ Timezone updated!\n\n{text}",
+            f"✅ Timezone updated!\n\n{timezone_name}",
             reply_markup=admin_keyboard(),
         )
         return
@@ -983,7 +985,7 @@ def admin_handlers():
         CommandHandler("removeadmin", remove_admin_command),
         CommandHandler("addchannel", add_channel_start),
         CommandHandler("removechannel", remove_channel_command),
-        CallbackQueryHandler(admin_buttons, pattern=r"^(admin_|user_|owner_su_|set_upi_)"),
+        CallbackQueryHandler(admin_buttons, pattern=r"^(admin_|user_|owner_su_|set_upi_|set_timezone$)"),
         MessageHandler(filters.FORWARDED, receive_channel_forward),
         MessageHandler(filters.TEXT & ~filters.COMMAND, receive_admin_text),
     ]
