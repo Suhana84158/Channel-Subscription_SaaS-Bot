@@ -226,6 +226,7 @@ async def save_support_template(owner_id: int, command: str, **values):
         "media_file_id",
         "buttons",
         "auto_delete_minutes",
+        "auto_delete_seconds",
     }
     clean = {key: value for key, value in values.items() if key in allowed}
     if "auto_delete_minutes" in clean:
@@ -233,6 +234,11 @@ async def save_support_template(owner_id: int, command: str, **values):
         if minutes < 0 or minutes > 10080:
             raise ValueError("Auto remove 0 se 10080 minutes ke beech rakho")
         clean["auto_delete_minutes"] = minutes
+    if "auto_delete_seconds" in clean:
+        seconds = int(clean["auto_delete_seconds"] or 0)
+        if seconds < 0 or seconds > 604800:
+            raise ValueError("Auto remove 0 seconds se 7 days ke beech rakho")
+        clean["auto_delete_seconds"] = seconds
 
     now = datetime.now(timezone.utc)
     clean["updated_at"] = now
@@ -247,6 +253,7 @@ async def save_support_template(owner_id: int, command: str, **values):
         "media_file_id": "",
         "buttons": [],
         "auto_delete_minutes": 0,
+        "auto_delete_seconds": 0,
         "created_at": now,
     }
     for key in clean:
