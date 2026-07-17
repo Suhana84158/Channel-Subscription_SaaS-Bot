@@ -469,8 +469,7 @@ class SellerBotManager:
 
         banned=bool(user.get("banned"))
         keyboard=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎁 Give Subscription",callback_data=f"a_user_give_{user_id}")],
-            [InlineKeyboardButton("⌛ Extend Subscription",callback_data=f"a_user_extend_{user_id}")],
+            [InlineKeyboardButton("🎁 Give / Extend Subscription",callback_data=f"a_user_manage_{user_id}")],
             [InlineKeyboardButton("❌ Remove Subscription",callback_data=f"a_user_remove_{user_id}")],
             [InlineKeyboardButton(
                 "✅ Unban User" if banned else "🚫 Ban User",
@@ -491,7 +490,7 @@ class SellerBotManager:
             )
             return
 
-        title="🎁 Choose plan to give" if mode=="give" else "⌛ Choose plan duration to extend"
+        title="🎁 Give / Extend Subscription\n\nChoose an existing plan or use a custom duration. Existing active validity will be preserved."
         kb=[]
 
         for plan in plans:
@@ -500,6 +499,7 @@ class SellerBotManager:
                 callback_data=f"a_user_apply_{mode}_{user_id}_{plan['plan_id']}",
             )])
 
+        kb.append([InlineKeyboardButton("⌨️ Custom Duration",callback_data=f"a_user_custom_{user_id}")])
         kb.append([InlineKeyboardButton("⬅ Back",callback_data=f"a_user_view_{user_id}")])
         await q.edit_message_text(title,reply_markup=InlineKeyboardMarkup(kb))
 
@@ -559,12 +559,18 @@ class SellerBotManager:
 
     @staticmethod
     def parse_duration(value:str)->int:
-        value=value.strip().lower(); n=int(value[:-1]); unit=value[-1]
+        value=value.strip().lower()
+        if value.endswith("mo"):
+            n=int(value[:-2])
+            if n<=0: raise ValueError("Duration must be positive")
+            return n*30*1440
+        n=int(value[:-1]); unit=value[-1]
         if n<=0: raise ValueError("Duration must be positive")
         if unit=="m": return n
         if unit=="h": return n*60
         if unit=="d": return n*1440
-        raise ValueError("Use m, h or d")
+        if unit=="y": return n*365*1440
+        raise ValueError("Use m, h, d, mo or y")
     @classmethod
     def parse_plan(cls,text:str):
         p=[x.strip() for x in text.split("|")]
@@ -742,7 +748,7 @@ class SellerBotManager:
             "📨 Pending Payments\n"
             "Open a screenshot and Approve or Reject it. Payment ID and user details remain visible after processing.\n\n"
             "👥 User Management\n"
-            "Search by User ID or @username. Give, extend or remove subscriptions, and ban/unban users.\n\n"
+            "Search by User ID or @username. Give/extend subscriptions using an existing plan or custom minutes, hours, days, months or years; remove subscriptions; and ban/unban users.\n\n"
             "💬 Welcome Message\n"
             "Edit text, media and buttons, then use Preview.\n"
             "Button format:\n"
@@ -2021,15 +2027,27 @@ class SellerBotManager:
             await self.show_user_details(q,owner,int(a.replace("a_user_view_","")))
             return
 
-        if a.startswith("a_user_give_"):
+        if a.startswith("a_user_manage_"):
             await self.show_admin_plan_selector(
-                q,owner,int(a.replace("a_user_give_","")),"give"
+                q,owner,int(a.replace("a_user_manage_","")),"manage"
             )
             return
 
-        if a.startswith("a_user_extend_"):
-            await self.show_admin_plan_selector(
-                q,owner,int(a.replace("a_user_extend_","")),"extend"
+        if a.startswith("a_user_custom_"):
+            user_id=int(a.replace("a_user_custom_",""))
+            context.user_data.clear()
+            context.user_data["wait_user_custom_subscription"]=user_id
+            await q.edit_message_text(
+                "⌨️ Custom Subscription Duration\n\n"
+                "Send one duration:\n"
+                "• Minutes: 30m\n"
+                "• Hours: 12h\n"
+                "• Days: 7d\n"
+                "• Months: 3mo\n"
+                "• Years: 1y\n\n"
+                "1 month = 30 days and 1 year = 365 days.\n"
+                "If the user already has an active subscription, this duration will be added to the remaining time.",
+                reply_markup=self.back(f"a_user_view_{user_id}"),
             )
             return
 
@@ -2488,6 +2506,49 @@ class SellerBotManager:
                 except Exception as exc: await update.effective_message.reply_text(f"❌ {exc}"); return
                 await set_seller_setting(owner,"welcome_buttons",rows); context.user_data.clear()
                 await update.effective_message.reply_text("✅ Welcome buttons saved. Use 👀 Preview to check them.",reply_markup=self.welcome_buttons_menu()); return
+            if context.user_data.get("wait_user_custom_subscription"):
+                user_id=int(context.user_data["wait_user_custom_subscription"])
+                try:
+                    duration_text=text.strip().lower()
+                    duration_minutes=self.parse_duration(duration_text)
+                    current=await get_subscription(owner,user_id) or {}
+                    plan_name=current.get("plan") or "Custom Subscription"
+                    plan_cfg,_=await effective_plan(owner)
+                    active_now=await active_subscriptions(owner)
+                    already_active=any(int(x.get("user_id"))==user_id for x in active_now)
+                    sub_limit=int(plan_cfg.get("active_subscriber_limit",25))
+                    if not already_active and sub_limit>=0 and len(active_now)>=sub_limit:
+                        context.user_data.clear()
+                        await update.effective_message.reply_text(
+                            await plan_limit_warning(owner),
+                            reply_markup=self.limit_keyboard(f"a_user_view_{user_id}"),
+                        )
+                        return
+                    expiry=await activate_subscription(
+                        owner,user_id,plan_name,duration_minutes,
+                        amount=0,duration_text=duration_text,
+                    )
+                    delivery=await self.deliver_subscription_access(owner,user_id)
+                    context.user_data.clear()
+                    await update.effective_message.reply_text(
+                        "✅ Subscription given/extended successfully.\n\n"
+                        f"👤 User ID: {user_id}\n"
+                        f"⏳ Duration added: {duration_text}\n"
+                        f"📅 New expiry: {self.format_dt(expiry)}\n"
+                        f"🔗 Invite links sent: {delivery.get('sent',0)}\n"
+                        f"✅ Already joined: {delivery.get('already_member',0)}\n"
+                        f"⚠️ Failed: {delivery.get('failed',0)}",
+                        reply_markup=self.back(f"a_user_view_{user_id}"),
+                    )
+                except Exception as exc:
+                    await update.effective_message.reply_text(
+                        "❌ Invalid duration.\n\n"
+                        "Use: 30m, 12h, 7d, 3mo or 1y.\n"
+                        "m = minutes, h = hours, d = days, mo = months, y = years.\n\n"
+                        f"Error: {exc}"
+                    )
+                return
+
             if context.user_data.get("wait_user_search"):
                 query=text.strip()
                 user=None
