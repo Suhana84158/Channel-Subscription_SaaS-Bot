@@ -2,7 +2,6 @@ import asyncio
 import html
 import logging
 import os
-import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Optional
@@ -53,9 +52,6 @@ from handlers.deleting_messages import deleting_messages_handlers
 from services.protected_bot import ProtectedExtBot
 from handlers.content_protection import content_protection_handlers
 from database.content_protection import get_content_protection_settings
-from database.ai_assistant import get_ai_settings, set_ai_enabled
-from database.settings import get_setting_value
-from services.ai_help_assistant import answer_question_ultimate
 
 from database.subscription_guard import save_invite, active_invites_for_user, deactivate_invite
 from database.staff import active_staff, list_staff, promote_staff, remove_staff, set_staff_status, log_staff_action
@@ -67,7 +63,18 @@ class RunningSellerBot:
     owner_id:int; bot_id:int; application:Application
 
 class SellerBotManager:
-    def __init__(self): self._running:Dict[int,RunningSellerBot]={}; self._lock=asyncio.Lock()
+    def __init__(self):
+        self._running: Dict[int, RunningSellerBot] = {}
+        self._bot_locks: Dict[int, asyncio.Lock] = {}
+        self._restore_semaphore = asyncio.Semaphore(3)
+
+    def _lock_for(self, bot_id: int) -> asyncio.Lock:
+        bot_id = int(bot_id)
+        lock = self._bot_locks.get(bot_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._bot_locks[bot_id] = lock
+        return lock
     def is_running(self,owner_id:int)->bool:return owner_id in self._running
     def get_running(self,owner_id:int):
         owner_id=int(owner_id)
@@ -98,7 +105,6 @@ class SellerBotManager:
             [InlineKeyboardButton("🗓 Scheduled", callback_data="a_broadcast_schedule"), InlineKeyboardButton("🎟 Coupons", callback_data="a_coupons")],
             [InlineKeyboardButton("🔁 Retry Failed", callback_data="a_retry_failed"), InlineKeyboardButton("🤝 Seller Referral", callback_data="a_seller_referral")],
             [InlineKeyboardButton("📜 Terms & Policy", callback_data="a_terms")],
-            [InlineKeyboardButton("🤖 AI Help Assistant", callback_data="a_ai_help")],
             [InlineKeyboardButton("🆘 Help & Commands", callback_data="a_help")],
         ])
 
@@ -786,45 +792,6 @@ class SellerBotManager:
             "See users, plans, channels, pending payments and revenue."
         )
         await update.effective_message.reply_text(admin_text)
-
-    async def ai_help_command(self, update:Update, context:ContextTypes.DEFAULT_TYPE):
-        if not await self.auth(update, context):
-            await update.effective_message.reply_text("❌ This command is available only to the seller and authorized staff.")
-            return
-
-        owner = self.owner(context)
-        settings = await get_ai_settings(owner)
-        if not settings.get("enabled"):
-            await update.effective_message.reply_text(
-                "⚠️ AI Help Assistant is currently disabled.\n\n"
-                "Enable it from:\n"
-                "Admin Panel → AI Help Assistant"
-            )
-            return
-
-        message_text = update.effective_message.text or ""
-        question = re.sub(r"^/(?i:ai)(?:@\w+)?\s*", "", message_text, count=1).strip()
-        if not question:
-            await update.effective_message.reply_text(
-                "🤖 AI Help Assistant\n\n"
-                "Write your question after the command.\n\n"
-                "Example:\n"
-                "/ai My group invite link is not working.\n\n"
-                "You can write in English or Hindi."
-            )
-            return
-
-        support_username = await get_setting_value("support_username", "")
-        response, escalated = await answer_question_ultimate(owner, update.effective_user.id, question, support_username)
-        keyboard = None
-        if escalated and support_username:
-            username = str(support_username).strip()
-            if username.startswith("https://t.me/"):
-                url = username
-            else:
-                url = f"https://t.me/{username.lstrip('@')}"
-            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Contact Owner Support", url=url)]])
-        await update.effective_message.reply_text(response, reply_markup=keyboard)
 
     async def admin(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         if not await self.auth(update,context): await update.effective_message.reply_text("❌ Not authorized"); return
@@ -2060,74 +2027,6 @@ class SellerBotManager:
                 ]),
                 disable_web_page_preview=True,
             ); return
-        if a=="a_ai_help":
-            ai_settings = await get_ai_settings(owner)
-            enabled = bool(ai_settings.get("enabled"))
-            status = "🟢 Enabled" if enabled else "🔴 Disabled"
-            toggle_text = "🔴 Disable" if enabled else "🟢 Enable"
-            await q.edit_message_text(
-                "🤖 AI Help Assistant\n\n"
-                "AI Help Assistant can answer questions about every feature of your Subscription SaaS Bot.\n\n"
-                "It understands both English and Hindi.\n\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                "📌 How to Use\n\n"
-                "Use the command below anywhere inside your Clone Bot:\n\n"
-                "/ai Your question here\n\n"
-                "Examples:\n\n"
-                "/ai How do I create a subscription plan?\n\n"
-                "/ai My group invite link is not working.\n\n"
-                "/ai How do I enable Live Support?\n\n"
-                "/ai Broadcast is failing.\n\n"
-                "/ai My payment QR is not showing.\n\n"
-                "/ai Subscription Guard removed my users.\n\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                "🌐 Supported Languages\n\n"
-                "✅ English\n"
-                "✅ Hindi\n\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                f"Status: {status}",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(toggle_text, callback_data="a_ai_toggle")],
-                    [InlineKeyboardButton("⬅ Back", callback_data="a_home")],
-                ]),
-            )
-            return
-        if a=="a_ai_toggle":
-            ai_settings = await get_ai_settings(owner)
-            await set_ai_enabled(owner, not bool(ai_settings.get("enabled")))
-            q.data = "a_ai_help"
-            ai_settings = await get_ai_settings(owner)
-            enabled = bool(ai_settings.get("enabled"))
-            status = "🟢 Enabled" if enabled else "🔴 Disabled"
-            toggle_text = "🔴 Disable" if enabled else "🟢 Enable"
-            await q.edit_message_text(
-                "🤖 AI Help Assistant\n\n"
-                "AI Help Assistant can answer questions about every feature of your Subscription SaaS Bot.\n\n"
-                "It understands both English and Hindi.\n\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                "📌 How to Use\n\n"
-                "Use the command below anywhere inside your Clone Bot:\n\n"
-                "/ai Your question here\n\n"
-                "Examples:\n\n"
-                "/ai How do I create a subscription plan?\n\n"
-                "/ai My group invite link is not working.\n\n"
-                "/ai How do I enable Live Support?\n\n"
-                "/ai Broadcast is failing.\n\n"
-                "/ai My payment QR is not showing.\n\n"
-                "/ai Subscription Guard removed my users.\n\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                "🌐 Supported Languages\n\n"
-                "✅ English\n"
-                "✅ Hindi\n\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                f"Status: {status}",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(toggle_text, callback_data="a_ai_toggle")],
-                    [InlineKeyboardButton("⬅ Back", callback_data="a_home")],
-                ]),
-            )
-            return
-
         if a=="a_help":
             await q.edit_message_text(
                 "🆘 Clone Bot Admin Help & Commands\n\n"
@@ -3168,17 +3067,28 @@ class SellerBotManager:
             except Exception:
                 pass
 
-    def build_app(self,token,data_owner_id,seller_account_id):
+    async def clone_error_handler(self, update, context):
+        bot_id = context.application.bot_data.get("seller_bot_id")
+        owner_id = context.application.bot_data.get("seller_owner_id")
+        logger.error(
+            "Unhandled clone bot update error bot_id=%s owner_id=%s",
+            bot_id,
+            owner_id,
+            exc_info=(type(context.error), context.error, context.error.__traceback__),
+        )
+
+    def build_app(self,token,data_owner_id,seller_account_id,bot_id=None):
         protected_bot=ProtectedExtBot(token=token,owner_id=int(data_owner_id))
         app=Application.builder().bot(protected_bot).build()
         app.bot_data["seller_owner_id"]=int(data_owner_id)
         app.bot_data["seller_account_id"]=int(seller_account_id)
+        app.bot_data["seller_bot_id"]=int(bot_id or 0)
+        app.add_error_handler(self.clone_error_handler)
         app.add_handler(CommandHandler("start",self.child_start))
         app.add_handler(CommandHandler("help",self.help_command))
         app.add_handler(CommandHandler("admin",self.admin))
         app.add_handler(CommandHandler("connectgroup",self.connect_group_command))
         app.add_handler(CommandHandler("connectsupport",self.connect_support_command))
-        app.add_handler(MessageHandler(filters.Regex(r"^/(?i:ai)(?:@\w+)?(?:\s+|$)"), self.ai_help_command), group=-8)
         app.add_handler(MessageHandler(filters.COMMAND,self.support_template_command_handler),group=9)
         app.add_handler(
             CommandHandler(
@@ -3208,74 +3118,149 @@ class SellerBotManager:
         if app.job_queue: app.job_queue.run_repeating(self.expiry_job,interval=60,first=30,name=f"seller_expiry_{data_owner_id}")
         return app
 
-    async def start_bot(self,bot_id:int)->bool:
-        bot_id=int(bot_id)
-        async with self._lock:
-            if bot_id in self._running:return True
-            record=await get_bot_by_bot_id(bot_id)
+    async def start_bot(self, bot_id: int) -> bool:
+        bot_id = int(bot_id)
+        async with self._lock_for(bot_id):
+            if bot_id in self._running:
+                running = self._running[bot_id]
+                if running.application.running and (
+                    not running.application.updater or running.application.updater.running
+                ):
+                    return True
+                self._running.pop(bot_id, None)
+
+            record = await get_bot_by_bot_id(bot_id)
             if not record:
-                record=await get_bot(bot_id)
-            if not record or not record.get("active"):return False
-            bot_id=int(record["bot_id"])
-            if bot_id in self._running:return True
-            token=await get_decrypted_bot_token(bot_id)
-            if not token:
-                await set_runtime_status(bot_id,"token_missing","Missing encrypted token")
+                record = await get_bot(bot_id)
+            if not record or not record.get("active"):
                 return False
-            app:Optional[Application]=None
-            data_owner_id=int(record.get("data_owner_id") or record["owner_id"])
-            seller_account_id=int(record["owner_id"])
+
+            bot_id = int(record["bot_id"])
+            token = await get_decrypted_bot_token(bot_id)
+            if not token:
+                await set_runtime_status(bot_id, "token_missing", "Missing encrypted token")
+                return False
+
+            app: Optional[Application] = None
+            data_owner_id = int(record.get("data_owner_id") or record["owner_id"])
+            seller_account_id = int(record["owner_id"])
             try:
-                await ensure_seller_defaults(data_owner_id,record.get("bot_name","Subscription Bot"))
-                app=self.build_app(token,data_owner_id,seller_account_id)
-                await app.initialize(); await app.start()
-                await app.updater.start_polling(drop_pending_updates=True,allowed_updates=Update.ALL_TYPES)
-                self._running[bot_id]=RunningSellerBot(data_owner_id,bot_id,app)
-                await set_runtime_status(bot_id,"running",None)
+                await asyncio.wait_for(
+                    ensure_seller_defaults(data_owner_id, record.get("bot_name", "Subscription Bot")),
+                    timeout=20,
+                )
+                app = self.build_app(token, data_owner_id, seller_account_id, bot_id=bot_id)
+                await asyncio.wait_for(app.initialize(), timeout=25)
+                await asyncio.wait_for(app.start(), timeout=15)
+                await asyncio.wait_for(
+                    app.updater.start_polling(
+                        drop_pending_updates=True,
+                        allowed_updates=Update.ALL_TYPES,
+                        bootstrap_retries=-1,
+                    ),
+                    timeout=35,
+                )
+                self._running[bot_id] = RunningSellerBot(data_owner_id, bot_id, app)
+                await set_runtime_status(bot_id, "running", None)
+                logger.info("Clone bot started bot_id=%s owner_id=%s", bot_id, data_owner_id)
                 return True
             except Exception as exc:
-                logger.exception("Seller bot start failed bot_id=%s",bot_id)
-                await set_runtime_status(bot_id,"error",str(exc)[:500])
-                if app: await self._safe_shutdown(app)
+                logger.exception("Seller bot start failed bot_id=%s", bot_id)
+                try:
+                    await set_runtime_status(bot_id, "error", str(exc)[:500])
+                except Exception:
+                    logger.exception("Could not save clone bot failure status bot_id=%s", bot_id)
+                if app:
+                    await self._safe_shutdown(app)
                 return False
 
-    async def _safe_shutdown(self,app):
+    async def _safe_shutdown(self, app):
         try:
-            if app.updater and app.updater.running: await app.updater.stop()
-        except Exception: pass
+            if app.updater and app.updater.running:
+                await asyncio.wait_for(app.updater.stop(), timeout=15)
+        except Exception:
+            logger.debug("Clone updater stop failed", exc_info=True)
         try:
-            if app.running: await app.stop()
-        except Exception: pass
-        try: await app.shutdown()
-        except Exception: pass
+            if app.running:
+                await asyncio.wait_for(app.stop(), timeout=15)
+        except Exception:
+            logger.debug("Clone application stop failed", exc_info=True)
+        try:
+            await asyncio.wait_for(app.shutdown(), timeout=15)
+        except Exception:
+            logger.debug("Clone application shutdown failed", exc_info=True)
 
-    async def stop_bot(self,bot_id:int,runtime_status="paused"):
-        bot_id=int(bot_id)
-        async with self._lock:
-            r=self._running.pop(bot_id,None)
-            if r is None:
-                matched_id=next((rid for rid,item in self._running.items()
-                    if int(item.owner_id)==bot_id or int(item.application.bot_data.get("seller_account_id",-1))==bot_id),None)
+    async def stop_bot(self, bot_id: int, runtime_status="paused"):
+        bot_id = int(bot_id)
+        async with self._lock_for(bot_id):
+            running = self._running.pop(bot_id, None)
+            if running is None:
+                matched_id = next(
+                    (
+                        rid
+                        for rid, item in self._running.items()
+                        if int(item.owner_id) == bot_id
+                        or int(item.application.bot_data.get("seller_account_id", -1)) == bot_id
+                    ),
+                    None,
+                )
                 if matched_id is not None:
-                    bot_id=int(matched_id)
-                    r=self._running.pop(bot_id,None)
-            if r: await self._safe_shutdown(r.application)
-            await set_runtime_status(bot_id,runtime_status,None)
+                    bot_id = int(matched_id)
+                    running = self._running.pop(bot_id, None)
+            if running:
+                await self._safe_shutdown(running.application)
+            await set_runtime_status(bot_id, runtime_status, None)
             return True
 
-    async def restart_bot(self,bot_id):
-        await self.stop_bot(bot_id,"restarting")
+    async def restart_bot(self, bot_id):
+        await self.stop_bot(bot_id, "restarting")
         return await self.start_bot(bot_id)
 
+    async def _restore_one(self, bot_id: int) -> bool:
+        async with self._restore_semaphore:
+            return await self.start_bot(bot_id)
+
     async def restore_active_bots(self):
-        started=failed=0
-        for r in await get_all_active_bots():
-            if await self.start_bot(int(r["bot_id"])): started+=1
-            else: failed+=1
-        return {"started":started,"failed":failed}
+        records = await get_all_active_bots()
+        if not records:
+            return {"started": 0, "failed": 0}
+        results = await asyncio.gather(
+            *(self._restore_one(int(record["bot_id"])) for record in records),
+            return_exceptions=True,
+        )
+        started = sum(result is True for result in results)
+        failed = len(results) - started
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error("Clone bot restore task failed", exc_info=(type(result), result, result.__traceback__))
+        return {"started": started, "failed": failed}
+
+    async def recover_dead_bots(self):
+        """Restart clone bots whose Application or polling updater stopped."""
+        dead_ids = []
+        for bot_id, running in list(self._running.items()):
+            app = running.application
+            updater_running = bool(app.updater and app.updater.running)
+            if not app.running or not updater_running:
+                dead_ids.append(int(bot_id))
+
+        if not dead_ids:
+            return {"checked": len(self._running), "restarted": 0}
+
+        logger.warning("Clone bot watchdog found stopped runtimes: %s", dead_ids)
+        results = await asyncio.gather(
+            *(self.restart_bot(bot_id) for bot_id in dead_ids),
+            return_exceptions=True,
+        )
+        restarted = sum(result is True for result in results)
+        return {"checked": len(self._running), "restarted": restarted}
 
     async def shutdown_all(self):
-        for bot_id in list(self._running):
-            await self.stop_bot(bot_id,"service_stopped")
+        bot_ids = list(self._running)
+        if bot_ids:
+            await asyncio.gather(
+                *(self.stop_bot(bot_id, "service_stopped") for bot_id in bot_ids),
+                return_exceptions=True,
+            )
 
 bot_manager=SellerBotManager()
