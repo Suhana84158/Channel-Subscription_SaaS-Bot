@@ -411,3 +411,109 @@ def answer_question(question: str, support_username: str) -> tuple[str, bool]:
 
     # Unclear questions receive a clarification instead of immediately escalating.
     return (HI_CLARIFY if hindi else EN_CLARIFY), False
+
+# ---------------- AI Help Assistant Ultimate: safe v3 + v4 features ----------------
+import asyncio
+from database.ai_assistant import (
+    get_session, record_ai_event, save_unanswered_question, update_session,
+)
+from database.seller_data import (
+    get_channels, get_plans, get_seller_settings, pending_payments, stats,
+)
+from database.seller_bots import get_bot_by_data_owner_id
+
+ERROR_PATTERNS = (
+    (("chat not found", "bad request: chat not found"), "Chat Not Found", "Check that the chat ID is correct, the bot is still inside the group/channel, and the ID starts with -100 for supergroups/channels."),
+    (("bot is not a member", "not enough rights", "administrator rights"), "Missing Admin Permission", "Promote the clone bot as administrator and enable Invite Users, Ban Users, and Delete Messages permissions as required."),
+    (("forbidden", "bot was blocked", "user is deactivated"), "Telegram Forbidden Error", "The user blocked the bot, left Telegram, or the bot cannot access that chat. That delivery cannot be forced."),
+    (("flood control", "retry after", "too many requests"), "Telegram Rate Limit", "Wait for the Retry After time. Use queued sending for large broadcasts and avoid repeated retries."),
+    (("bad auth", "authentication failed", "atlaserror"), "MongoDB Authentication Error", "Verify the MongoDB username, password, database access, network access, and URL-encode special characters in the password."),
+    (("timed out", "timeout", "network error"), "Temporary Network Error", "Retry after a short delay and check Render status, Telegram connectivity, and database connectivity."),
+    (("invite_hash_expired", "invite link expired", "invite link is revoked"), "Expired Invite Link", "Generate a new invite link or use Resend Invite Links for active subscribers."),
+)
+
+
+def _detect_error_guide(question: str, hindi: bool):
+    q = _normalize(question)
+    for patterns, title, solution in ERROR_PATTERNS:
+        if any(p in q for p in patterns):
+            if hindi:
+                return f"🧾 Error Analysis: {title}\n\nPossible cause mil gaya.\n\nSolution:\n{solution}\n\nError text dobara check karke test karein."
+            return f"🧾 Error Analysis: {title}\n\nPossible cause detected.\n\nSolution:\n{solution}\n\nTest again after applying these checks."
+    return None
+
+
+async def _bot_doctor(owner_id: int, hindi: bool) -> str:
+    settings, channels, plans, pending, summary, bot_record = await asyncio.gather(
+        get_seller_settings(owner_id), get_channels(owner_id), get_plans(owner_id, True),
+        pending_payments(owner_id), stats(owner_id), get_bot_by_data_owner_id(owner_id),
+    )
+    checks = []
+    checks.append((bool(bot_record and bot_record.get("active", True)), "Clone Bot record is active", "Clone Bot record inactive"))
+    checks.append((bool(channels), f"{len(channels)} channel/group connected", "No channel or group connected"))
+    checks.append((bool(plans), f"{len(plans)} active subscription plan(s)", "No active subscription plan"))
+    checks.append((bool(settings.get("upi_id") or settings.get("upi_qr_file_id")), "Payment details configured", "UPI ID or QR is missing"))
+    checks.append((bool(settings.get("timezone")), f"Timezone: {settings.get('timezone')}", "Timezone is not configured"))
+    checks.append((bool(settings.get("support_username")), "Seller support username configured", "Seller support username is missing"))
+    score = round(sum(1 for ok, _, _ in checks if ok) / len(checks) * 100)
+    lines = [f"🩺 Bot Health Report\n\nHealth Score: {score}/100\n"]
+    for ok, good, bad in checks:
+        lines.append(("✅ " + good) if ok else ("⚠️ " + bad))
+    lines.append(f"\n👥 Users: {summary.get('users', 0)}")
+    lines.append(f"⏳ Pending payments: {len(pending)}")
+    if hindi:
+        lines.append("\nRecommended: Jo items ⚠️ dikh rahe hain unko Admin Panel me set karein. Telegram admin permissions bot database se verify nahi ki ja sakti; unhe group/channel ke andar manually check karein.")
+    else:
+        lines.append("\nRecommended: Configure every item marked ⚠️. Telegram admin permissions cannot be fully verified from stored settings, so check them manually inside the group/channel.")
+    return "\n".join(lines)
+
+
+async def answer_question_ultimate(owner_id: int, user_id: int, question: str, support_username: str) -> tuple[str, bool]:
+    raw = (question or "").strip()
+    query = _normalize(raw)
+    hindi = looks_hindi(raw)
+    language = "hi" if hindi else "en"
+    support = _support_name(support_username)
+
+    if any(p in query for p in ("check my bot", "bot health", "health check", "mera bot check", "bot ko check", "diagnose my bot")):
+        response = await _bot_doctor(owner_id, hindi)
+        await record_ai_event(owner_id, user_id, raw, "bot_doctor", "solved", language)
+        await update_session(owner_id, user_id, last_topic="bot_doctor", unresolved_count=0)
+        return response, False
+
+    error_response = _detect_error_guide(raw, hindi)
+    if error_response:
+        await record_ai_event(owner_id, user_id, raw, "error_analyzer", "solved", language)
+        await update_session(owner_id, user_id, last_topic="error_analyzer", unresolved_count=0)
+        return error_response, False
+
+    if not query or _is_generic_help(query):
+        await record_ai_event(owner_id, user_id, raw, "clarification", "clarify", language)
+        return (HI_CLARIFY if hindi else EN_CLARIFY), False
+
+    scored = sorted(((_token_score(query, guide), guide) for guide in GUIDES), key=lambda item: item[0], reverse=True)
+    best_score, best_guide = scored[0]
+    session = await get_session(owner_id, user_id)
+
+    if best_score >= 0.43:
+        topic = best_guide["title_en"]
+        response = best_guide["hi" if hindi else "en"]
+        await record_ai_event(owner_id, user_id, raw, topic, "solved", language)
+        await update_session(owner_id, user_id, last_topic=topic, unresolved_count=0)
+        return response, False
+
+    failure = _is_failure_followup(query)
+    unresolved_count = int(session.get("unresolved_count", 0)) + 1
+    await update_session(owner_id, user_id, unresolved_count=unresolved_count, last_question=raw)
+    await save_unanswered_question(owner_id, user_id, raw, query)
+
+    if failure or unresolved_count >= 2:
+        template = HI_ESCALATION if hindi else EN_ESCALATION
+        await record_ai_event(owner_id, user_id, raw, "unknown", "escalated", language)
+        await update_session(owner_id, user_id, unresolved_count=0)
+        return template.format(support=support), True
+
+    await record_ai_event(owner_id, user_id, raw, "unknown", "clarify", language)
+    if hindi:
+        return "🤖 Main question ko poori tarah identify nahi kar saka.\n\nFeature ka naam aur exact problem likhein. Error ho to exact error text paste karein.\n\nExamples:\n/ai Group kaise add kare?\n/ai Check my bot\n/ai Bad Request: chat not found", False
+    return "🤖 I could not identify the exact issue yet.\n\nInclude the feature name and describe what is failing. Paste the exact error text when available.\n\nExamples:\n/ai How do I add a group?\n/ai Check my bot\n/ai Bad Request: chat not found", False

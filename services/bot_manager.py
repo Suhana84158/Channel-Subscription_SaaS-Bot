@@ -55,7 +55,7 @@ from handlers.content_protection import content_protection_handlers
 from database.content_protection import get_content_protection_settings
 from database.ai_assistant import get_ai_settings, set_ai_enabled
 from database.settings import get_setting_value
-from services.ai_help_assistant import answer_question
+from services.ai_help_assistant import answer_question_ultimate
 
 from database.subscription_guard import save_invite, active_invites_for_user, deactivate_invite
 from database.staff import active_staff, list_staff, promote_staff, remove_staff, set_staff_status, log_staff_action
@@ -815,7 +815,7 @@ class SellerBotManager:
             return
 
         support_username = await get_setting_value("support_username", "")
-        response, escalated = answer_question(question, support_username)
+        response, escalated = await answer_question_ultimate(owner, update.effective_user.id, question, support_username)
         keyboard = None
         if escalated and support_username:
             username = str(support_username).strip()
