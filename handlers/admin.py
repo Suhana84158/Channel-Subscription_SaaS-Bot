@@ -82,14 +82,8 @@ def user_action_keyboard(user_id: int, banned: bool):
     keyboard = [
         [
             InlineKeyboardButton(
-                "🎁 Give Subscription",
-                callback_data=f"user_give_sub_{user_id}",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⏳ Extend Subscription",
-                callback_data=f"user_extend_sub_{user_id}",
+                "🎁 Give / Extend Subscription",
+                callback_data=f"user_manage_sub_{user_id}",
             )
         ],
         [
@@ -134,10 +128,16 @@ def parse_plan_time(time_text: str):
     if time_text.endswith("h"):
         return int(time_text[:-1]) * 60, "hours"
 
+    if time_text.endswith("mo"):
+        return int(time_text[:-2]) * 30 * 1440, "months"
+
+    if time_text.endswith("y"):
+        return int(time_text[:-1]) * 365 * 1440, "years"
+
     if time_text.endswith("d"):
         return int(time_text[:-1]) * 1440, "days"
 
-    raise ValueError("Invalid time format")
+    raise ValueError("Invalid time format. Use m, h, d, mo or y")
 
 
 def parse_plans(text: str):
@@ -199,8 +199,7 @@ async def show_user_details(query, user):
 def seller_user_action_keyboard(owner_id:int,user_id:int,banned:bool):
     prefix=f"owner_su_{int(owner_id)}_{int(user_id)}"
     rows=[
-        [InlineKeyboardButton("🎁 Give Subscription",callback_data=prefix+"_give")],
-        [InlineKeyboardButton("⏳ Extend Subscription",callback_data=prefix+"_extend")],
+        [InlineKeyboardButton("🎁 Give / Extend Subscription",callback_data=prefix+"_manage")],
         [InlineKeyboardButton("❌ Remove Subscription",callback_data=prefix+"_remove")],
     ]
     rows.append([InlineKeyboardButton("✅ Unban User" if banned else "🚫 Ban User",callback_data=prefix+("_unban" if banned else "_ban"))])
@@ -292,31 +291,72 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = await get_user(user_id)
         await show_user_details(query, user)
 
-    elif query.data.startswith("user_give_sub_"):
-        user_id = int(query.data.replace("user_give_sub_", ""))
-
+    elif query.data.startswith("user_manage_sub_"):
+        user_id = int(query.data.replace("user_manage_sub_", ""))
         context.user_data.clear()
-        context.user_data["give_sub_user"] = user_id
+        context.user_data["manage_sub_user"] = user_id
 
+        channels = await get_all_channels()
+        plan_map = {}
+        rows = []
+        counter = 0
+        for channel in channels:
+            for plan in channel.get("plans", []):
+                counter += 1
+                key = f"p{counter}"
+                plan_map[key] = {
+                    "name": f"{channel.get('title','Plan')} - {plan.get('duration_text','')}",
+                    "duration_minutes": int(plan.get("duration_minutes", 0)),
+                    "duration_text": plan.get("duration_text", ""),
+                }
+                rows.append([InlineKeyboardButton(
+                    plan_map[key]["name"],
+                    callback_data=f"user_apply_plan_{user_id}_{key}",
+                )])
+        context.user_data["manage_sub_plans"] = plan_map
+        rows.append([InlineKeyboardButton("⌨️ Custom Duration", callback_data=f"user_custom_sub_{user_id}")])
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data="admin_users")])
         await query.edit_message_text(
-            "🎁 Give Subscription\n\n"
-            "Send duration.\n\n"
-            "Examples:\n"
-            "1m\n30m\n1h\n1d\n30d\n90d\n365d",
-            reply_markup=back_keyboard(),
+            "🎁 Give / Extend Subscription\n\n"
+            "Select an existing plan or choose Custom Duration.\n\n"
+            "If the user already has an active subscription, the new duration is added to the remaining validity.",
+            reply_markup=InlineKeyboardMarkup(rows),
         )
 
-    elif query.data.startswith("user_extend_sub_"):
-        user_id = int(query.data.replace("user_extend_sub_", ""))
-
+    elif query.data.startswith("user_apply_plan_"):
+        _, _, _, user_id_text, key = query.data.split("_", 4)
+        user_id = int(user_id_text)
+        plan = (context.user_data.get("manage_sub_plans") or {}).get(key)
+        if not plan:
+            await query.answer("Plan selection expired. Open User Management again.", show_alert=True)
+            return
+        current = await get_subscription(user_id)
+        if current and current.get("active"):
+            expiry = await renew_subscription(user_id=user_id, duration_minutes=plan["duration_minutes"])
+        else:
+            expiry = await activate_subscription(
+                user_id=user_id,
+                plan_name=plan["name"],
+                duration_minutes=plan["duration_minutes"],
+            )
+        await grant_channel_access(user_id)
         context.user_data.clear()
-        context.user_data["extend_sub_user"] = user_id
+        user = await get_user(user_id)
+        await show_user_details(query, user)
 
+    elif query.data.startswith("user_custom_sub_"):
+        user_id = int(query.data.replace("user_custom_sub_", ""))
+        context.user_data.clear()
+        context.user_data["manage_sub_custom_user"] = user_id
         await query.edit_message_text(
-            "⏳ Extend Subscription\n\n"
-            "Send duration.\n\n"
-            "Examples:\n"
-            "1m\n30m\n1h\n1d\n30d\n90d\n365d",
+            "⌨️ Custom Subscription Duration\n\n"
+            "Send duration in one of these formats:\n"
+            "• Minutes: 30m\n"
+            "• Hours: 12h\n"
+            "• Days: 7d\n"
+            "• Months: 3mo\n"
+            "• Years: 1y\n\n"
+            "Note: 1 month = 30 days and 1 year = 365 days.",
             reply_markup=back_keyboard(),
         )
 
@@ -342,11 +382,14 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action=="view":
             await show_seller_user_details(query,seller_owner_id,user)
             return
-        if action in {"give","extend"}:
+        if action=="manage":
             context.user_data.clear()
-            context.user_data["owner_seller_sub_action"]={"owner_id":seller_owner_id,"user_id":user_id,"action":action}
+            context.user_data["owner_seller_sub_action"]={"owner_id":seller_owner_id,"user_id":user_id,"action":"manage"}
             await query.edit_message_text(
-                ("🎁 Give" if action=="give" else "⏳ Extend")+" Clone Bot Subscription\n\nSend duration, for example: 30m, 1h, 1d, 30d.",
+                "🎁 Give / Extend Clone Bot Subscription\n\n"
+                "Send a custom duration:\n"
+                "30m, 12h, 7d, 3mo or 1y.\n\n"
+                "Existing active validity will be preserved and the new duration will be added.",
                 reply_markup=back_keyboard(),
             )
             return
@@ -761,42 +804,37 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text(f"❌ Could not update subscription.\n\nError: {exc}")
         return
 
-    if context.user_data.get("give_sub_user") or context.user_data.get("extend_sub_user"):
-        duration_text = text.lower()
+    if context.user_data.get("manage_sub_custom_user"):
+        duration_text = text.lower().strip()
+        user_id = int(context.user_data["manage_sub_custom_user"])
         try:
             duration_minutes, _ = parse_plan_time(duration_text)
-            duration_days = duration_minutes // 1440 if duration_minutes % 1440 == 0 else 0
-
-            if context.user_data.get("give_sub_user"):
-                user_id = context.user_data.get("give_sub_user")
+            current = await get_subscription(user_id)
+            if current and current.get("active"):
+                expiry = await renew_subscription(user_id=user_id, duration_minutes=duration_minutes)
+                action_text = "extended"
+            else:
                 expiry = await activate_subscription(
                     user_id=user_id,
-                    plan_name="Admin Gift",
-                    duration_days=duration_days,
+                    plan_name="Custom Subscription",
                     duration_minutes=duration_minutes,
                 )
                 action_text = "given"
-            else:
-                user_id = context.user_data.get("extend_sub_user")
-                expiry = await renew_subscription(
-                    user_id=user_id,
-                    duration_days=duration_days,
-                    duration_minutes=duration_minutes,
-                )
-                action_text = "extended"
 
             await grant_channel_access(user_id)
             context.user_data.clear()
             await update.message.reply_text(
                 f"✅ Subscription {action_text} successfully!\n\n"
                 f"👤 User ID: {user_id}\n"
-                f"⏳ Duration: {duration_text}\n"
-                f"📅 Expiry: {format_time(expiry)}"
+                f"⏳ Duration added: {duration_text}\n"
+                f"📅 New expiry: {format_time(expiry)}",
+                reply_markup=back_keyboard(),
             )
         except Exception as e:
             await update.message.reply_text(
-                "❌ Invalid duration or error.\n\n"
-                "Use format like: 1m, 30m, 1h, 1d, 30d\n\n"
+                "❌ Invalid duration.\n\n"
+                "Use: 30m, 12h, 7d, 3mo or 1y.\n"
+                "m = minutes, h = hours, d = days, mo = months, y = years.\n\n"
                 f"Error: {e}"
             )
         return
