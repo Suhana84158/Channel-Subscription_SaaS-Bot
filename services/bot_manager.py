@@ -6,8 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
-from utils.timezone import format_local_datetime
+from utils.timezone_ui import timezone_guide, timezone_keyboard, timezone_from_key, normalize_timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Conflict, InvalidToken, TelegramError
@@ -55,9 +54,7 @@ from handlers.content_protection import content_protection_handlers
 from database.content_protection import get_content_protection_settings
 
 from database.subscription_guard import save_invite, active_invites_for_user, deactivate_invite
-from services.subscription_guard import (
-    enforce_user_access, subscription_guard_chat_member, subscription_guard_new_members,
-)
+from services.subscription_guard import subscription_guard_chat_member, subscription_guard_new_members
 from handlers.subscription_guard import subscription_guard_handlers
 
 @dataclass
@@ -417,11 +414,11 @@ class SellerBotManager:
                 raise
 
     @staticmethod
-    def format_dt(value, timezone_name="Asia/Kolkata"):
+    def format_dt(value):
         if not value:
             return "-"
         try:
-            return format_local_datetime(value, timezone_name, "%d-%m-%Y %I:%M:%S %p")
+            return value.astimezone(timezone.utc).strftime("%d-%m-%Y %I:%M:%S %p UTC")
         except Exception:
             return str(value)
 
@@ -446,9 +443,6 @@ class SellerBotManager:
         if sub and expiry:
             sub["expiry_date"]=expiry
 
-        seller_settings=await get_seller_settings(owner)
-        timezone_name=seller_settings.get("timezone") or "Asia/Kolkata"
-
         text=(
             "👤 User Details\n\n"
             f"🆔 ID: {user.get('user_id')}\n"
@@ -456,9 +450,9 @@ class SellerBotManager:
             f"📝 Username: {username}\n"
             f"🚫 Banned: {'Yes' if user.get('banned') else 'No'}\n"
             f"📋 Reason: {user.get('ban_reason') or '-'}\n"
-            f"📅 Joined: {self.format_dt(user.get('joined_at'), timezone_name)}\n\n"
+            f"📅 Joined: {self.format_dt(user.get('joined_at'))}\n\n"
             f"💎 Plan: {(sub or {}).get('plan') or 'No Plan'}\n"
-            f"📅 Expiry: {self.format_dt((sub or {}).get('expiry_date'), timezone_name)}\n"
+            f"📅 Expiry: {self.format_dt((sub or {}).get('expiry_date'))}\n"
             f"📌 Status: {'Active' if active else 'No Subscription'}"
         )
         return text,user,sub
@@ -940,10 +934,8 @@ class SellerBotManager:
                     return value.astimezone(timezone.utc)
 
                 joined=aware_utc(user_record.get("joined_at"))
-                seller_settings=await get_seller_settings(owner)
-                timezone_name=seller_settings.get("timezone") or "Asia/Kolkata"
                 joined_text=(
-                    format_local_datetime(joined, timezone_name, "%d %b %Y, %I:%M %p")
+                    joined.strftime("%d %b %Y, %I:%M %p UTC")
                     if joined else "Unknown"
                 )
 
@@ -1010,11 +1002,11 @@ class SellerBotManager:
                         or sub.get("created_at")
                     )
                     start_text=(
-                        format_local_datetime(start, timezone_name, "%d %b %Y, %I:%M %p")
+                        start.strftime("%d %b %Y, %I:%M %p UTC")
                         if start else "Unknown"
                     )
-                    expiry_text=format_local_datetime(
-                        expiry, timezone_name, "%d %b %Y, %I:%M %p"
+                    expiry_text=expiry.strftime(
+                        "%d %b %Y, %I:%M %p UTC"
                     )
 
                     amount=sub.get("amount")
@@ -1039,7 +1031,7 @@ class SellerBotManager:
                         f"💎 Last Plan: {(sub or {}).get('plan') or '—'}",
                         f"💰 Amount: {(sub or {}).get('amount') or '—'}",
                         f"⏳ Duration: {(sub or {}).get('duration_text') or '—'}",
-                        f"📅 Expiry: {self.format_dt(expiry, timezone_name)}",
+                        f"📅 Expiry: {self.format_dt(expiry)}",
                     ])
 
                 await self.safe_query_message(
@@ -1664,11 +1656,46 @@ class SellerBotManager:
             await self.send_support_template(context,owner,q.from_user.id,tpl,q.from_user)
             await q.answer("Preview sent",show_alert=True); return
 
+        if a.startswith("a_tz_"):
+            key = a.replace("a_tz_", "", 1)
+            if key == "manual":
+                context.user_data.clear()
+                context.user_data["wait_timezone"] = True
+                settings = await get_seller_settings(owner)
+                await q.edit_message_text(
+                    timezone_guide(settings.get("timezone") or "Asia/Kolkata")
+                    + "\n\nSend the timezone name now.",
+                    reply_markup=self.back("a_settings"),
+                )
+                return
+            timezone_name = timezone_from_key(key)
+            if not timezone_name:
+                await q.answer("Invalid timezone selection.", show_alert=True)
+                return
+            await set_seller_setting(owner, "timezone", timezone_name)
+            context.user_data.clear()
+            await q.edit_message_text(
+                f"✅ Timezone updated!\n\nTimezone: {timezone_name}",
+                reply_markup=self.settings_menu(),
+            )
+            return
+
         if a=="a_payment":
             s=await get_seller_settings(owner); await q.edit_message_text(f"💳 Payment Settings\n\nUPI Name: {s.get('upi_name') or 'Not Set'}\nUPI ID: {s.get('upi_id') or 'Not Set'}\nQR: {'Added' if s.get('upi_qr_file_id') else 'Not Added'}",reply_markup=self.payment_menu()); return
-        state={"a_set_upi_id":("wait_upi_id","Send UPI ID","a_payment"),"a_set_upi_name":("wait_upi_name","Send UPI Name","a_payment"),"a_set_bot_name":("wait_bot_name","Send Bot Name","a_settings"),"a_set_support":("wait_support","Send Support Username","a_settings"),"a_set_currency":("wait_currency","Send Currency","a_settings"),"a_set_timezone":("wait_timezone","Send Timezone","a_settings"),"a_set_reminder":("wait_reminder","Send Reminder Days","a_settings"),"a_set_referral_days":("wait_referral_days","Send free reward days per successful referral","a_settings")}
+        state={"a_set_upi_id":("wait_upi_id","Send UPI ID","a_payment"),"a_set_upi_name":("wait_upi_name","Send UPI Name","a_payment"),"a_set_bot_name":("wait_bot_name","Send Bot Name","a_settings"),"a_set_support":("wait_support","Send Support Username","a_settings"),"a_set_currency":("wait_currency","Send Currency","a_settings"),"a_set_timezone":("wait_timezone","__TIMEZONE_PICKER__","a_settings"),"a_set_reminder":("wait_reminder","Send Reminder Days","a_settings"),"a_set_referral_days":("wait_referral_days","Send free reward days per successful referral","a_settings")}
         if a in state:
-            key,msg,back=state[a]; context.user_data.clear(); context.user_data[key]=True; await q.edit_message_text(msg,reply_markup=self.back(back)); return
+            key,msg,back=state[a]
+            context.user_data.clear()
+            if a == "a_set_timezone":
+                settings = await get_seller_settings(owner)
+                await q.edit_message_text(
+                    timezone_guide(settings.get("timezone") or "Asia/Kolkata"),
+                    reply_markup=timezone_keyboard("a_tz_", "a_settings"),
+                )
+            else:
+                context.user_data[key]=True
+                await q.edit_message_text(msg,reply_markup=self.back(back))
+            return
         if a=="a_set_qr": context.user_data.clear(); context.user_data["wait_qr"]=True; await q.edit_message_text("Send QR image",reply_markup=self.back("a_payment")); return
         if a=="a_settings":
             s=await get_seller_settings(owner); await q.edit_message_text(f"⚙ Bot Settings\n\nBot Name: {s.get('bot_name')}\nSupport: {s.get('support_username') or 'Not Set'}\nCurrency: {s.get('currency')}\nTimezone: {s.get('timezone')}\nReminder: {s.get('reminder_days')}",reply_markup=self.settings_menu()); return
@@ -2055,7 +2082,6 @@ class SellerBotManager:
         if a.startswith("a_user_remove_"):
             user_id=int(a.replace("a_user_remove_",""))
             await remove_subscription(owner,user_id)
-            await enforce_user_access(context.bot, owner, user_id, "Subscription removed by admin")
             try:
                 await context.bot.send_message(
                     user_id,
@@ -2499,7 +2525,6 @@ class SellerBotManager:
             if context.user_data.get("wait_user_ban_reason"):
                 user_id=int(context.user_data["wait_user_ban_reason"])
                 await set_user_ban(owner,user_id,True,text)
-                await enforce_user_access(context.bot, owner, user_id, f"Banned by seller: {text}")
                 context.user_data.clear()
 
                 try:
@@ -2524,9 +2549,21 @@ class SellerBotManager:
                 return
 
             if context.user_data.get("wait_timezone"):
-                try: ZoneInfo(text)
-                except ZoneInfoNotFoundError: await update.effective_message.reply_text("❌ Invalid timezone"); return
-                await set_seller_setting(owner,"timezone",text); context.user_data.clear(); await update.effective_message.reply_text("✅ Updated",reply_markup=self.settings_menu()); return
+                try:
+                    timezone_name = normalize_timezone(text)
+                except Exception:
+                    await update.effective_message.reply_text(
+                        "❌ Invalid timezone.\n\nUse the exact format, for example:\nAsia/Kolkata\n\nTimezone names are case-sensitive.",
+                        reply_markup=timezone_keyboard("a_tz_", "a_settings"),
+                    )
+                    return
+                await set_seller_setting(owner, "timezone", timezone_name)
+                context.user_data.clear()
+                await update.effective_message.reply_text(
+                    f"✅ Timezone updated!\n\nTimezone: {timezone_name}",
+                    reply_markup=self.settings_menu(),
+                )
+                return
             if context.user_data.get("wait_referral_days"):
                 try:
                     days=int(text)
