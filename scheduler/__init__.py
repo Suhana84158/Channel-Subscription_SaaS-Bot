@@ -15,7 +15,7 @@ def start_scheduler() -> None:
         scheduler.add_job(
             check_expired_users,
             trigger="interval",
-            minutes=5,
+            minutes=1,
             id="subscription_expiry_check",
             replace_existing=True,
             max_instances=1,
