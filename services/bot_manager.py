@@ -47,6 +47,44 @@ logger=logging.getLogger(__name__)
 WELCOME_RUNTIME_VERSION="2026-07-13-main-role-dashboard-fix-13"
 MAIN_BOT_USERNAME=os.getenv("MAIN_BOT_USERNAME","Local_supplier3_bot").lstrip("@")
 
+
+def _format_auto_delete(seconds: int) -> str:
+    seconds = max(0, int(seconds or 0))
+    if seconds == 0:
+        return "Off"
+    if seconds % 86400 == 0:
+        return f"{seconds // 86400}d"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+def _template_auto_delete_seconds(template: dict) -> int:
+    if not template:
+        return 0
+    if template.get("auto_delete_seconds") is not None:
+        return max(0, int(template.get("auto_delete_seconds") or 0))
+    return max(0, int(template.get("auto_delete_minutes") or 0) * 60)
+
+
+def _parse_auto_delete_duration(value: str) -> int:
+    raw = str(value or "").strip().lower().replace(" ", "")
+    if raw in {"0", "off", "none", "disable", "disabled"}:
+        return 0
+    units = (("mo", 30 * 86400), ("min", 60), ("s", 1), ("m", 60), ("h", 3600), ("d", 86400))
+    for suffix, multiplier in units:
+        if raw.endswith(suffix):
+            number = raw[:-len(suffix)]
+            if not number or not number.isdigit():
+                break
+            seconds = int(number) * multiplier
+            if seconds < 0 or seconds > 7 * 86400:
+                raise ValueError("Duration 0 seconds se 7 days ke beech rakho")
+            return seconds
+    raise ValueError("Use: 30s, 2m, 1h, 6h, 1d ya off")
+
 from services.message_moderation import moderate_seller_message
 from handlers.deleting_messages import deleting_messages_handlers
 from services.protected_bot import ProtectedExtBot
@@ -238,7 +276,9 @@ class SellerBotManager:
         rows=[[InlineKeyboardButton("➕ Add Command",callback_data="a_support_tpl_add")]]
         for item in templates:
             command=item.get("command","")
-            rows.append([InlineKeyboardButton(f"/{command}",callback_data=f"a_support_tpl_view_{command}")])
+            duration=_format_auto_delete(_template_auto_delete_seconds(item))
+            icon="🔴" if duration=="Off" else "🟢"
+            rows.append([InlineKeyboardButton(f"/{command}   {icon} {duration}",callback_data=f"a_support_tpl_view_{command}")])
         rows.append([InlineKeyboardButton("⬅ Back",callback_data="a_live_support")])
         return InlineKeyboardMarkup(rows)
 
@@ -248,9 +288,22 @@ class SellerBotManager:
             [InlineKeyboardButton("📝 Edit Text",callback_data=f"a_support_tpl_text_{command}"),InlineKeyboardButton("🗑 Remove Text",callback_data=f"a_support_tpl_rmtext_{command}")],
             [InlineKeyboardButton("🖼 Edit Media",callback_data=f"a_support_tpl_media_{command}"),InlineKeyboardButton("🗑 Remove Media",callback_data=f"a_support_tpl_rmmedia_{command}")],
             [InlineKeyboardButton("🔗 Edit Buttons",callback_data=f"a_support_tpl_buttons_{command}"),InlineKeyboardButton("🗑 Remove Buttons",callback_data=f"a_support_tpl_rmbuttons_{command}")],
+            [InlineKeyboardButton("⏱ Auto Delete Time",callback_data=f"a_support_tpl_autodel_{command}")],
             [InlineKeyboardButton("👀 Preview",callback_data=f"a_support_tpl_preview_{command}")],
             [InlineKeyboardButton("🗑 Delete Command",callback_data=f"a_support_tpl_delete_{command}")],
             [InlineKeyboardButton("⬅ Back",callback_data="a_support_templates")],
+        ])
+
+    @staticmethod
+    def support_template_auto_delete_menu(command, current_seconds=0):
+        current=_format_auto_delete(current_seconds)
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Off",callback_data=f"a_tpl_ad_0_{command}"),InlineKeyboardButton("30 Seconds",callback_data=f"a_tpl_ad_30_{command}")],
+            [InlineKeyboardButton("1 Minute",callback_data=f"a_tpl_ad_60_{command}"),InlineKeyboardButton("5 Minutes",callback_data=f"a_tpl_ad_300_{command}")],
+            [InlineKeyboardButton("10 Minutes",callback_data=f"a_tpl_ad_600_{command}"),InlineKeyboardButton("30 Minutes",callback_data=f"a_tpl_ad_1800_{command}")],
+            [InlineKeyboardButton("1 Hour",callback_data=f"a_tpl_ad_3600_{command}"),InlineKeyboardButton("⌨️ Custom",callback_data=f"a_tpl_ad_custom_{command}")],
+            [InlineKeyboardButton(f"Current: {current}",callback_data="noop")],
+            [InlineKeyboardButton("⬅ Back",callback_data=f"a_support_tpl_view_{command}")],
         ])
 
     @staticmethod
@@ -1666,7 +1719,8 @@ class SellerBotManager:
             if not tpl:
                 await q.edit_message_text("❌ Template not found",reply_markup=self.back("a_support_templates")); return
             count=sum(len(row) for row in (tpl.get("buttons") or []))
-            await q.edit_message_text(f"⚡ /{command}\n\n📝 Text: {'✅' if tpl.get('text') else '❌'}\n🖼 Media: {'✅' if tpl.get('media_file_id') else '❌'}\n🔗 Buttons: {count}",reply_markup=self.support_template_edit_menu(command)); return
+            auto_delete=_format_auto_delete(_template_auto_delete_seconds(tpl))
+            await q.edit_message_text(f"⚡ /{command}\n\n📝 Text: {'✅' if tpl.get('text') else '❌'}\n🖼 Media: {'✅' if tpl.get('media_file_id') else '❌'}\n🔗 Buttons: {count}\n⏱ Auto Delete: {auto_delete}",reply_markup=self.support_template_edit_menu(command)); return
         if a.startswith("a_support_tpl_text_"):
             command=a.replace("a_support_tpl_text_",""); context.user_data.clear(); context.user_data["wait_support_tpl_text"]=command
             await q.edit_message_text("📝 Template text bhejo.\n\nVariables: {NAME} {ID} {USERNAME} {PLAN} {EXPIRY}",reply_markup=self.back(f"a_support_tpl_view_{command}")); return
@@ -1676,6 +1730,32 @@ class SellerBotManager:
         if a.startswith("a_support_tpl_buttons_"):
             command=a.replace("a_support_tpl_buttons_",""); context.user_data.clear(); context.user_data["wait_support_tpl_buttons"]=command
             await q.edit_message_text("🔗 Buttons bhejo. Format:\nTitle - https://example.com\n\nSame row:\nButton 1 - URL && Button 2 - URL",reply_markup=self.back(f"a_support_tpl_view_{command}")); return
+        if a.startswith("a_support_tpl_autodel_"):
+            command=a.replace("a_support_tpl_autodel_","")
+            tpl=await get_support_template(owner,command)
+            if not tpl:
+                await q.edit_message_text("❌ Template not found",reply_markup=self.back("a_support_templates")); return
+            current=_template_auto_delete_seconds(tpl)
+            await q.edit_message_text(
+                f"⏱ Auto Delete Time — /{command}\n\nCurrent: {_format_auto_delete(current)}\n\nBot ka template reply selected time ke baad automatically delete hoga.",
+                reply_markup=self.support_template_auto_delete_menu(command,current),
+            ); return
+        if a.startswith("a_tpl_ad_custom_"):
+            command=a.replace("a_tpl_ad_custom_","")
+            context.user_data.clear(); context.user_data["wait_support_tpl_auto_delete"]=command
+            await q.edit_message_text(
+                "⌨️ Custom auto-delete duration bhejo.\n\nExamples:\n30s = 30 seconds\n2m = 2 minutes\n1h = 1 hour\n6h = 6 hours\n1d = 1 day\noff = disable\n\nMaximum: 7 days",
+                reply_markup=self.back(f"a_support_tpl_autodel_{command}"),
+            ); return
+        if a.startswith("a_tpl_ad_"):
+            payload=a.replace("a_tpl_ad_", "", 1)
+            seconds_text, command=payload.split("_",1)
+            seconds=int(seconds_text)
+            await save_support_template(owner,command,auto_delete_seconds=seconds)
+            await q.edit_message_text(
+                f"✅ Auto Delete updated\n\n/{command}: {_format_auto_delete(seconds)}",
+                reply_markup=self.support_template_auto_delete_menu(command,seconds),
+            ); return
         if a.startswith("a_support_tpl_rmtext_"):
             command=a.replace("a_support_tpl_rmtext_",""); await save_support_template(owner,command,text="")
             await q.edit_message_text("✅ Text removed",reply_markup=self.support_template_edit_menu(command)); return
@@ -2294,11 +2374,27 @@ class SellerBotManager:
         file_id=template.get("media_file_id")
         media_type=template.get("media_type")
         kwargs={"chat_id":int(target_user_id),"reply_markup":keyboard}
-        if file_id and media_type=="photo": return await context.bot.send_photo(photo=file_id,caption=text or None,**kwargs)
-        if file_id and media_type=="video": return await context.bot.send_video(video=file_id,caption=text or None,**kwargs)
-        if file_id and media_type=="animation": return await context.bot.send_animation(animation=file_id,caption=text or None,**kwargs)
-        if file_id and media_type=="document": return await context.bot.send_document(document=file_id,caption=text or None,**kwargs)
-        return await context.bot.send_message(text=text or "(Empty template)",disable_web_page_preview=True,**kwargs)
+        if file_id and media_type=="photo": sent=await context.bot.send_photo(photo=file_id,caption=text or None,**kwargs)
+        elif file_id and media_type=="video": sent=await context.bot.send_video(video=file_id,caption=text or None,**kwargs)
+        elif file_id and media_type=="animation": sent=await context.bot.send_animation(animation=file_id,caption=text or None,**kwargs)
+        elif file_id and media_type=="document": sent=await context.bot.send_document(document=file_id,caption=text or None,**kwargs)
+        else: sent=await context.bot.send_message(text=text or "(Empty template)",disable_web_page_preview=True,**kwargs)
+        auto_delete_seconds=_template_auto_delete_seconds(template)
+        if auto_delete_seconds > 0:
+            asyncio.create_task(self._delete_template_message_later(context.bot,sent.chat_id,sent.message_id,auto_delete_seconds))
+        return sent
+
+    @staticmethod
+    async def _delete_template_message_later(bot,chat_id,message_id,delay_seconds):
+        try:
+            await asyncio.sleep(max(1,int(delay_seconds)))
+            await bot.delete_message(chat_id=chat_id,message_id=message_id)
+        except asyncio.CancelledError:
+            raise
+        except TelegramError as exc:
+            logger.warning("Template auto-delete failed chat=%s message=%s: %s",chat_id,message_id,exc)
+        except Exception:
+            logger.exception("Unexpected template auto-delete failure chat=%s message=%s",chat_id,message_id)
 
     async def support_template_command_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         message=update.effective_message; user=update.effective_user; chat=update.effective_chat
@@ -2537,6 +2633,19 @@ class SellerBotManager:
                 except Exception as exc: await update.effective_message.reply_text(f"❌ {exc}"); return
                 await save_support_template(owner,command,buttons=rows); context.user_data.clear()
                 await update.effective_message.reply_text("✅ Template buttons saved",reply_markup=self.support_template_edit_menu(command)); return
+            if context.user_data.get("wait_support_tpl_auto_delete"):
+                command=context.user_data["wait_support_tpl_auto_delete"]
+                try:
+                    seconds=_parse_auto_delete_duration(text)
+                    await save_support_template(owner,command,auto_delete_seconds=seconds)
+                except Exception as exc:
+                    await update.effective_message.reply_text(f"❌ {exc}")
+                    return
+                context.user_data.clear()
+                await update.effective_message.reply_text(
+                    f"✅ Auto Delete updated\n\n/{command}: {_format_auto_delete(seconds)}",
+                    reply_markup=self.support_template_edit_menu(command),
+                ); return
             if context.user_data.get("wait_coupon_create"):
                 try:
                     code,ctype,value,limit=[x.strip() for x in text.split("|",3)]
