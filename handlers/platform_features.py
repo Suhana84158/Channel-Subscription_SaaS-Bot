@@ -16,6 +16,8 @@ from database.platform_features import audit, get_policy, recent_audit
 from database.seller_bots import get_all_active_bots
 from database.sellers import get_all_sellers
 from services.bot_manager import bot_manager
+from database.performance import database_ping_ms, initialize_performance_indexes
+from utils.performance import performance_runtime
 
 _PROCESS_STARTED_AT = datetime.now(timezone.utc)
 
@@ -313,6 +315,44 @@ async def owner_feature_callback(update: Update, context: ContextTypes.DEFAULT_T
         await q.edit_message_text(
             "✅ Backup generated and sent above. Keep this file safe for manual restore/migration.",
             reply_markup=back(),
+        )
+        return
+
+
+    if data in {"owner_performance", "owner_performance_refresh"}:
+        ping = await database_ping_ms()
+        stats = performance_runtime.stats()
+        running = len(getattr(bot_manager, "_applications", {}) or {})
+        text = (
+            "⚡ Performance Monitor\n\n"
+            f"Database response: {ping:.0f} ms\n"
+            f"Cache entries: {stats['entries']}\n"
+            f"Cache hit rate: {stats['hit_rate']:.1f}%\n"
+            f"Cache hits/misses: {stats['hits']}/{stats['misses']}\n"
+            f"Running clone bots: {running}\n\n"
+            "Optimization runs automatically. Use Optimize Now only for troubleshooting."
+        )
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh", callback_data="owner_performance_refresh")],
+            [InlineKeyboardButton("⚙️ Optimize Now", callback_data="owner_performance_optimize")],
+            [InlineKeyboardButton("⬅ Owner Dashboard", callback_data="main_owner_dashboard")],
+        ]))
+        return
+
+    if data == "owner_performance_optimize":
+        cleared = performance_runtime.clear()
+        await initialize_performance_indexes()
+        ping = await database_ping_ms()
+        await q.answer("Optimization completed ✅", show_alert=True)
+        await q.edit_message_text(
+            "✅ Optimization Completed\n\n"
+            f"Cache entries cleared: {cleared}\n"
+            f"Database response: {ping:.0f} ms\n"
+            "MongoDB indexes checked successfully.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚡ Performance Monitor", callback_data="owner_performance")],
+                [InlineKeyboardButton("⬅ Owner Dashboard", callback_data="main_owner_dashboard")],
+            ]),
         )
         return
 

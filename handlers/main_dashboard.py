@@ -24,6 +24,7 @@ from database.seller_subscriptions import effective_plan, seller_usage
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from database.mongo import get_database
+from utils.performance import performance_runtime
 
 
 def home_button():
@@ -47,6 +48,7 @@ def owner_dashboard_keyboard():
         ],
         [InlineKeyboardButton("🌐 Official Links Settings", callback_data="official_settings")],
         [InlineKeyboardButton("🩺 Health Monitoring", callback_data="owner_health")],
+        [InlineKeyboardButton("⚡ Performance Monitor", callback_data="owner_performance")],
         [InlineKeyboardButton("📜 Terms & Policy", callback_data="owner_terms_policy")],
         [InlineKeyboardButton("🆘 Owner Help", callback_data="main_help")],
     ])
@@ -93,11 +95,16 @@ def seller_dashboard_keyboard(record=None):
 
 
 async def owner_dashboard_text():
-    sellers = await total_sellers()
-    bots = await total_bots()
-    users = await total_users()
-    pending = await count_pending_payments()
-    revenue = await total_revenue()
+    async def build():
+        sellers, bots, users, pending, revenue = await asyncio.gather(
+            total_sellers(), total_bots(), total_users(),
+            count_pending_payments(), total_revenue(),
+        )
+        return sellers, bots, users, pending, revenue
+
+    sellers, bots, users, pending, revenue = await performance_runtime.cached(
+        "owner_dashboard_summary", 20, build
+    )
 
     return (
         "👑 Owner Dashboard\n\n"
@@ -122,7 +129,9 @@ async def seller_dashboard_text(user_id: int):
             "then send its token securely."
         ), None
 
-    child_stats = await seller_stats(user_id)
+    child_stats = await performance_runtime.cached(
+        f"seller_dashboard:{user_id}", 15, lambda: seller_stats(user_id)
+    )
     return (
         "🏪 Seller Dashboard\n\n"
         f"🤖 Bot: @{record.get('bot_username','-')}\n"
