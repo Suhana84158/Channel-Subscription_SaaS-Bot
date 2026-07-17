@@ -54,6 +54,7 @@ from handlers.content_protection import content_protection_handlers
 from database.content_protection import get_content_protection_settings
 
 from database.subscription_guard import save_invite, active_invites_for_user, deactivate_invite
+from database.staff import active_staff, list_staff, promote_staff, remove_staff, set_staff_status, log_staff_action
 from services.subscription_guard import subscription_guard_chat_member, subscription_guard_new_members
 from handlers.subscription_guard import subscription_guard_handlers
 
@@ -85,7 +86,7 @@ class SellerBotManager:
             [InlineKeyboardButton("📦 Manage Plans", callback_data="a_plans"), InlineKeyboardButton("💳 Payment Settings", callback_data="a_payment")],
             [InlineKeyboardButton("📨 Pending Payments", callback_data="a_pending"), InlineKeyboardButton("📜 Payment History", callback_data="a_history")],
             [InlineKeyboardButton("📢 Channels / Groups", callback_data="a_channels"), InlineKeyboardButton("⚙️ Bot Settings", callback_data="a_settings")],
-            [InlineKeyboardButton("👥 User Management", callback_data="a_users")],
+            [InlineKeyboardButton("👥 User Management", callback_data="a_users"), InlineKeyboardButton("👮 Staff Management", callback_data="a_staff")],
             [InlineKeyboardButton("📣 Broadcast", callback_data="a_broadcast"), InlineKeyboardButton("📊 Statistics", callback_data="a_stats")],
             [InlineKeyboardButton("🗑 Deleting Messages", callback_data="dm_home"), InlineKeyboardButton("🔒 Content Protection", callback_data="cp_home")],
             [InlineKeyboardButton("💬 Live Support", callback_data="a_live_support")],
@@ -469,7 +470,8 @@ class SellerBotManager:
 
         banned=bool(user.get("banned"))
         keyboard=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎁 Give / Extend Subscription",callback_data=f"a_user_manage_{user_id}")],
+            [InlineKeyboardButton("🎁 Give Subscription",callback_data=f"a_user_give_{user_id}")],
+            [InlineKeyboardButton("⌛ Extend Subscription",callback_data=f"a_user_extend_{user_id}")],
             [InlineKeyboardButton("❌ Remove Subscription",callback_data=f"a_user_remove_{user_id}")],
             [InlineKeyboardButton(
                 "✅ Unban User" if banned else "🚫 Ban User",
@@ -490,7 +492,7 @@ class SellerBotManager:
             )
             return
 
-        title="🎁 Give / Extend Subscription\n\nChoose an existing plan or use a custom duration. Existing active validity will be preserved."
+        title="🎁 Choose plan to give" if mode=="give" else "⌛ Choose plan duration to extend"
         kb=[]
 
         for plan in plans:
@@ -499,7 +501,6 @@ class SellerBotManager:
                 callback_data=f"a_user_apply_{mode}_{user_id}_{plan['plan_id']}",
             )])
 
-        kb.append([InlineKeyboardButton("⌨️ Custom Duration",callback_data=f"a_user_custom_{user_id}")])
         kb.append([InlineKeyboardButton("⬅ Back",callback_data=f"a_user_view_{user_id}")])
         await q.edit_message_text(title,reply_markup=InlineKeyboardMarkup(kb))
 
@@ -559,18 +560,12 @@ class SellerBotManager:
 
     @staticmethod
     def parse_duration(value:str)->int:
-        value=value.strip().lower()
-        if value.endswith("mo"):
-            n=int(value[:-2])
-            if n<=0: raise ValueError("Duration must be positive")
-            return n*30*1440
-        n=int(value[:-1]); unit=value[-1]
+        value=value.strip().lower(); n=int(value[:-1]); unit=value[-1]
         if n<=0: raise ValueError("Duration must be positive")
         if unit=="m": return n
         if unit=="h": return n*60
         if unit=="d": return n*1440
-        if unit=="y": return n*365*1440
-        raise ValueError("Use m, h, d, mo or y")
+        raise ValueError("Use m, h or d")
     @classmethod
     def parse_plan(cls,text:str):
         p=[x.strip() for x in text.split("|")]
@@ -579,7 +574,30 @@ class SellerBotManager:
 
     def owner(self,context): return int(context.application.bot_data["seller_owner_id"])
     def seller_account(self,context): return int(context.application.bot_data.get("seller_account_id", self.owner(context)))
-    async def auth(self,update,context): return update.effective_user.id==self.seller_account(context)
+    async def staff_record(self, update, context):
+        uid = int(update.effective_user.id)
+        if uid == self.seller_account(context):
+            return {"role": "seller", "status": "active", "permissions": ["*"]}
+        return await active_staff(self.owner(context), uid)
+
+    async def auth(self,update,context):
+        return bool(await self.staff_record(update, context))
+
+    @staticmethod
+    def staff_menu():
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Promote Admin", callback_data="a_staff_add_admin"), InlineKeyboardButton("➕ Promote Moderator", callback_data="a_staff_add_moderator")],
+            [InlineKeyboardButton("📋 Staff List", callback_data="a_staff_list")],
+            [InlineKeyboardButton("⬅ Back", callback_data="a_home")],
+        ])
+
+    @staticmethod
+    def staff_item_menu(user_id:int, suspended:bool=False):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ Activate" if suspended else "⏸ Suspend", callback_data=f"a_staff_status_{user_id}_{'active' if suspended else 'suspended'}")],
+            [InlineKeyboardButton("❌ Remove Staff", callback_data=f"a_staff_remove_{user_id}")],
+            [InlineKeyboardButton("⬅ Staff List", callback_data="a_staff_list")],
+        ])
 
     async def safe_query_message(self,q,text,reply_markup=None):
         """Edit text messages; reply with a new message when the button is on media."""
@@ -609,7 +627,8 @@ class SellerBotManager:
         owner=self.owner(context)
 
         # Clone-bot seller opens the selected section directly from main-bot deep links.
-        if update.effective_user.id == self.seller_account(context):
+        staff = await self.staff_record(update, context)
+        if staff:
             context.user_data.clear()
             target = context.args[0] if context.args else "admin_panel"
             if target == "admin_payment":
@@ -748,7 +767,7 @@ class SellerBotManager:
             "📨 Pending Payments\n"
             "Open a screenshot and Approve or Reject it. Payment ID and user details remain visible after processing.\n\n"
             "👥 User Management\n"
-            "Search by User ID or @username. Give/extend subscriptions using an existing plan or custom minutes, hours, days, months or years; remove subscriptions; and ban/unban users.\n\n"
+            "Search by User ID or @username. Give, extend or remove subscriptions, and ban/unban users.\n\n"
             "💬 Welcome Message\n"
             "Edit text, media and buttons, then use Preview.\n"
             "Button format:\n"
@@ -1118,8 +1137,20 @@ class SellerBotManager:
 
     async def admin_callback(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         q=update.callback_query; await q.answer(); owner=self.owner(context)
-        if q.from_user.id!=owner: await q.edit_message_text("❌ Not authorized"); return
+        staff = await self.staff_record(update, context)
+        if not staff:
+            await q.edit_message_text("❌ Not authorized")
+            return
         a=q.data
+        role = staff.get("role", "moderator")
+        if role == "moderator":
+            allowed_prefixes = ("a_home", "a_users", "a_user_", "a_pending", "a_pay_", "a_live_support", "a_help")
+            if not any(a == p or a.startswith(p) for p in allowed_prefixes):
+                await q.answer("Moderator permission is not available for this section.", show_alert=True)
+                return
+        if role != "seller" and a.startswith("a_staff"):
+            await q.answer("Only the seller can manage staff.", show_alert=True)
+            return
         if a=="a_home":
             context.user_data.clear()
             await q.edit_message_text(
@@ -2014,6 +2045,52 @@ class SellerBotManager:
                 policy=await get_policy(key); parts.append(f"{key.title()}:\n{policy.get('text')}")
             await q.edit_message_text("📜 Terms & Policy\n\n"+"\n\n".join(parts),reply_markup=self.admin_menu()); return
         if a=="a_broadcast": context.user_data.clear(); context.user_data["wait_broadcast"]=True; await q.edit_message_text("📢 Send any one message to broadcast.\n\nSupported: text, photo with caption, video, document, audio, voice, GIF, sticker and forwarded messages.",reply_markup=self.back()); return
+        if a=="a_staff":
+            await q.edit_message_text(
+                "👮 Staff Management\n\nPromote trusted people as Admin or Moderator for this clone bot.\n\nAdmin: broad management access\nModerator: users, pending payments and live support",
+                reply_markup=self.staff_menu(),
+            )
+            return
+        if a in {"a_staff_add_admin", "a_staff_add_moderator"}:
+            context.user_data.clear()
+            context.user_data["wait_staff_promote"] = "admin" if a.endswith("admin") else "moderator"
+            await q.edit_message_text(
+                "Send the Telegram User ID of the person you want to promote.\n\nThe person must start this clone bot once before using staff access.",
+                reply_markup=self.back("a_staff"),
+            )
+            return
+        if a=="a_staff_list":
+            rows=await list_staff(owner)
+            if not rows:
+                await q.edit_message_text("📋 Staff List\n\nNo staff members added.", reply_markup=self.back("a_staff"))
+                return
+            kb=[]
+            lines=["📋 Staff List\n"]
+            for row in rows:
+                uid=int(row["user_id"]); role_name=str(row.get("role","moderator")).title(); status=row.get("status","active")
+                label=("@"+row.get("username")) if row.get("username") else (row.get("full_name") or str(uid))
+                lines.append(f"• {label} — {role_name} — {status.title()}")
+                kb.append([InlineKeyboardButton(f"{role_name}: {label}", callback_data=f"a_staff_view_{uid}")])
+            kb.append([InlineKeyboardButton("⬅ Back", callback_data="a_staff")])
+            await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
+            return
+        if a.startswith("a_staff_view_"):
+            uid=int(a.replace("a_staff_view_", "")); row=await active_staff(owner,uid)
+            if not row:
+                all_rows=await list_staff(owner); row=next((x for x in all_rows if int(x.get("user_id",0))==uid),None)
+            if not row:
+                await q.edit_message_text("❌ Staff member not found.", reply_markup=self.back("a_staff_list")); return
+            label=("@"+row.get("username")) if row.get("username") else (row.get("full_name") or "Not available")
+            text=(f"👮 Staff Details\n\nName: {label}\nUser ID: {uid}\nRole: {str(row.get('role','')).title()}\nStatus: {str(row.get('status','active')).title()}\nTotal Actions: {int(row.get('total_actions',0))}\nLast Action: {row.get('last_action') or 'No activity yet'}")
+            await q.edit_message_text(text, reply_markup=self.staff_item_menu(uid,row.get("status")=="suspended"))
+            return
+        if a.startswith("a_staff_status_"):
+            _,_,_,uid,status=a.split("_",4); await set_staff_status(owner,int(uid),status)
+            await q.edit_message_text(f"✅ Staff status updated: {status.title()}", reply_markup=self.back("a_staff_list")); return
+        if a.startswith("a_staff_remove_"):
+            uid=int(a.replace("a_staff_remove_", "")); await remove_staff(owner,uid)
+            await q.edit_message_text("✅ Staff member removed.", reply_markup=self.back("a_staff_list")); return
+
         if a=="a_users":
             context.user_data.clear()
             context.user_data["wait_user_search"]=True
@@ -2027,27 +2104,15 @@ class SellerBotManager:
             await self.show_user_details(q,owner,int(a.replace("a_user_view_","")))
             return
 
-        if a.startswith("a_user_manage_"):
+        if a.startswith("a_user_give_"):
             await self.show_admin_plan_selector(
-                q,owner,int(a.replace("a_user_manage_","")),"manage"
+                q,owner,int(a.replace("a_user_give_","")),"give"
             )
             return
 
-        if a.startswith("a_user_custom_"):
-            user_id=int(a.replace("a_user_custom_",""))
-            context.user_data.clear()
-            context.user_data["wait_user_custom_subscription"]=user_id
-            await q.edit_message_text(
-                "⌨️ Custom Subscription Duration\n\n"
-                "Send one duration:\n"
-                "• Minutes: 30m\n"
-                "• Hours: 12h\n"
-                "• Days: 7d\n"
-                "• Months: 3mo\n"
-                "• Years: 1y\n\n"
-                "1 month = 30 days and 1 year = 365 days.\n"
-                "If the user already has an active subscription, this duration will be added to the remaining time.",
-                reply_markup=self.back(f"a_user_view_{user_id}"),
+        if a.startswith("a_user_extend_"):
+            await self.show_admin_plan_selector(
+                q,owner,int(a.replace("a_user_extend_","")),"extend"
             )
             return
 
@@ -2433,7 +2498,8 @@ class SellerBotManager:
 
     async def text_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context); text=update.effective_message.text.strip()
-        if update.effective_user.id==owner:
+        staff = await self.staff_record(update, context)
+        if staff:
             gateway=context.user_data.get("wait_pg_credentials")
             if gateway:
                 values=[x.strip() for x in text.split("|")]
@@ -2506,47 +2572,29 @@ class SellerBotManager:
                 except Exception as exc: await update.effective_message.reply_text(f"❌ {exc}"); return
                 await set_seller_setting(owner,"welcome_buttons",rows); context.user_data.clear()
                 await update.effective_message.reply_text("✅ Welcome buttons saved. Use 👀 Preview to check them.",reply_markup=self.welcome_buttons_menu()); return
-            if context.user_data.get("wait_user_custom_subscription"):
-                user_id=int(context.user_data["wait_user_custom_subscription"])
+            if context.user_data.get("wait_staff_promote"):
                 try:
-                    duration_text=text.strip().lower()
-                    duration_minutes=self.parse_duration(duration_text)
-                    current=await get_subscription(owner,user_id) or {}
-                    plan_name=current.get("plan") or "Custom Subscription"
-                    plan_cfg,_=await effective_plan(owner)
-                    active_now=await active_subscriptions(owner)
-                    already_active=any(int(x.get("user_id"))==user_id for x in active_now)
-                    sub_limit=int(plan_cfg.get("active_subscriber_limit",25))
-                    if not already_active and sub_limit>=0 and len(active_now)>=sub_limit:
-                        context.user_data.clear()
-                        await update.effective_message.reply_text(
-                            await plan_limit_warning(owner),
-                            reply_markup=self.limit_keyboard(f"a_user_view_{user_id}"),
-                        )
-                        return
-                    expiry=await activate_subscription(
-                        owner,user_id,plan_name,duration_minutes,
-                        amount=0,duration_text=duration_text,
+                    staff_user_id=int(text.strip())
+                    if staff_user_id==owner:
+                        raise ValueError("Seller is already the owner")
+                    user=await get_user(owner,staff_user_id)
+                    role=context.user_data["wait_staff_promote"]
+                    record=await promote_staff(
+                        owner, staff_user_id, role, update.effective_user.id,
+                        username=(user or {}).get("username", ""),
+                        full_name=(user or {}).get("full_name", ""),
                     )
-                    delivery=await self.deliver_subscription_access(owner,user_id)
                     context.user_data.clear()
+                    try:
+                        await context.bot.send_message(staff_user_id, f"✅ You were promoted as {role.title()} for this clone bot. Send /start to open your staff panel.")
+                    except Exception:
+                        pass
                     await update.effective_message.reply_text(
-                        "✅ Subscription given/extended successfully.\n\n"
-                        f"👤 User ID: {user_id}\n"
-                        f"⏳ Duration added: {duration_text}\n"
-                        f"📅 New expiry: {self.format_dt(expiry)}\n"
-                        f"🔗 Invite links sent: {delivery.get('sent',0)}\n"
-                        f"✅ Already joined: {delivery.get('already_member',0)}\n"
-                        f"⚠️ Failed: {delivery.get('failed',0)}",
-                        reply_markup=self.back(f"a_user_view_{user_id}"),
+                        f"✅ Staff promoted\n\nUser ID: {staff_user_id}\nRole: {role.title()}",
+                        reply_markup=self.staff_menu(),
                     )
                 except Exception as exc:
-                    await update.effective_message.reply_text(
-                        "❌ Invalid duration.\n\n"
-                        "Use: 30m, 12h, 7d, 3mo or 1y.\n"
-                        "m = minutes, h = hours, d = days, mo = months, y = years.\n\n"
-                        f"Error: {exc}"
-                    )
+                    await update.effective_message.reply_text(f"❌ Could not promote staff: {exc}\n\nSend a numeric Telegram User ID.")
                 return
 
             if context.user_data.get("wait_user_search"):
@@ -3044,7 +3092,7 @@ class SellerBotManager:
         app.add_handler(MessageHandler(filters.PHOTO,self.photo_handler),group=0)
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,self.text_handler))
         app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,self.route_live_support_message),group=10)
-        if app.job_queue: app.job_queue.run_repeating(self.expiry_job,interval=300,first=60,name=f"seller_expiry_{data_owner_id}")
+        if app.job_queue: app.job_queue.run_repeating(self.expiry_job,interval=60,first=30,name=f"seller_expiry_{data_owner_id}")
         return app
 
     async def start_bot(self,bot_id:int)->bool:
