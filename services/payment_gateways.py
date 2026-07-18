@@ -12,12 +12,14 @@ from paytmchecksum import PaytmChecksum
 
 from config import PUBLIC_BASE_URL
 from database.payment_gateways import (
+    claim_transaction_fulfillment,
     claim_transaction_success,
     get_gateway_config,
     get_gateway_transaction,
     get_transaction_by_gateway_order,
     mark_transaction_failed,
     mark_transaction_fulfilled,
+    mark_transaction_fulfillment_retry,
     reserve_webhook_event,
     update_gateway_transaction,
 )
@@ -288,21 +290,43 @@ async def verify_and_process_webhook(gateway: str, scope: str, owner_id: int, he
         tx = await get_transaction_by_gateway_order(gateway, str(txid))
     if not tx:
         return False, "unknown transaction"
-    fresh_event = await reserve_webhook_event(gateway, str(event_key), payload)
+    fresh_event = await reserve_webhook_event(
+        gateway,
+        str(event_key),
+        payload,
+    )
     if not success:
         if fresh_event:
-            await mark_transaction_failed(tx["transaction_id"], "gateway reported failure", payload)
+            await mark_transaction_failed(
+                tx["transaction_id"],
+                "gateway reported failure",
+                payload,
+            )
         return True, "failure recorded"
+
     if tx.get("status") == "fulfilled":
         return True, "already processed"
-    claimed = await claim_transaction_success(tx["transaction_id"], str(payment_id), payload)
-    work = claimed or tx
-    if work.get("status") not in {"paid", "paid_unfulfilled"}:
+
+    await claim_transaction_success(
+        tx["transaction_id"],
+        str(payment_id),
+        payload,
+    )
+
+    work = await claim_transaction_fulfillment(tx["transaction_id"])
+    if not work:
+        current = await get_gateway_transaction(tx["transaction_id"])
+        if current and current.get("status") == "fulfilled":
+            return True, "already processed"
         return True, "already processing"
+
     try:
         await fulfill_transaction(work)
     except Exception as exc:
-        await update_gateway_transaction(tx["transaction_id"], status="paid_unfulfilled", fulfillment_error=str(exc)[:500])
+        await mark_transaction_fulfillment_retry(
+            tx["transaction_id"],
+            str(exc),
+        )
         raise
     return True, "processed"
 
