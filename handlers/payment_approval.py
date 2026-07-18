@@ -185,11 +185,18 @@ async def approve_payment_by_id(update: Update, context: ContextTypes.DEFAULT_TY
         duration_minutes = payment.get("duration_minutes") or 43200
         plan_days = duration_minutes // 1440 if duration_minutes % 1440 == 0 else 0
 
-        await update_payment_status_by_id(
+        claimed = await update_payment_status_by_id(
             payment_id=payment_id,
             status="approved",
             admin_id=query.from_user.id,
         )
+
+        if not claimed:
+            await safe_edit(
+                query,
+                "⚠️ This payment has already been processed.",
+            )
+            return
 
         subscription = await get_subscription(user_id)
 
@@ -250,11 +257,18 @@ async def reject_payment_by_id(update: Update, context: ContextTypes.DEFAULT_TYP
 
         user_id = payment["user_id"]
 
-        await update_payment_status_by_id(
+        claimed = await update_payment_status_by_id(
             payment_id=payment_id,
             status="rejected",
             admin_id=query.from_user.id,
         )
+
+        if not claimed:
+            await safe_edit(
+                query,
+                "⚠️ This payment has already been processed.",
+            )
+            return
 
         await safe_edit(query, "❌ Payment Rejected")
 
@@ -284,11 +298,18 @@ async def approve_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         plan_days = duration_minutes // 1440 if duration_minutes % 1440 == 0 else 0
 
-        await update_payment_status(
+        claimed = await update_payment_status(
             user_id=user_id,
             status="approved",
             admin_id=query.from_user.id,
         )
+
+        if not claimed:
+            await safe_edit(
+                query,
+                "⚠️ This payment has already been processed.",
+            )
+            return
 
         subscription = await get_subscription(user_id)
 
@@ -342,11 +363,18 @@ async def reject_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = int(query.data.split("_")[1])
 
-        await update_payment_status(
+        claimed = await update_payment_status(
             user_id=user_id,
             status="rejected",
             admin_id=query.from_user.id,
         )
+
+        if not claimed:
+            await safe_edit(
+                query,
+                "⚠️ This payment has already been processed.",
+            )
+            return
 
         await safe_edit(query, "❌ Payment Rejected")
 
