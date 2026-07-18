@@ -6,7 +6,7 @@ from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, fil
 from config import ADMIN_IDS
 from database.admins import is_admin
 from database.sellers import get_seller, sellers_collection
-from database.platform_features import reserve_payment_fingerprint, audit
+from database.platform_features import reserve_payment_fingerprint, release_payment_fingerprint, audit
 from handlers.official_links import build_official_links_keyboard
 from database.seller_subscriptions import (
     assign_plan_with_history, extend_plan_with_history, create_plan_request, create_seller_payment,
@@ -367,14 +367,55 @@ async def seller_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not plan_id: return
     photo=update.effective_message.photo[-1]
     fingerprint=getattr(photo,"file_unique_id","")
-    if not await reserve_payment_fingerprint("seller",0,fingerprint,update.effective_user.id):
+    reserved = await reserve_payment_fingerprint(
+        "seller",
+        0,
+        fingerprint,
+        update.effective_user.id,
+    )
+    if not reserved:
         context.user_data.clear()
-        await update.effective_message.reply_text("⚠️ This payment screenshot was already submitted. Please send a new genuine payment proof.")
+        await update.effective_message.reply_text(
+            "⚠️ This payment screenshot was already submitted. "
+            "Please send a new genuine payment proof."
+        )
         return
-    doc=await create_seller_payment(update.effective_user.id,plan_id,photo.file_id,context.user_data.get("seller_request_type","upgrade"))
-    await audit("seller_plan_payment_submitted",update.effective_user.id,update.effective_user.id,{"payment_id":doc.get("payment_id")})
+
+    try:
+        doc=await create_seller_payment(
+            update.effective_user.id,
+            plan_id,
+            photo.file_id,
+            context.user_data.get("seller_request_type","upgrade"),
+        )
+    except Exception:
+        await release_payment_fingerprint(
+            "seller",
+            0,
+            fingerprint,
+            update.effective_user.id,
+        )
+        logger.exception(
+            "Seller plan payment creation failed seller_id=%s plan_id=%s",
+            update.effective_user.id,
+            plan_id,
+        )
+        await update.effective_message.reply_text(
+            "❌ Payment submission failed temporarily. Please try again."
+        )
+        return
+
+    await audit(
+        "seller_plan_payment_submitted",
+        update.effective_user.id,
+        update.effective_user.id,
+        {"payment_id":doc.get("payment_id")},
+    )
     context.user_data.clear()
-    await update.effective_message.reply_text(f"✅ Payment submitted. ID: {doc['payment_id']}\nOwner approval pending.")
+    await update.effective_message.reply_text(
+        f"✅ Payment submitted. ID: {doc['payment_id']}\n"
+        "Owner approval pending."
+    )
     for aid in ADMIN_IDS:
         try:
             await context.bot.send_photo(aid,doc["file_id"],caption=f"🧾 Seller Plan Payment\nSeller: {doc['owner_id']}\nPlan: {doc['plan_name']}\nAmount: ₹{doc['amount']:g}\nID: {doc['payment_id']}",reply_markup=kb([[InlineKeyboardButton("✅ Approve",callback_data=f"subpay_ok_{doc['payment_id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"subpay_no_{doc['payment_id']}")]]))
