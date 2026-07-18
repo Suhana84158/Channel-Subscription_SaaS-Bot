@@ -1,3 +1,5 @@
+import logging
+
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import InvalidToken, TelegramError
 from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, filters
@@ -30,6 +32,9 @@ from database.platform_features import get_policy
 from database.mongo import get_database
 from database.sellers import get_or_create_seller
 from utils.timezone_ui import timezone_guide, timezone_keyboard, timezone_from_key, normalize_timezone
+
+
+logger = logging.getLogger(__name__)
 
 
 def main_seller_keyboard():
@@ -648,13 +653,90 @@ async def receive_seller_token(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if context.user_data.get("seller_waiting_channel"):
         try:
-            raw_id, title = [x.strip() for x in text.split("|", 1)]
+            raw_id, supplied_title = [x.strip() for x in text.split("|", 1)]
             chat_id = int(raw_id)
-            await add_channel(owner_id, chat_id, title, "group_or_channel")
+
+            if not str(chat_id).startswith("-100"):
+                await update.effective_message.reply_text(
+                    "❌ Invalid Telegram channel/group ID.\n\n"
+                    "Use the full ID, for example:\n"
+                    "-1001234567890 | Group Name"
+                )
+                return
+
+            running = bot_manager.get_running(bot_id)
+            if not running or int(running.bot_id) != bot_id:
+                await update.effective_message.reply_text(
+                    "❌ Clone bot is not running. Start the clone bot first, "
+                    "then try again.",
+                    reply_markup=channels_markup(bot_id),
+                )
+                return
+
+            clone_bot = running.application.bot
+            chat = await clone_bot.get_chat(chat_id)
+            member = await clone_bot.get_chat_member(chat_id, clone_bot.id)
+
+            if chat.type not in {"channel", "group", "supergroup"}:
+                await update.effective_message.reply_text(
+                    "❌ This ID does not belong to a Telegram channel or group."
+                )
+                return
+
+            if member.status not in {"administrator", "creator"}:
+                await update.effective_message.reply_text(
+                    "❌ Make the clone bot an administrator in that "
+                    "channel/group, then try again."
+                )
+                return
+
+            if (
+                member.status == "administrator"
+                and not getattr(member, "can_invite_users", False)
+            ):
+                await update.effective_message.reply_text(
+                    "❌ Enable the clone bot's Invite Users admin permission, "
+                    "then try again."
+                )
+                return
+
+            title = (getattr(chat, "title", None) or supplied_title).strip()
+            if not title:
+                title = "Telegram Channel/Group"
+
+            await add_channel(owner_id, chat_id, title, chat.type)
             context.user_data.clear()
-            await update.effective_message.reply_text("✅ Channel/group added.", reply_markup=channels_markup(bot_id))
+            await update.effective_message.reply_text(
+                "✅ Channel/group verified and added successfully.",
+                reply_markup=channels_markup(bot_id),
+            )
+
+        except ValueError:
+            await update.effective_message.reply_text(
+                "❌ Invalid format. Use:\n"
+                "-1001234567890 | Group Name"
+            )
+        except TelegramError as exc:
+            logger.warning(
+                "Channel verification failed owner_id=%s bot_id=%s error=%s",
+                owner_id,
+                bot_id,
+                exc,
+            )
+            await update.effective_message.reply_text(
+                "❌ Clone bot cannot access this channel/group.\n\n"
+                "Check that the ID is correct, the clone bot is added as "
+                "admin, and Invite Users permission is enabled."
+            )
         except Exception:
-            await update.effective_message.reply_text("❌ Invalid format. Use: -1001234567890 | Group Name")
+            logger.exception(
+                "Unexpected channel connection failure owner_id=%s bot_id=%s",
+                owner_id,
+                bot_id,
+            )
+            await update.effective_message.reply_text(
+                "❌ Channel/group could not be added. Please try again."
+            )
         return
 
     if not context.user_data.get("waiting_seller_token"):
