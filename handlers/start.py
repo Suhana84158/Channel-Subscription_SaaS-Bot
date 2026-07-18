@@ -9,6 +9,7 @@ from database.seller_bots import get_bot
 from database.sellers import get_or_create_seller, get_seller
 from database.seller_referrals import register_seller_referral, reward_seller_referral
 from database.users import get_or_create_user
+from database.referrals import create_referral
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -139,6 +140,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Reason: {user.get('ban_reason') or 'Not specified'}"
         )
         return
+
+    if context.args and context.args[0].isdigit():
+        try:
+            referrer_id = int(context.args[0])
+            if referrer_id != tg_user.id:
+                await _bounded(
+                    create_referral(referrer_id, tg_user.id),
+                    default=None,
+                    label="user referral registration",
+                )
+        except (TypeError, ValueError):
+            pass
 
     if context.args and context.args[0].startswith("refseller_"):
         try:
