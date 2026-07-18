@@ -10,6 +10,7 @@ from database.mongo import get_database
 
 COLLECTION = "payments"
 PENDING_PAYMENT_TTL_MINUTES = 30
+FULFILLMENT_STALE_MINUTES = 15
 
 _index_lock = asyncio.Lock()
 _indexes_ready = False
@@ -276,3 +277,183 @@ async def total_revenue():
 
 async def total_payments():
     return await payments_collection().count_documents({})
+
+
+
+async def get_latest_payment_for_user(
+    user_id: int,
+    *,
+    status: str | None = None,
+):
+    query = {"user_id": int(user_id)}
+    if status is not None:
+        query["status"] = status
+
+    return await payments_collection().find_one(
+        query,
+        sort=[("processed_at", -1), ("created_at", -1)],
+    )
+
+
+async def claim_payment_fulfillment(
+    payment_id,
+    *,
+    admin_id: int | None = None,
+    stale_minutes: int = FULFILLMENT_STALE_MINUTES,
+):
+    """
+    Atomically claim an approved payment for fulfillment.
+
+    Pending, failed, or stale processing records can be claimed. Completed
+    records are never claimed again.
+    """
+    try:
+        object_id = to_object_id(payment_id)
+    except ValueError:
+        return None
+
+    now = datetime.now(timezone.utc)
+    stale_before = now - timedelta(
+        minutes=max(1, int(stale_minutes))
+    )
+
+    return await payments_collection().find_one_and_update(
+        {
+            "_id": object_id,
+            "status": "approved",
+            "$or": [
+                {"fulfillment_status": {"$in": ["pending", "failed"]}},
+                {"fulfillment_status": {"$exists": False}},
+                {
+                    "fulfillment_status": "processing",
+                    "fulfillment_claimed_at": {"$lt": stale_before},
+                },
+            ],
+        },
+        {
+            "$set": {
+                "fulfillment_status": "processing",
+                "fulfillment_claimed_at": now,
+                "fulfillment_admin_id": admin_id,
+                "updated_at": now,
+            },
+            "$inc": {"fulfillment_attempts": 1},
+            "$unset": {"fulfillment_error": ""},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+async def mark_payment_channel_delivered(
+    payment_id,
+    chat_id: int,
+) -> bool:
+    try:
+        object_id = to_object_id(payment_id)
+    except ValueError:
+        return False
+
+    result = await payments_collection().update_one(
+        {
+            "_id": object_id,
+            "status": "approved",
+            "fulfillment_status": "processing",
+        },
+        {
+            "$addToSet": {
+                "fulfilled_channel_ids": int(chat_id),
+            },
+            "$set": {
+                "updated_at": datetime.now(timezone.utc),
+            },
+        },
+    )
+    return result.matched_count == 1
+
+
+async def mark_payment_subscription_fulfilled(
+    payment_id,
+    *,
+    expiry,
+    action: str,
+) -> bool:
+    try:
+        object_id = to_object_id(payment_id)
+    except ValueError:
+        return False
+
+    result = await payments_collection().update_one(
+        {
+            "_id": object_id,
+            "status": "approved",
+            "fulfillment_status": "processing",
+        },
+        {
+            "$set": {
+                "subscription_fulfilled": True,
+                "subscription_action": str(action),
+                "subscription_expiry": expiry,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+    return result.matched_count == 1
+
+
+async def complete_payment_fulfillment(
+    payment_id,
+) -> bool:
+    try:
+        object_id = to_object_id(payment_id)
+    except ValueError:
+        return False
+
+    now = datetime.now(timezone.utc)
+    result = await payments_collection().update_one(
+        {
+            "_id": object_id,
+            "status": "approved",
+            "fulfillment_status": "processing",
+        },
+        {
+            "$set": {
+                "fulfillment_status": "completed",
+                "fulfilled_at": now,
+                "updated_at": now,
+            },
+            "$unset": {
+                "fulfillment_claimed_at": "",
+                "fulfillment_error": "",
+            },
+        },
+    )
+    return result.modified_count == 1
+
+
+async def fail_payment_fulfillment(
+    payment_id,
+    error: str,
+) -> bool:
+    try:
+        object_id = to_object_id(payment_id)
+    except ValueError:
+        return False
+
+    now = datetime.now(timezone.utc)
+    result = await payments_collection().update_one(
+        {
+            "_id": object_id,
+            "status": "approved",
+            "fulfillment_status": "processing",
+        },
+        {
+            "$set": {
+                "fulfillment_status": "failed",
+                "fulfillment_error": str(error)[:1000],
+                "fulfillment_failed_at": now,
+                "updated_at": now,
+            },
+            "$unset": {"fulfillment_claimed_at": ""},
+        },
+    )
+    return result.modified_count == 1
