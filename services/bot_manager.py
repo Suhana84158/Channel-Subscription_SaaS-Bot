@@ -39,7 +39,8 @@ from database.seller_data import (
     release_processing_payment,
     set_seller_setting, stats, update_plan, upsert_user,
     register_referral, count_all_referrals, count_successful_referrals,
-    mark_referral_rewarded, get_user_by_username, set_user_ban,
+    mark_referral_rewarded, finalize_referral_reward,
+    release_referral_reward, get_user_by_username, set_user_ban,
     remove_subscription,
 )
 
@@ -1961,6 +1962,7 @@ class SellerBotManager:
                 referral=await mark_referral_rewarded(
                     owner,
                     p["user_id"],
+                    payment_id=pid,
                 )
                 if referral:
                     settings=await get_seller_settings(owner)
@@ -1969,23 +1971,56 @@ class SellerBotManager:
                     )
                     referrer_id=int(referral["referrer_user_id"])
 
-                    if reward_days>0:
-                        await activate_subscription(
-                            owner,
-                            referrer_id,
-                            "Referral Reward",
-                            reward_days*1440,
-                            amount=0,
-                            duration_text=f"{reward_days}d",
-                        )
-                        try:
-                            await context.bot.send_message(
+                    try:
+                        if reward_days>0:
+                            await activate_subscription(
+                                owner,
                                 referrer_id,
-                                "🎉 Referral Reward Added!\n"
-                                f"You received {reward_days} free day(s).",
+                                "Referral Reward",
+                                reward_days*1440,
+                                amount=0,
+                                duration_text=f"{reward_days}d",
                             )
-                        except Exception:
-                            pass
+
+                        finalized_reward=await finalize_referral_reward(
+                            owner,
+                            p["user_id"],
+                            payment_id=pid,
+                        )
+                        if not finalized_reward:
+                            raise RuntimeError(
+                                "Referral reward finalization was not applied"
+                            )
+
+                        if reward_days>0:
+                            try:
+                                await context.bot.send_message(
+                                    referrer_id,
+                                    "🎉 Referral Reward Added!\n"
+                                    f"You received {reward_days} free day(s).",
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Referral reward notification failed "
+                                    "owner=%s referrer=%s payment=%s",
+                                    owner,
+                                    referrer_id,
+                                    pid,
+                                )
+                    except Exception as exc:
+                        await release_referral_reward(
+                            owner,
+                            p["user_id"],
+                            str(exc),
+                            payment_id=pid,
+                        )
+                        logger.exception(
+                            "Referral reward processing failed "
+                            "owner=%s referred=%s payment=%s",
+                            owner,
+                            p["user_id"],
+                            pid,
+                        )
 
                 links=[]
                 for ch in await get_channels(owner):
