@@ -179,11 +179,12 @@ async def post_init(application: Application) -> None:
     configure_runtime(asyncio.get_running_loop(), application.bot)
 
     try:
-        start_scheduler()
-
         async def seller_subscription_reminder_job() -> None:
             await run_seller_subscription_reminders(application.bot)
 
+        # Register every job before starting APScheduler. This removes the
+        # startup gap in which only the expiry job existed and lets the
+        # scheduler restore the complete registry in one reconciliation.
         add_cron_job(
             seller_subscription_reminder_job,
             "seller_subscription_reminders",
@@ -195,6 +196,7 @@ async def post_init(application: Application) -> None:
             "clone_bot_runtime_watchdog",
             minutes=2,
         )
+        start_scheduler()
     except Exception:
         logger.exception("Scheduler startup failed.")
         raise RuntimeError("Unable to start scheduler.") from None
