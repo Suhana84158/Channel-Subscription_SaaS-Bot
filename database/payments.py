@@ -1,13 +1,88 @@
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timedelta, timezone
 
 from bson import ObjectId
+from bson.errors import InvalidId
+from pymongo import ASCENDING, ReturnDocument
+from pymongo.errors import DuplicateKeyError, PyMongoError
+
 from database.mongo import get_database
 
 COLLECTION = "payments"
+PENDING_PAYMENT_TTL_MINUTES = 30
+
+_index_lock = asyncio.Lock()
+_indexes_ready = False
 
 
 def payments_collection():
     return get_database()[COLLECTION]
+
+
+async def ensure_payment_indexes():
+    """Create payment indexes once without changing existing records."""
+    global _indexes_ready
+
+    if _indexes_ready:
+        return
+
+    async with _index_lock:
+        if _indexes_ready:
+            return
+
+        collection = payments_collection()
+
+        # Only new pending records receive pending_key. The sparse unique
+        # index therefore remains compatible with old payment history.
+        await collection.create_index(
+            [("pending_key", ASCENDING)],
+            unique=True,
+            sparse=True,
+            name="unique_active_pending_payment",
+        )
+        await collection.create_index(
+            [("status", ASCENDING), ("created_at", ASCENDING)],
+            name="payment_status_created_at",
+        )
+        await collection.create_index(
+            [("user_id", ASCENDING), ("created_at", ASCENDING)],
+            name="payment_user_created_at",
+        )
+
+        _indexes_ready = True
+
+
+def _pending_key(user_id: int, plan: str) -> str:
+    return f"{int(user_id)}:{str(plan).strip().lower()}"
+
+
+async def expire_stale_pending_payments(
+    user_id: int | None = None,
+    *,
+    ttl_minutes: int = PENDING_PAYMENT_TTL_MINUTES,
+) -> int:
+    """Expire old pending screenshot payments so they cannot be approved."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=ttl_minutes)
+
+    query = {
+        "status": "pending",
+        "created_at": {"$lt": cutoff},
+    }
+    if user_id is not None:
+        query["user_id"] = int(user_id)
+
+    result = await payments_collection().update_many(
+        query,
+        {
+            "$set": {
+                "status": "expired",
+                "remarks": "Payment session expired before approval.",
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$unset": {"pending_key": ""},
+        },
+    )
+    return result.modified_count
 
 
 async def create_payment(
@@ -19,12 +94,22 @@ async def create_payment(
     duration_minutes: int = None,
     duration_text: str = None,
 ):
-    now = datetime.now(timezone.utc)
+    """
+    Create one active pending payment per user and plan.
 
-    payment = {
-        "user_id": user_id,
+    Repeated screenshot submissions update the existing pending payment rather
+    than creating duplicate admin approval requests.
+    """
+    await ensure_payment_indexes()
+    await expire_stale_pending_payments(user_id)
+
+    now = datetime.now(timezone.utc)
+    key = _pending_key(user_id, plan)
+
+    payment_fields = {
+        "user_id": int(user_id),
         "plan": plan,
-        "amount": amount,
+        "amount": float(amount),
         "screenshot_file_id": screenshot_file_id,
         "utr": utr,
         "duration_minutes": duration_minutes,
@@ -32,28 +117,56 @@ async def create_payment(
         "status": "pending",
         "admin_id": None,
         "remarks": None,
-        "created_at": now,
         "updated_at": now,
+        "pending_key": key,
     }
 
-    result = await payments_collection().insert_one(payment)
-    payment["_id"] = result.inserted_id
+    try:
+        payment = await payments_collection().find_one_and_update(
+            {"pending_key": key, "status": "pending"},
+            {
+                "$set": payment_fields,
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        # Another request won the race. Update and return that record.
+        payment = await payments_collection().find_one_and_update(
+            {"pending_key": key, "status": "pending"},
+            {"$set": payment_fields},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    if payment is None:
+        raise RuntimeError("Unable to create or update pending payment.")
+
     return payment
 
 
 def to_object_id(payment_id):
     if isinstance(payment_id, ObjectId):
         return payment_id
-    return ObjectId(str(payment_id))
+
+    try:
+        return ObjectId(str(payment_id))
+    except (InvalidId, TypeError, ValueError) as exc:
+        raise ValueError("Invalid payment ID.") from exc
 
 
 async def get_payment(payment_id):
-    return await payments_collection().find_one(
-        {"_id": to_object_id(payment_id)}
-    )
+    try:
+        object_id = to_object_id(payment_id)
+    except ValueError:
+        return None
+
+    return await payments_collection().find_one({"_id": object_id})
 
 
 async def get_pending_payments(limit: int = 20):
+    await expire_stale_pending_payments()
+
     return await payments_collection().find(
         {"status": "pending"}
     ).sort("created_at", -1).to_list(length=limit)
@@ -61,7 +174,7 @@ async def get_pending_payments(limit: int = 20):
 
 async def get_payment_history(limit: int = 50):
     return await payments_collection().find(
-        {"status": {"$in": ["approved", "rejected"]}}
+        {"status": {"$in": ["approved", "rejected", "expired"]}}
     ).sort("updated_at", -1).to_list(length=limit)
 
 
@@ -79,20 +192,12 @@ async def update_payment_status(
     if not payment:
         return False
 
-    result = await payments_collection().update_one(
-        {"_id": payment["_id"], "status": "pending"},
-        {
-            "$set": {
-                "status": status,
-                "admin_id": admin_id,
-                "remarks": remarks,
-                "processed_at": datetime.now(timezone.utc),
-                "updated_at": datetime.now(timezone.utc),
-            }
-        },
+    return await update_payment_status_by_id(
+        payment_id=payment["_id"],
+        status=status,
+        admin_id=admin_id,
+        remarks=remarks,
     )
-
-    return result.modified_count == 1
 
 
 async def update_payment_status_by_id(
@@ -101,20 +206,32 @@ async def update_payment_status_by_id(
     admin_id: int = None,
     remarks: str = None,
 ):
+    """
+    Apply a payment decision only while the record is pending.
+
+    This makes repeated admin clicks harmless and releases pending_key so the
+    user can submit a future payment for the same plan.
+    """
+    try:
+        object_id = to_object_id(payment_id)
+    except ValueError:
+        return False
+
+    now = datetime.now(timezone.utc)
+    update = {
+        "$set": {
+            "status": status,
+            "admin_id": admin_id,
+            "remarks": remarks,
+            "updated_at": now,
+            "processed_at": now,
+        },
+        "$unset": {"pending_key": ""},
+    }
+
     result = await payments_collection().update_one(
-        {
-            "_id": to_object_id(payment_id),
-            "status": "pending",
-        },
-        {
-            "$set": {
-                "status": status,
-                "admin_id": admin_id,
-                "remarks": remarks,
-                "processed_at": datetime.now(timezone.utc),
-                "updated_at": datetime.now(timezone.utc),
-            }
-        },
+        {"_id": object_id, "status": "pending"},
+        update,
     )
 
     return result.modified_count == 1
@@ -138,6 +255,7 @@ async def reject_payment(payment_id, admin_id: int, remarks: str = ""):
 
 
 async def count_pending_payments():
+    await expire_stale_pending_payments()
     return await payments_collection().count_documents(
         {"status": "pending"}
     )
