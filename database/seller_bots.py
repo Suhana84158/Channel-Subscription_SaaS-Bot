@@ -1,8 +1,13 @@
 from datetime import datetime, timezone
 from database.mongo import get_database
+from pymongo.errors import DuplicateKeyError
 from utils.crypto import decrypt_secret, encrypt_secret
 
 COLLECTION = "seller_bots"
+
+
+class BotOwnershipError(RuntimeError):
+    """Raised when a Telegram bot is already owned by another seller."""
 
 
 def seller_bots_collection():
@@ -66,36 +71,71 @@ async def get_bot_by_username(bot_username: str):
 
 
 async def save_bot(owner_id: int, bot_id: int, bot_name: str, bot_username: str, bot_token: str):
+    """
+    Save a clone bot without allowing ownership takeover.
+
+    The database query itself enforces ownership, so two sellers submitting the
+    same token concurrently cannot transfer the bot between accounts.
+    """
+    owner_id = int(owner_id)
+    bot_id = int(bot_id)
     now = datetime.now(timezone.utc)
+
     existing = await get_bot_by_bot_id(bot_id)
-    # First bot keeps old owner_id scope so all existing plans/users/settings remain intact.
+    if existing and int(existing.get("owner_id", 0)) != owner_id:
+        raise BotOwnershipError("This bot is already connected to another seller.")
+
+    # First bot keeps old owner_id scope so existing plans/users/settings remain intact.
     first_bot = await get_bot(owner_id)
     data_owner_id = (
-        int(existing.get("data_owner_id")) if existing and existing.get("data_owner_id") is not None
-        else int(owner_id) if not first_bot
-        else int(bot_id)
+        int(existing.get("data_owner_id"))
+        if existing and existing.get("data_owner_id") is not None
+        else owner_id if not first_bot
+        else bot_id
     )
-    await seller_bots_collection().update_one(
-        {"bot_id": int(bot_id)},
-        {
-            "$set": {
-                "owner_id": int(owner_id),
-                "data_owner_id": data_owner_id,
-                "bot_id": int(bot_id),
-                "bot_name": bot_name,
-                "bot_username": bot_username,
-                "bot_username_normalized": bot_username.lstrip("@").lower(),
-                "bot_token_encrypted": encrypt_secret(bot_token),
-                "active": True,
-                "status": "registered",
-                "updated_at": now,
+
+    query = {
+        "bot_id": bot_id,
+        "$or": [
+            {"owner_id": owner_id},
+            {"owner_id": {"$exists": False}},
+        ],
+    }
+
+    try:
+        result = await seller_bots_collection().update_one(
+            query,
+            {
+                "$set": {
+                    "owner_id": owner_id,
+                    "data_owner_id": data_owner_id,
+                    "bot_id": bot_id,
+                    "bot_name": bot_name,
+                    "bot_username": bot_username,
+                    "bot_username_normalized": bot_username.lstrip("@").lower(),
+                    "bot_token_encrypted": encrypt_secret(bot_token),
+                    "active": True,
+                    "status": "registered",
+                    "updated_at": now,
+                },
+                "$unset": {"bot_token": ""},
+                "$setOnInsert": {"created_at": now},
             },
-            "$unset": {"bot_token": ""},
-            "$setOnInsert": {"created_at": now},
-        },
-        upsert=True,
-    )
-    return await get_bot_by_bot_id(bot_id)
+            upsert=True,
+        )
+    except DuplicateKeyError as exc:
+        raise BotOwnershipError(
+            "This bot is already connected to another seller."
+        ) from exc
+
+    if result.matched_count == 0 and result.upserted_id is None:
+        raise BotOwnershipError("This bot is already connected to another seller.")
+
+    record = await get_bot_by_bot_id(bot_id)
+    if not record or int(record.get("owner_id", 0)) != owner_id:
+        raise BotOwnershipError("Unable to verify clone bot ownership.")
+
+    return record
 
 
 async def get_decrypted_bot_token(bot_id: int):
