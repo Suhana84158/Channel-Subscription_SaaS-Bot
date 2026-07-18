@@ -1,3 +1,5 @@
+import logging
+
 from telegram import Update, ForceReply
 from telegram.ext import (
     CallbackQueryHandler,
@@ -9,6 +11,8 @@ from telegram.ext import (
 
 from config import ADMIN_IDS
 from database.admins import get_all_admins
+
+logger = logging.getLogger(__name__)
 
 WAIT_SUPPORT = 1
 SUPPORT_REPLY_MAP = {}
@@ -41,7 +45,7 @@ async def receive_support_message(update: Update, context: ContextTypes.DEFAULT_
             if admin_id:
                 admin_ids.add(int(admin_id))
     except Exception:
-        pass
+        logger.exception("Failed to load additional support admins")
 
     text = (
         "📞 NEW SUPPORT REQUEST\n\n"
@@ -64,8 +68,12 @@ async def receive_support_message(update: Update, context: ContextTypes.DEFAULT_
             SUPPORT_REPLY_MAP[admin_msg.message_id] = user.id
             sent += 1
 
-        except Exception as e:
-            print(f"Support send failed: {e}")
+        except Exception:
+            logger.exception(
+                "Failed to forward support request admin_id=%s user_id=%s",
+                admin_id,
+                user.id,
+            )
 
     if sent:
         await message.reply_text("✅ Your support request has been sent.")
@@ -99,8 +107,13 @@ async def admin_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         await message.reply_text("✅ Reply sent to user.")
 
-    except Exception as e:
-        await message.reply_text(f"❌ Failed to send reply:\n{e}")
+    except Exception:
+        logger.exception(
+            "Failed to deliver support reply admin_id=%s user_id=%s",
+            update.effective_user.id if update.effective_user else None,
+            user_id,
+        )
+        await message.reply_text("❌ Failed to send reply. Please try again.")
 
 
 def support_callback():
