@@ -68,23 +68,26 @@ async def _runtime_health():
     database = get_database_health()
     database["status"] = "connected" if mongo_ok else "disconnected"
 
-    clone_status_method = getattr(
-        bot_manager,
-        "get_runtime_status",
-        None,
+    # ZIP 28 exposes ``runtime_health()``. Older patch builds used
+    # ``get_runtime_status()``, so support both names without changing the
+    # clone-bot manager API or breaking existing installations.
+    clone_status_method = (
+        getattr(bot_manager, "runtime_health", None)
+        or getattr(bot_manager, "get_runtime_status", None)
     )
 
-    if clone_status_method is not None:
+    if callable(clone_status_method):
         clone_bots = clone_status_method()
         if asyncio.iscoroutine(clone_bots):
             clone_bots = await clone_bots
     else:
         running = getattr(bot_manager, "_running", {})
         clone_bots = {
+            "active": len(running),
             "running": len(running),
             "offline": 0,
-            "restart_count": 0,
-            "failed": 0,
+            "unhealthy": 0,
+            "recovery_attempts_total": 0,
         }
 
     scheduler = scheduler_health()
