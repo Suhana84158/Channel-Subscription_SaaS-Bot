@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from database.mongo import get_database
 from utils.crypto import decrypt_secret, encrypt_secret
@@ -193,15 +194,92 @@ async def claim_transaction_success(transaction_id: str, gateway_payment_id: str
     )
 
 
-async def mark_transaction_fulfilled(transaction_id: str, details: dict | None = None) -> dict | None:
-    return await update_gateway_transaction(transaction_id, status="fulfilled", fulfilled_at=datetime.now(timezone.utc), fulfillment=details or {})
+async def claim_transaction_fulfillment(
+    transaction_id: str,
+    *,
+    lease_seconds: int = 300,
+) -> dict | None:
+    """Claim exclusive fulfillment ownership for one paid transaction.
+
+    A short lease allows recovery after a process crash while preventing two
+    webhook workers from activating the same purchase at the same time.
+    """
+    now = datetime.now(timezone.utc)
+    lease_until = now + timedelta(seconds=max(30, int(lease_seconds)))
+    return await _transactions().find_one_and_update(
+        {
+            "transaction_id": transaction_id,
+            "$or": [
+                {"status": {"$in": ["paid", "paid_unfulfilled"]}},
+                {
+                    "status": "fulfilling",
+                    "fulfillment_lease_until": {"$lte": now},
+                },
+            ],
+        },
+        {
+            "$set": {
+                "status": "fulfilling",
+                "fulfillment_started_at": now,
+                "fulfillment_lease_until": lease_until,
+                "updated_at": now,
+            },
+            "$inc": {"fulfillment_attempts": 1},
+            "$unset": {"fulfillment_error": ""},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+async def mark_transaction_fulfilled(
+    transaction_id: str,
+    details: dict | None = None,
+) -> dict | None:
+    now = datetime.now(timezone.utc)
+    return await _transactions().find_one_and_update(
+        {"transaction_id": transaction_id, "status": "fulfilling"},
+        {
+            "$set": {
+                "status": "fulfilled",
+                "fulfilled_at": now,
+                "fulfillment": details or {},
+                "updated_at": now,
+            },
+            "$unset": {"fulfillment_lease_until": ""},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+async def mark_transaction_fulfillment_retry(
+    transaction_id: str,
+    reason: str,
+) -> dict | None:
+    """Release a failed fulfillment claim so a later webhook can retry it."""
+    now = datetime.now(timezone.utc)
+    return await _transactions().find_one_and_update(
+        {"transaction_id": transaction_id, "status": "fulfilling"},
+        {
+            "$set": {
+                "status": "paid_unfulfilled",
+                "fulfillment_error": str(reason)[:500],
+                "updated_at": now,
+            },
+            "$unset": {"fulfillment_lease_until": ""},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
 
 
 async def mark_transaction_failed(transaction_id: str, reason: str = "", raw_event: dict | None = None):
     return await update_gateway_transaction(transaction_id, status="failed", failure_reason=reason[:500], raw_failure=raw_event or {})
 
 
-async def reserve_webhook_event(gateway: str, event_key: str, payload: dict | None = None) -> bool:
+async def reserve_webhook_event(
+    gateway: str,
+    event_key: str,
+    payload: dict | None = None,
+) -> bool:
     try:
         await _events().insert_one({
             "gateway": gateway,
@@ -210,7 +288,7 @@ async def reserve_webhook_event(gateway: str, event_key: str, payload: dict | No
             "created_at": datetime.now(timezone.utc),
         })
         return True
-    except Exception:
+    except DuplicateKeyError:
         return False
 
 
