@@ -23,7 +23,11 @@ async def activate_subscription(
         duration_minutes=duration_minutes,
     )
 
-    logger.info(f"Subscription activated for {user_id}")
+    logger.info(
+        "Subscription activated user_id=%s expiry=%s",
+        user_id,
+        expiry,
+    )
     return expiry
 
 
@@ -38,7 +42,11 @@ async def extend_subscription(
         duration_minutes=duration_minutes,
     )
 
-    logger.info(f"Subscription renewed for {user_id}")
+    logger.info(
+        "Subscription renewed user_id=%s expiry=%s",
+        user_id,
+        expiry,
+    )
     return expiry
 
 
