@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
+from pymongo import ReturnDocument
 from database.mongo import get_database
 
 SETTINGS="seller_settings"; PLANS="seller_plans"; CHANNELS="seller_channels"; USERS="seller_users"
@@ -381,23 +382,91 @@ async def count_all_referrals(owner_id:int, referrer_user_id:int):
     )
 
 
-async def mark_referral_rewarded(owner_id:int, referred_user_id:int):
+async def mark_referral_rewarded(
+    owner_id:int,
+    referred_user_id:int,
+    payment_id:str|None=None,
+):
+    """Atomically claim a referral reward without marking it completed yet."""
     now = datetime.now(timezone.utc)
     return await c(REFERRALS).find_one_and_update(
         {
             "owner_id":owner_id,
             "referred_user_id":int(referred_user_id),
             "rewarded":False,
+            "reward_status":{"$nin":["processing","rewarded"]},
         },
         {
             "$set":{
+                "reward_status":"processing",
+                "reward_payment_id":str(payment_id) if payment_id else None,
+                "reward_claimed_at":now,
+                "updated_at":now,
+            },
+            "$inc":{"reward_attempts":1},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+async def finalize_referral_reward(
+    owner_id:int,
+    referred_user_id:int,
+    payment_id:str|None=None,
+):
+    now = datetime.now(timezone.utc)
+    query = {
+        "owner_id":owner_id,
+        "referred_user_id":int(referred_user_id),
+        "rewarded":False,
+        "reward_status":"processing",
+    }
+    if payment_id:
+        query["reward_payment_id"] = str(payment_id)
+
+    result = await c(REFERRALS).update_one(
+        query,
+        {
+            "$set":{
                 "rewarded":True,
+                "reward_status":"rewarded",
                 "rewarded_at":now,
+                "updated_at":now,
+            },
+            "$unset":{"reward_error":""},
+        },
+    )
+    return result.modified_count == 1
+
+
+async def release_referral_reward(
+    owner_id:int,
+    referred_user_id:int,
+    error:str,
+    payment_id:str|None=None,
+):
+    now = datetime.now(timezone.utc)
+    query = {
+        "owner_id":owner_id,
+        "referred_user_id":int(referred_user_id),
+        "rewarded":False,
+        "reward_status":"processing",
+    }
+    if payment_id:
+        query["reward_payment_id"] = str(payment_id)
+
+    result = await c(REFERRALS).update_one(
+        query,
+        {
+            "$set":{
+                "reward_status":"failed",
+                "reward_error":str(error)[:500],
+                "reward_failed_at":now,
                 "updated_at":now,
             }
         },
-        return_document=True,
     )
+    return result.modified_count == 1
 
 
 async def stats(owner_id):
