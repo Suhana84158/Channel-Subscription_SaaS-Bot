@@ -73,6 +73,27 @@ async def reserve_payment_fingerprint(scope: str, owner_id: int, fingerprint: st
         raise
 
 
+async def release_payment_fingerprint(
+    scope: str,
+    owner_id: int,
+    fingerprint: str,
+    user_id: int | None = None,
+):
+    """Release a reserved fingerprint when payment creation fails."""
+    if not fingerprint:
+        return
+
+    query = {
+        "scope": scope,
+        "owner_id": int(owner_id),
+        "fingerprint": fingerprint,
+    }
+    if user_id is not None:
+        query["user_id"] = int(user_id)
+
+    await col(PAYMENT_FINGERPRINTS).delete_one(query)
+
+
 async def create_invoice(owner_id: int, user_id: int, payment: dict, seller_name: str = "Seller"):
     invoice_no = f"INV-{datetime.now(timezone.utc):%Y%m%d}-{uuid4().hex[:8].upper()}"
     doc = {
