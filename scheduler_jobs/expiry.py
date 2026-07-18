@@ -1,46 +1,64 @@
 from datetime import datetime, timezone
 
 from database.subscriptions import (
-    get_expired_subscriptions,
     expire_subscription,
+    get_expired_subscriptions,
+    get_subscription,
+    make_aware,
+    subscription_lock,
 )
-
 from services.telegram_service import (
     remove_user_from_channels,
     send_expiry_message,
 )
-
 from logging_config import get_logger
 
 logger = get_logger(__name__)
 
 
 async def check_expired_subscriptions():
-    """
-    Check all expired subscriptions
-    and remove users automatically.
-    """
+    """Process expired subscriptions safely without racing renewals."""
+    expired_users = await get_expired_subscriptions(
+        datetime.now(timezone.utc)
+    )
 
-    now = datetime.now(timezone.utc)
+    for snapshot in expired_users:
+        user_id = snapshot.get("user_id")
+        if user_id is None:
+            continue
 
-    expired_users = await get_expired_subscriptions(now)
-
-    if not expired_users:
-        return
-
-    for subscription in expired_users:
         try:
-            user_id = subscription["user_id"]
+            async with subscription_lock(user_id):
+                current = await get_subscription(user_id)
+                if not current or not current.get("active"):
+                    continue
 
-            await remove_user_from_channels(user_id)
+                current_expiry = make_aware(current.get("expiry_date"))
+                if not current_expiry or current_expiry > datetime.now(timezone.utc):
+                    continue
 
-            await send_expiry_message(user_id)
+                await remove_user_from_channels(user_id)
+                await send_expiry_message(user_id)
 
-            await expire_subscription(user_id)
+                expired = await expire_subscription(
+                    user_id,
+                    expected_expiry=current.get("expiry_date"),
+                )
 
-            logger.info(
-                f"Expired subscription processed: {user_id}"
+                if expired:
+                    logger.info(
+                        "Expired subscription processed user_id=%s expiry=%s",
+                        user_id,
+                        current_expiry,
+                    )
+                else:
+                    logger.warning(
+                        "Expiry state changed before final update user_id=%s",
+                        user_id,
+                    )
+
+        except Exception:
+            logger.exception(
+                "Failed processing expired subscription user_id=%s",
+                user_id,
             )
-
-        except Exception as e:
-            logger.exception(e)
