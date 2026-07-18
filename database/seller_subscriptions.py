@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from database.mongo import get_database
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 SETTINGS = "seller_subscription_settings"
 ASSIGNMENTS = "seller_plan_assignments"
@@ -268,6 +269,12 @@ def _requests():
 
 async def initialize_seller_subscription_extra_indexes():
     await _payments().create_index("payment_id", unique=True)
+    await _payments().create_index(
+        "pending_key",
+        unique=True,
+        sparse=True,
+        name="unique_pending_seller_plan_payment",
+    )
     await _payments().create_index([("status", 1), ("created_at", -1)])
     await _history().create_index([("owner_id", 1), ("created_at", -1)])
     await _requests().create_index([("owner_id", 1), ("status", 1)])
@@ -334,19 +341,59 @@ async def extend_plan_with_history(owner_id: int, plan_id: str, days: int, sourc
 
 
 async def create_seller_payment(owner_id: int, plan_id: str, file_id: str, request_type="upgrade"):
+    """
+    Create or update one active pending seller-plan payment.
+
+    Repeated submissions for the same seller and plan update the pending proof
+    instead of creating multiple approval records.
+    """
     import secrets
+
+    owner_id = int(owner_id)
     plan = await get_paid_plan(plan_id)
     if not plan:
         raise ValueError("Plan not found")
-    payment_id = secrets.token_hex(6)
+
     now = datetime.now(timezone.utc)
-    doc = {
-        "payment_id": payment_id, "owner_id": int(owner_id), "plan_id": plan_id,
-        "plan_name": plan.get("name", plan_id), "amount": float(plan.get("price", 0)),
-        "duration_days": int(plan.get("duration_days", 30)), "file_id": file_id,
-        "request_type": request_type, "status": "pending", "created_at": now,
+    pending_key = f"{owner_id}:{plan_id}"
+    payment_id = secrets.token_hex(6)
+
+    update = {
+        "$set": {
+            "owner_id": owner_id,
+            "plan_id": plan_id,
+            "plan_name": plan.get("name", plan_id),
+            "amount": float(plan.get("price", 0)),
+            "duration_days": int(plan.get("duration_days", 30)),
+            "file_id": file_id,
+            "request_type": request_type,
+            "status": "pending",
+            "pending_key": pending_key,
+            "updated_at": now,
+        },
+        "$setOnInsert": {
+            "payment_id": payment_id,
+            "created_at": now,
+        },
     }
-    await _payments().insert_one(doc)
+
+    try:
+        doc = await _payments().find_one_and_update(
+            {"pending_key": pending_key, "status": "pending"},
+            update,
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        doc = await _payments().find_one_and_update(
+            {"pending_key": pending_key, "status": "pending"},
+            {"$set": update["$set"]},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    if not doc:
+        raise RuntimeError("Unable to create seller payment request.")
+
     return doc
 
 
@@ -362,7 +409,15 @@ async def decide_seller_payment(payment_id: str, status: str, admin_id: int):
     now = datetime.now(timezone.utc)
     result = await _payments().find_one_and_update(
         {"payment_id": payment_id, "status": "pending"},
-        {"$set": {"status": status, "decided_at": now, "decided_by": int(admin_id)}},
+        {
+            "$set": {
+                "status": status,
+                "decided_at": now,
+                "decided_by": int(admin_id),
+                "updated_at": now,
+            },
+            "$unset": {"pending_key": ""},
+        },
         return_document=ReturnDocument.AFTER,
     )
     return result
