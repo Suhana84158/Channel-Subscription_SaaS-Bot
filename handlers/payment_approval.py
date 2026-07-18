@@ -6,6 +6,8 @@ from database.admins import is_admin
 from database.payments import (
     update_payment_status,
     update_payment_status_by_id,
+    decide_latest_payment,
+    decide_payment_by_id,
     get_pending_payments,
     get_payment,
     get_payment_history,
@@ -288,21 +290,28 @@ async def approve_payment_by_id(update: Update, context: ContextTypes.DEFAULT_TY
 
     try:
         if payment.get("status") == "pending":
-            decision_saved = await update_payment_status_by_id(
+            decided = await decide_payment_by_id(
                 payment_id=payment_id,
                 status="approved",
                 admin_id=query.from_user.id,
             )
-            if not decision_saved:
+            if decided is None:
                 payment = await get_payment(payment_id)
+                winner = payment.get("status") if payment else "unknown"
+                await safe_edit(
+                    query,
+                    "⚠️ Payment was already decided by another admin.\n\n"
+                    f"Final status: {winner}",
+                )
+                return
+            payment = decided
         elif payment.get("status") != "approved":
             await safe_edit(
                 query,
-                "⚠️ This payment cannot be approved.",
+                "⚠️ Payment was already decided.\n\n"
+                f"Final status: {payment.get('status', 'unknown')}",
             )
             return
-
-        payment = await get_payment(payment_id)
         result = await fulfill_approved_payment(
             payment,
             admin_id=query.from_user.id,
@@ -372,16 +381,23 @@ async def reject_payment_by_id(update: Update, context: ContextTypes.DEFAULT_TYP
 
         user_id = payment["user_id"]
 
-        claimed = await update_payment_status_by_id(
+        decided = await decide_payment_by_id(
             payment_id=payment_id,
             status="rejected",
             admin_id=query.from_user.id,
         )
 
-        if not claimed:
+        if decided is None:
+            current = await get_payment(payment_id)
+            final_status = (
+                current.get("status", "unknown")
+                if current
+                else "unknown"
+            )
             await safe_edit(
                 query,
-                "⚠️ This payment has already been processed.",
+                "⚠️ Payment was already decided by another admin.\n\n"
+                f"Final status: {final_status}",
             )
             return
 
@@ -408,21 +424,23 @@ async def approve_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = query.data.split("_")
         user_id = int(data[1])
 
-        claimed = await update_payment_status(
+        payment = await decide_latest_payment(
             user_id=user_id,
             status="approved",
             admin_id=query.from_user.id,
         )
 
-        payment = await get_latest_payment_for_user(
-            user_id,
-            status="approved",
-        )
-
-        if not payment:
+        if payment is None:
+            latest = await get_latest_payment_for_user(user_id)
+            final_status = (
+                latest.get("status", "unknown")
+                if latest
+                else "unknown"
+            )
             await safe_edit(
                 query,
-                "⚠️ Approved payment record was not found.",
+                "⚠️ Payment was already decided.\n\n"
+                f"Final status: {final_status}",
             )
             return
 
@@ -473,16 +491,23 @@ async def reject_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = int(query.data.split("_")[1])
 
-        claimed = await update_payment_status(
+        decided = await decide_latest_payment(
             user_id=user_id,
             status="rejected",
             admin_id=query.from_user.id,
         )
 
-        if not claimed:
+        if decided is None:
+            latest = await get_latest_payment_for_user(user_id)
+            final_status = (
+                latest.get("status", "unknown")
+                if latest
+                else "unknown"
+            )
             await safe_edit(
                 query,
-                "⚠️ This payment has already been processed.",
+                "⚠️ Payment was already decided.\n\n"
+                f"Final status: {final_status}",
             )
             return
 
