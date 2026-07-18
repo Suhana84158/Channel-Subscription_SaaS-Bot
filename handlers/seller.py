@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -35,6 +36,18 @@ from utils.timezone_ui import timezone_guide, timezone_keyboard, timezone_from_k
 
 
 logger = logging.getLogger(__name__)
+
+
+_channel_operation_locks: dict[int, asyncio.Lock] = {}
+
+
+def _channel_lock(owner_id: int) -> asyncio.Lock:
+    """Serialize channel add/remove/resend operations per seller."""
+    lock = _channel_operation_locks.get(int(owner_id))
+    if lock is None:
+        lock = asyncio.Lock()
+        _channel_operation_locks[int(owner_id)] = lock
+    return lock
 
 
 def main_seller_keyboard():
@@ -428,41 +441,138 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows)); return
 
     if action.startswith("seller_channel_remove_"):
-        parts=action.split("_"); bot_id=int(parts[3]); chat_id=int(parts[4]); await remove_channel(owner_id,chat_id)
-        await q.edit_message_text("✅ Channel/group removed.", reply_markup=channels_markup(bot_id)); return
+        parts = action.split("_")
+        bot_id = int(parts[3])
+        chat_id = int(parts[4])
+        async with _channel_lock(owner_id):
+            removed = await remove_channel(owner_id, chat_id)
+        await q.edit_message_text(
+            "✅ Channel/group removed." if removed else "ℹ️ Channel/group was already removed.",
+            reply_markup=channels_markup(bot_id),
+        )
+        return
 
     if action.startswith("seller_channel_resend_"):
         bot_id = int(action.rsplit("_", 1)[1])
         record = await get_bot_by_bot_id(bot_id)
         if not record or int(record.get("owner_id", 0)) != owner_id:
-            await q.answer("Clone bot not found.", show_alert=True); return
-        running = bot_manager.get_running(bot_id) or bot_manager.get_running(owner_id)
-        channels = await get_channels(owner_id)
-        db = get_database()
-        now = __import__('datetime').datetime.now(__import__('datetime').timezone.utc)
-        subs = await db['seller_subscriptions'].find({'owner_id': owner_id, 'active': True, 'expiry_date': {'$gt': now}}).to_list(length=5000)
-        if not running:
-            await q.edit_message_text("❌ Clone bot is not running. Resume it first.", reply_markup=channels_markup(bot_id)); return
-        if not channels:
-            await q.edit_message_text("❌ No channel/group connected.", reply_markup=channels_markup(bot_id)); return
-        sent = failed = 0
-        for sub in subs:
-            uid = int(sub.get('user_id', 0))
-            if not uid: continue
-            links=[]
-            for ch in channels:
+            await q.answer("Clone bot not found.", show_alert=True)
+            return
+
+        if _channel_lock(owner_id).locked():
+            await q.answer(
+                "Another channel operation is already running. Please wait.",
+                show_alert=True,
+            )
+            return
+
+        await q.edit_message_text("⏳ Preparing fresh invite links...")
+
+        async with _channel_lock(owner_id):
+            running = bot_manager.get_running(bot_id) or bot_manager.get_running(owner_id)
+            if not running:
+                await q.edit_message_text(
+                    "❌ Clone bot is not running. Resume it first.",
+                    reply_markup=channels_markup(bot_id),
+                )
+                return
+
+            # This immutable snapshot cannot change while resend is running because
+            # add/remove operations use the same per-seller lock.
+            channels = tuple(await get_channels(owner_id))
+            if not channels:
+                await q.edit_message_text(
+                    "❌ No channel/group connected.",
+                    reply_markup=channels_markup(bot_id),
+                )
+                return
+
+            db = get_database()
+            now = datetime.now(timezone.utc)
+            subs = await db["seller_subscriptions"].find(
+                {
+                    "owner_id": owner_id,
+                    "active": True,
+                    "expiry_date": {"$gt": now},
+                },
+                {"user_id": 1},
+            ).to_list(length=5000)
+
+            sent = failed = skipped = 0
+            for sub in subs:
+                uid = int(sub.get("user_id") or 0)
+                if not uid:
+                    skipped += 1
+                    continue
+
+                links = []
+                for channel in channels:
+                    chat_id = int(channel["chat_id"])
+                    try:
+                        invite = await running.application.bot.create_chat_invite_link(
+                            chat_id,
+                            member_limit=1,
+                        )
+                        links.append(
+                            f"{channel.get('title', 'Channel/Group')}: {invite.invite_link}"
+                        )
+                    except TelegramError as exc:
+                        logger.warning(
+                            "Invite creation failed owner_id=%s bot_id=%s "
+                            "user_id=%s chat_id=%s error=%s",
+                            owner_id,
+                            bot_id,
+                            uid,
+                            chat_id,
+                            exc,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Unexpected invite creation failure owner_id=%s "
+                            "bot_id=%s user_id=%s chat_id=%s",
+                            owner_id,
+                            bot_id,
+                            uid,
+                            chat_id,
+                        )
+
+                if not links:
+                    failed += 1
+                    continue
+
                 try:
-                    link = await running.application.bot.create_chat_invite_link(int(ch['chat_id']), member_limit=1)
-                    links.append(f"{ch.get('title','Channel/Group')}: {link.invite_link}")
+                    await running.application.bot.send_message(
+                        uid,
+                        "🔗 Your fresh invite links:\n\n" + "\n".join(links),
+                        disable_web_page_preview=True,
+                    )
+                    sent += 1
+                except TelegramError as exc:
+                    failed += 1
+                    logger.warning(
+                        "Invite resend delivery failed owner_id=%s bot_id=%s "
+                        "user_id=%s error=%s",
+                        owner_id,
+                        bot_id,
+                        uid,
+                        exc,
+                    )
                 except Exception:
-                    pass
-            if not links: failed += 1; continue
-            try:
-                await running.application.bot.send_message(uid, "🔗 Your fresh invite links:\n\n" + "\n".join(links))
-                sent += 1
-            except Exception:
-                failed += 1
-        await q.edit_message_text(f"✅ Invite link resend completed.\n\nSent: {sent}\nFailed: {failed}", reply_markup=channels_markup(bot_id)); return
+                    failed += 1
+                    logger.exception(
+                        "Unexpected invite delivery failure owner_id=%s "
+                        "bot_id=%s user_id=%s",
+                        owner_id,
+                        bot_id,
+                        uid,
+                    )
+
+        await q.edit_message_text(
+            "✅ Invite link resend completed.\n\n"
+            f"Sent: {sent}\nFailed: {failed}\nSkipped: {skipped}",
+            reply_markup=channels_markup(bot_id),
+        )
+        return
 
     if action == "seller_bots_list":
         bots = await get_bots(owner_id)
@@ -704,7 +814,8 @@ async def receive_seller_token(update: Update, context: ContextTypes.DEFAULT_TYP
             if not title:
                 title = "Telegram Channel/Group"
 
-            await add_channel(owner_id, chat_id, title, chat.type)
+            async with _channel_lock(owner_id):
+                await add_channel(owner_id, chat_id, title, chat.type)
             context.user_data.clear()
             await update.effective_message.reply_text(
                 "✅ Channel/group verified and added successfully.",
