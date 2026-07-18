@@ -11,11 +11,18 @@ from telegram.ext import (
 
 from config import ADMIN_IDS
 from database.admins import get_all_admins
+from database.live_support import (
+    get_private_message_link,
+    save_private_message_link,
+)
 
 logger = logging.getLogger(__name__)
 
 WAIT_SUPPORT = 1
+# Fast in-memory cache. The database mapping remains the source of truth
+# after restarts and avoids message-ID collisions between admin chats.
 SUPPORT_REPLY_MAP = {}
+MAIN_SUPPORT_OWNER_ID = 0
 
 
 async def support_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -65,7 +72,14 @@ async def receive_support_message(update: Update, context: ContextTypes.DEFAULT_
                 reply_markup=ForceReply(selective=True),
             )
 
-            SUPPORT_REPLY_MAP[admin_msg.message_id] = user.id
+            cache_key = (int(admin_id), int(admin_msg.message_id))
+            SUPPORT_REPLY_MAP[cache_key] = int(user.id)
+            await save_private_message_link(
+                owner_id=MAIN_SUPPORT_OWNER_ID,
+                admin_chat_id=int(admin_id),
+                admin_message_id=int(admin_msg.message_id),
+                user_id=int(user.id),
+            )
             sent += 1
 
         except Exception:
@@ -89,10 +103,33 @@ async def admin_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not message.reply_to_message:
         return
 
-    replied_id = message.reply_to_message.message_id
-    user_id = SUPPORT_REPLY_MAP.get(replied_id)
+    admin_chat_id = int(update.effective_chat.id)
+    replied_id = int(message.reply_to_message.message_id)
+    cache_key = (admin_chat_id, replied_id)
+    user_id = SUPPORT_REPLY_MAP.get(cache_key)
 
     if not user_id:
+        try:
+            link = await get_private_message_link(
+                owner_id=MAIN_SUPPORT_OWNER_ID,
+                admin_chat_id=admin_chat_id,
+                admin_message_id=replied_id,
+            )
+            if link:
+                user_id = int(link["user_id"])
+                SUPPORT_REPLY_MAP[cache_key] = user_id
+        except Exception:
+            logger.exception(
+                "Failed to resolve persisted support mapping "
+                "admin_chat_id=%s replied_message_id=%s",
+                admin_chat_id,
+                replied_id,
+            )
+
+    if not user_id:
+        await message.reply_text(
+            "❌ This support request mapping is unavailable or expired."
+        )
         return
 
     try:
