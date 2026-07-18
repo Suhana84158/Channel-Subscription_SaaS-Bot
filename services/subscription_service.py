@@ -1,5 +1,6 @@
 from database.subscriptions import (
     activate_subscription as db_activate_subscription,
+    fulfill_payment_subscription as db_fulfill_payment_subscription,
     renew_subscription,
     get_subscription,
     is_subscription_active,
@@ -29,6 +30,33 @@ async def activate_subscription(
         expiry,
     )
     return expiry
+
+
+async def fulfill_payment_subscription(
+    user_id: int,
+    fulfillment_key: str,
+    plan_name: str = "Premium",
+    plan_days: int = 0,
+    duration_minutes: int = 0,
+):
+    result = await db_fulfill_payment_subscription(
+        user_id=user_id,
+        fulfillment_key=fulfillment_key,
+        plan_name=plan_name,
+        duration_days=plan_days,
+        duration_minutes=duration_minutes,
+    )
+
+    logger.info(
+        "Payment subscription fulfillment user_id=%s key=%s "
+        "applied=%s action=%s expiry=%s",
+        user_id,
+        fulfillment_key,
+        result["applied"],
+        result["action"],
+        result["expiry"],
+    )
+    return result
 
 
 async def extend_subscription(
