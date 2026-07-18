@@ -79,19 +79,20 @@ async def update_payment_status(
     if not payment:
         return False
 
-    await payments_collection().update_one(
-        {"_id": payment["_id"]},
+    result = await payments_collection().update_one(
+        {"_id": payment["_id"], "status": "pending"},
         {
             "$set": {
                 "status": status,
                 "admin_id": admin_id,
                 "remarks": remarks,
+                "processed_at": datetime.now(timezone.utc),
                 "updated_at": datetime.now(timezone.utc),
             }
         },
     )
 
-    return True
+    return result.modified_count == 1
 
 
 async def update_payment_status_by_id(
@@ -101,18 +102,22 @@ async def update_payment_status_by_id(
     remarks: str = None,
 ):
     result = await payments_collection().update_one(
-        {"_id": to_object_id(payment_id)},
+        {
+            "_id": to_object_id(payment_id),
+            "status": "pending",
+        },
         {
             "$set": {
                 "status": status,
                 "admin_id": admin_id,
                 "remarks": remarks,
+                "processed_at": datetime.now(timezone.utc),
                 "updated_at": datetime.now(timezone.utc),
             }
         },
     )
 
-    return result.modified_count > 0
+    return result.modified_count == 1
 
 
 async def approve_payment(payment_id, admin_id: int):
