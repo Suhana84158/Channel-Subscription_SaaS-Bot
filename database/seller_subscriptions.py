@@ -445,5 +445,46 @@ async def reminder_was_sent(owner_id: int, key: str):
     return key in (a.get("reminders_sent") or [])
 
 
+async def claim_reminder(owner_id: int, key: str) -> bool:
+    """
+    Atomically reserve one reminder delivery.
+
+    This prevents two scheduler instances from sending the same reminder at
+    the same time. A failed delivery must call release_reminder_claim().
+    """
+    result = await _assignments().update_one(
+        {
+            "owner_id": int(owner_id),
+            "reminders_sent": {"$ne": key},
+            "reminder_claims": {"$ne": key},
+        },
+        {
+            "$addToSet": {"reminder_claims": key},
+            "$set": {"reminder_claim_updated_at": datetime.now(timezone.utc)},
+        },
+    )
+    return result.modified_count == 1
+
+
+async def release_reminder_claim(owner_id: int, key: str):
+    await _assignments().update_one(
+        {"owner_id": int(owner_id)},
+        {
+            "$pull": {"reminder_claims": key},
+            "$set": {"reminder_claim_updated_at": datetime.now(timezone.utc)},
+        },
+    )
+
+
 async def mark_reminder_sent(owner_id: int, key: str):
-    await _assignments().update_one({"owner_id": int(owner_id)}, {"$addToSet": {"reminders_sent": key}})
+    """
+    Finalize a successfully delivered reminder and release its claim.
+    """
+    await _assignments().update_one(
+        {"owner_id": int(owner_id)},
+        {
+            "$addToSet": {"reminders_sent": key},
+            "$pull": {"reminder_claims": key},
+            "$set": {"reminder_sent_at": datetime.now(timezone.utc)},
+        },
+    )
