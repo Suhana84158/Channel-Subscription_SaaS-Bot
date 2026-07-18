@@ -179,25 +179,109 @@ async def get_payment_history(limit: int = 50):
     ).sort("updated_at", -1).to_list(length=limit)
 
 
-async def update_payment_status(
+async def decide_latest_payment(
     user_id: int,
     status: str,
     admin_id: int = None,
     remarks: str = None,
 ):
     payment = await payments_collection().find_one(
-        {"user_id": user_id, "status": "pending"},
+        {
+            "user_id": int(user_id),
+            "status": "pending",
+        },
         sort=[("created_at", -1)],
     )
 
     if not payment:
-        return False
+        return None
 
-    return await update_payment_status_by_id(
+    return await decide_payment_by_id(
         payment_id=payment["_id"],
         status=status,
         admin_id=admin_id,
         remarks=remarks,
+    )
+
+
+async def update_payment_status(
+    user_id: int,
+    status: str,
+    admin_id: int = None,
+    remarks: str = None,
+):
+    """Backward-compatible boolean wrapper for legacy callbacks."""
+    payment = await decide_latest_payment(
+        user_id=user_id,
+        status=status,
+        admin_id=admin_id,
+        remarks=remarks,
+    )
+    return payment is not None
+
+
+async def decide_payment_by_id(
+    payment_id,
+    status: str,
+    admin_id: int = None,
+    remarks: str = None,
+):
+    """
+    Atomically decide one pending payment.
+
+    Only the first admin action can move the payment away from ``pending``.
+    The returned document is the winning decision. If another admin already
+    decided it, ``None`` is returned.
+    """
+    if status not in {"approved", "rejected"}:
+        raise ValueError("Payment status must be approved or rejected.")
+
+    try:
+        object_id = to_object_id(payment_id)
+    except ValueError:
+        return None
+
+    now = datetime.now(timezone.utc)
+    set_fields = {
+        "status": status,
+        "admin_id": admin_id,
+        "remarks": remarks,
+        "updated_at": now,
+        "processed_at": now,
+        "decision_status": status,
+        "decision_admin_id": admin_id,
+        "decision_at": now,
+    }
+
+    if status == "approved":
+        set_fields.update(
+            {
+                "fulfillment_status": "pending",
+                "fulfillment_attempts": 0,
+                "fulfilled_channel_ids": [],
+            }
+        )
+    else:
+        set_fields.update(
+            {
+                "fulfillment_status": "not_required",
+            }
+        )
+
+    return await payments_collection().find_one_and_update(
+        {
+            "_id": object_id,
+            "status": "pending",
+        },
+        {
+            "$set": set_fields,
+            "$unset": {
+                "pending_key": "",
+                "fulfillment_claimed_at": "",
+                "fulfillment_error": "",
+            },
+        },
+        return_document=ReturnDocument.AFTER,
     )
 
 
@@ -207,35 +291,14 @@ async def update_payment_status_by_id(
     admin_id: int = None,
     remarks: str = None,
 ):
-    """
-    Apply a payment decision only while the record is pending.
-
-    This makes repeated admin clicks harmless and releases pending_key so the
-    user can submit a future payment for the same plan.
-    """
-    try:
-        object_id = to_object_id(payment_id)
-    except ValueError:
-        return False
-
-    now = datetime.now(timezone.utc)
-    update = {
-        "$set": {
-            "status": status,
-            "admin_id": admin_id,
-            "remarks": remarks,
-            "updated_at": now,
-            "processed_at": now,
-        },
-        "$unset": {"pending_key": ""},
-    }
-
-    result = await payments_collection().update_one(
-        {"_id": object_id, "status": "pending"},
-        update,
+    """Backward-compatible boolean wrapper around the atomic decision."""
+    payment = await decide_payment_by_id(
+        payment_id=payment_id,
+        status=status,
+        admin_id=admin_id,
+        remarks=remarks,
     )
-
-    return result.modified_count == 1
+    return payment is not None
 
 
 async def approve_payment(payment_id, admin_id: int):
