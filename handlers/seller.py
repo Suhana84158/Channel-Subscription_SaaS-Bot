@@ -7,6 +7,7 @@ from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, fil
 from datetime import datetime, timezone, timedelta
 
 from database.seller_bots import (
+    BotOwnershipError,
     count_owner_bots,
     delete_bot,
     get_bot,
@@ -860,21 +861,93 @@ async def receive_seller_token(update: Update, context: ContextTypes.DEFAULT_TYP
         me = await temp.get_me()
         existing_token_record = await get_bot_by_bot_id(me.id)
         if existing_token_record and int(existing_token_record.get("owner_id", 0)) != owner_id:
-            await update.effective_message.reply_text("❌ This bot is already connected to another seller.")
+            await update.effective_message.reply_text(
+                "❌ This bot is already connected to another seller."
+            )
             return
-        if replace_bot_id and int(replace_bot_id) != int(me.id):
-            await bot_manager.stop_bot(int(replace_bot_id), "replacing")
-            await delete_bot(owner_id, int(replace_bot_id))
-        await save_bot(owner_id, me.id, me.first_name, me.username or str(me.id), token)
-        context.user_data.clear()
+
+        replacing_different_bot = (
+            replace_bot_id
+            and int(replace_bot_id) != int(me.id)
+        )
+
+        # Register and start the new bot first. The old bot remains untouched
+        # until the replacement is confirmed healthy.
+        await save_bot(
+            owner_id,
+            me.id,
+            me.first_name,
+            me.username or str(me.id),
+            token,
+        )
+
         started = await bot_manager.start_bot(me.id)
+        if not started:
+            if replacing_different_bot:
+                try:
+                    await bot_manager.stop_bot(me.id, "replacement_failed")
+                except Exception:
+                    logger.exception(
+                        "Failed to stop unsuccessful replacement bot "
+                        "owner_id=%s bot_id=%s",
+                        owner_id,
+                        me.id,
+                    )
+                await delete_bot(owner_id, me.id)
+
+            await update.effective_message.reply_text(
+                "❌ New clone bot could not start. Your previous clone bot "
+                "was not removed."
+            )
+            return
+
+        # Only retire the old bot after the replacement is running.
+        if replacing_different_bot:
+            try:
+                await bot_manager.stop_bot(int(replace_bot_id), "replaced")
+                await delete_bot(owner_id, int(replace_bot_id))
+            except Exception:
+                logger.exception(
+                    "Replacement started but old clone bot cleanup failed "
+                    "owner_id=%s old_bot_id=%s new_bot_id=%s",
+                    owner_id,
+                    replace_bot_id,
+                    me.id,
+                )
+                await update.effective_message.reply_text(
+                    "⚠️ New clone bot is running, but the old bot could not "
+                    "be removed automatically. Please remove it again."
+                )
+
+        context.user_data.clear()
         record = await get_bot_by_bot_id(me.id)
+        username = me.username or str(me.id)
         await update.effective_message.reply_text(
-            f"✅ Clone bot connected: @{me.username}\nRuntime: {'running' if started else 'failed'}",
+            f"✅ Clone bot connected: @{username}\nRuntime: running",
             reply_markup=selected_bot_markup(record),
         )
+    except BotOwnershipError:
+        await update.effective_message.reply_text(
+            "❌ This bot is already connected to another seller."
+        )
     except (InvalidToken, TelegramError) as exc:
-        await update.effective_message.reply_text(f"❌ Invalid token or Telegram error: {exc}")
+        logger.warning(
+            "Clone bot token validation failed owner_id=%s error=%s",
+            owner_id,
+            exc,
+        )
+        await update.effective_message.reply_text(
+            "❌ Invalid bot token or Telegram connection error."
+        )
+    except Exception:
+        logger.exception(
+            "Clone bot connection failed owner_id=%s replace_bot_id=%s",
+            owner_id,
+            replace_bot_id,
+        )
+        await update.effective_message.reply_text(
+            "❌ Clone bot could not be connected. Please try again."
+        )
 
 
 async def receive_seller_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
