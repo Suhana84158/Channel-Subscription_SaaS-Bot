@@ -32,6 +32,7 @@ from database.live_support import (
 from database.platform_features import (
     audit,
     broadcast_cancel_requested,
+    claim_failed_delivery,
     claim_scheduled_broadcast,
     create_coupon,
     create_invoice,
@@ -39,6 +40,7 @@ from database.platform_features import (
     get_policy,
     list_coupons,
     pending_scheduled_broadcasts,
+    release_failed_delivery_claim,
     release_scheduled_broadcast,
     reserve_payment_fingerprint,
     resolve_failed_delivery,
@@ -1454,23 +1456,97 @@ class SellerBotManager:
                 ]),
             )
             return
-        if a=="a_retry_failed":
-            failed_docs=await get_failed_deliveries(owner,"invite_resend")
-            sent=still_failed=0
-            channels=await get_channels(owner)
+        if a == "a_retry_failed":
+            failed_docs = await get_failed_deliveries(
+                owner,
+                "invite_resend",
+            )
+            sent = still_failed = skipped = 0
+            channels = await get_channels(owner)
+
             for item in failed_docs:
-                uid=int(item.get("user_id"))
+                claimed = await claim_failed_delivery(
+                    item["_id"],
+                    owner,
+                    stale_after_seconds=600,
+                )
+                if not claimed:
+                    skipped += 1
+                    continue
+
+                uid = int(claimed.get("user_id"))
+
                 try:
-                    links=[]
+                    links = []
+
                     for ch in channels:
-                        inv=await context.bot.create_chat_invite_link(ch["chat_id"],member_limit=1)
-                        await save_invite(owner, uid, ch["chat_id"], inv.invite_link)
-                        links.append(f"{ch.get('title','Channel')}: {inv.invite_link}")
-                    await context.bot.send_message(uid,"🔁 Fresh invite link(s):\n\n"+"\n".join(links),disable_web_page_preview=True)
-                    await resolve_failed_delivery(item["_id"]); sent+=1
-                except Exception:
-                    still_failed+=1
-            await q.edit_message_text(f"🔁 Retry completed\n\nSent: {sent}\nStill failed: {still_failed}",reply_markup=self.admin_menu()); return
+                        invite = await context.bot.create_chat_invite_link(
+                            ch["chat_id"],
+                            member_limit=1,
+                        )
+                        await save_invite(
+                            owner,
+                            uid,
+                            ch["chat_id"],
+                            invite.invite_link,
+                        )
+                        links.append(
+                            f"{ch.get('title', 'Channel')}: "
+                            f"{invite.invite_link}"
+                        )
+
+                    await context.bot.send_message(
+                        uid,
+                        "🔁 Fresh invite link(s):\n\n"
+                        + "\n".join(links),
+                        disable_web_page_preview=True,
+                    )
+
+                    resolved = await resolve_failed_delivery(
+                        claimed["_id"]
+                    )
+                    if resolved:
+                        sent += 1
+                    else:
+                        still_failed += 1
+                        logger.warning(
+                            "Failed delivery retry sent but could not "
+                            "finalize owner_id=%s user_id=%s delivery_id=%s",
+                            owner,
+                            uid,
+                            claimed["_id"],
+                        )
+                except Exception as exc:
+                    still_failed += 1
+                    logger.exception(
+                        "Failed delivery retry failed owner_id=%s "
+                        "user_id=%s delivery_id=%s",
+                        owner,
+                        uid,
+                        claimed["_id"],
+                    )
+                    try:
+                        await release_failed_delivery_claim(
+                            claimed["_id"],
+                            str(exc),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed delivery claim release failed "
+                            "owner_id=%s user_id=%s delivery_id=%s",
+                            owner,
+                            uid,
+                            claimed["_id"],
+                        )
+
+            await q.edit_message_text(
+                "🔁 Retry completed\n\n"
+                f"Sent: {sent}\n"
+                f"Still failed: {still_failed}\n"
+                f"Already processing: {skipped}",
+                reply_markup=self.admin_menu(),
+            )
+            return
         if a.startswith("a_channel_del_"): await remove_channel(owner,int(a.replace("a_channel_del_",""))); await q.edit_message_text("✅ Removed",reply_markup=self.channels_menu()); return
         if a=="a_welcome":
             s=await ensure_seller_defaults(owner,(await get_bot_by_data_owner_id(owner) or {}).get("bot_name","Subscription Bot"))
