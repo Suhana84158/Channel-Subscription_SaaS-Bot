@@ -31,6 +31,7 @@ from database.live_support import (
 )
 from database.platform_features import (
     audit,
+    broadcast_cancel_requested,
     claim_scheduled_broadcast,
     create_coupon,
     create_invoice,
@@ -3020,6 +3021,15 @@ class SellerBotManager:
             success = failed = 0
 
             for user in users:
+                if await broadcast_cancel_requested(job_id):
+                    logger.info(
+                        "Scheduled broadcast cancellation observed "
+                        "job_id=%s owner_id=%s",
+                        job_id,
+                        owner,
+                    )
+                    break
+
                 uid = user.get("user_id")
                 if not uid or uid == owner:
                     continue
