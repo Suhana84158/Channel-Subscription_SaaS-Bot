@@ -105,6 +105,12 @@ class SellerBotManager:
         self._running: Dict[int, RunningSellerBot] = {}
         self._bot_locks: Dict[int, asyncio.Lock] = {}
         self._restore_semaphore = asyncio.Semaphore(3)
+        self._watchdog_lock = asyncio.Lock()
+        self._recovery_attempts: Dict[int, int] = {}
+        self._recovery_totals: Dict[int, int] = {}
+        self._last_recovery_at: Dict[int, datetime] = {}
+        self._last_failure_at: Dict[int, datetime] = {}
+        self._last_recovery_error: Dict[int, str] = {}
 
     def _lock_for(self, bot_id: int) -> asyncio.Lock:
         bot_id = int(bot_id)
@@ -3358,25 +3364,210 @@ class SellerBotManager:
                 logger.error("Clone bot restore task failed", exc_info=(type(result), result, result.__traceback__))
         return {"started": started, "failed": failed}
 
+    async def _recover_bot_with_retry(
+        self,
+        bot_id: int,
+        *,
+        max_attempts: int = 3,
+        delays=(2, 5, 10),
+    ) -> bool:
+        """Recover one clone bot with bounded retries and recovery metrics."""
+        bot_id = int(bot_id)
+        last_error = ""
+
+        for attempt in range(1, max_attempts + 1):
+            self._recovery_attempts[bot_id] = attempt
+            self._recovery_totals[bot_id] = self._recovery_totals.get(bot_id, 0) + 1
+            logger.warning(
+                "[RECOVERY] clone bot restart bot_id=%s attempt=%s/%s",
+                bot_id,
+                attempt,
+                max_attempts,
+            )
+
+            try:
+                recovered = await self.restart_bot(bot_id)
+                if recovered:
+                    now = datetime.now(timezone.utc)
+                    self._last_recovery_at[bot_id] = now
+                    self._last_recovery_error.pop(bot_id, None)
+                    self._recovery_attempts[bot_id] = 0
+                    logger.info(
+                        "[RECOVERY] clone bot restored bot_id=%s attempt=%s time=%s",
+                        bot_id,
+                        attempt,
+                        now.isoformat(),
+                    )
+                    return True
+                last_error = "restart_bot returned False"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = str(exc)[:500]
+                logger.exception(
+                    "[RECOVERY] clone bot restart failed bot_id=%s attempt=%s",
+                    bot_id,
+                    attempt,
+                )
+
+            self._last_failure_at[bot_id] = datetime.now(timezone.utc)
+            self._last_recovery_error[bot_id] = last_error
+            if attempt < max_attempts:
+                delay = delays[min(attempt - 1, len(delays) - 1)]
+                await asyncio.sleep(max(0, delay))
+
+        self._recovery_attempts[bot_id] = 0
+        try:
+            await set_runtime_status(bot_id, "recovery_failed", last_error[:500])
+        except Exception:
+            logger.exception(
+                "Could not save recovery failure status bot_id=%s",
+                bot_id,
+            )
+        return False
+
     async def recover_dead_bots(self):
-        """Restart clone bots whose Application or polling updater stopped."""
-        dead_ids = []
+        """Recover stopped and unexpectedly missing active clone-bot runtimes."""
+        if self._watchdog_lock.locked():
+            return {
+                "checked": len(self._running),
+                "candidates": 0,
+                "restarted": 0,
+                "failed": 0,
+                "skipped": True,
+            }
+
+        async with self._watchdog_lock:
+            records = await get_all_active_bots()
+            active_ids = {
+                int(record["bot_id"])
+                for record in records
+                if record.get("bot_id") is not None
+            }
+
+            # Remove stale in-memory entries for bots that are no longer active.
+            stale_ids = [
+                int(bot_id)
+                for bot_id in list(self._running)
+                if int(bot_id) not in active_ids
+            ]
+            for bot_id in stale_ids:
+                running = self._running.pop(bot_id, None)
+                if running:
+                    await self._safe_shutdown(running.application)
+
+            candidates = []
+            for bot_id in active_ids:
+                running = self._running.get(bot_id)
+                if running is None:
+                    candidates.append(bot_id)
+                    continue
+
+                app = running.application
+                updater_running = bool(app.updater and app.updater.running)
+                if not app.running or not updater_running:
+                    candidates.append(bot_id)
+
+            if not candidates:
+                return {
+                    "checked": len(active_ids),
+                    "candidates": 0,
+                    "restarted": 0,
+                    "failed": 0,
+                    "stale_removed": len(stale_ids),
+                    "skipped": False,
+                }
+
+            logger.warning(
+                "Clone bot watchdog recovery candidates: %s",
+                candidates,
+            )
+            results = await asyncio.gather(
+                *(self._recover_bot_with_retry(bot_id) for bot_id in candidates),
+                return_exceptions=True,
+            )
+
+            restarted = sum(result is True for result in results)
+            failed = len(results) - restarted
+            for bot_id, result in zip(candidates, results):
+                if isinstance(result, Exception):
+                    self._last_failure_at[bot_id] = datetime.now(timezone.utc)
+                    self._last_recovery_error[bot_id] = str(result)[:500]
+                    logger.error(
+                        "Clone bot watchdog task failed bot_id=%s",
+                        bot_id,
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
+
+            return {
+                "checked": len(active_ids),
+                "candidates": len(candidates),
+                "restarted": restarted,
+                "failed": failed,
+                "stale_removed": len(stale_ids),
+                "skipped": False,
+            }
+
+    async def runtime_health(self):
+        """Return clone-bot runtime information for health endpoints."""
+        records = await get_all_active_bots()
+        active_ids = {
+            int(record["bot_id"])
+            for record in records
+            if record.get("bot_id") is not None
+        }
+        running_ids = set()
+        unhealthy_ids = []
+
         for bot_id, running in list(self._running.items()):
             app = running.application
-            updater_running = bool(app.updater and app.updater.running)
-            if not app.running or not updater_running:
-                dead_ids.append(int(bot_id))
+            healthy = bool(
+                app.running
+                and app.updater
+                and app.updater.running
+            )
+            if healthy:
+                running_ids.add(int(bot_id))
+            else:
+                unhealthy_ids.append(int(bot_id))
 
-        if not dead_ids:
-            return {"checked": len(self._running), "restarted": 0}
-
-        logger.warning("Clone bot watchdog found stopped runtimes: %s", dead_ids)
-        results = await asyncio.gather(
-            *(self.restart_bot(bot_id) for bot_id in dead_ids),
-            return_exceptions=True,
+        offline_ids = sorted(active_ids - running_ids)
+        all_metric_ids = active_ids | set(self._recovery_totals)
+        recovery_total = sum(
+            self._recovery_totals.get(bot_id, 0)
+            for bot_id in all_metric_ids
         )
-        restarted = sum(result is True for result in results)
-        return {"checked": len(self._running), "restarted": restarted}
+
+        def iso(value):
+            return value.isoformat() if value else None
+
+        return {
+            "active": len(active_ids),
+            "running": len(running_ids),
+            "offline": len(offline_ids),
+            "unhealthy": len(unhealthy_ids),
+            "offline_bot_ids": offline_ids,
+            "unhealthy_bot_ids": sorted(unhealthy_ids),
+            "recovery_attempts_total": recovery_total,
+            "currently_recovering": sorted(
+                bot_id
+                for bot_id, attempt in self._recovery_attempts.items()
+                if attempt > 0
+            ),
+            "last_recovery_at": {
+                str(bot_id): iso(value)
+                for bot_id, value in self._last_recovery_at.items()
+            },
+            "last_failure_at": {
+                str(bot_id): iso(value)
+                for bot_id, value in self._last_failure_at.items()
+            },
+            "last_errors": {
+                str(bot_id): error
+                for bot_id, error in self._last_recovery_error.items()
+                if error
+            },
+        }
 
     async def shutdown_all(self):
         bot_ids = list(self._running)
