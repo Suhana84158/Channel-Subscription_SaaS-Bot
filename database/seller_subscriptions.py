@@ -445,22 +445,35 @@ async def reminder_was_sent(owner_id: int, key: str):
     return key in (a.get("reminders_sent") or [])
 
 
-async def claim_reminder(owner_id: int, key: str) -> bool:
+async def claim_reminder(
+    owner_id: int,
+    key: str,
+    *,
+    stale_after_seconds: int = 600,
+) -> bool:
     """
     Atomically reserve one reminder delivery.
 
-    This prevents two scheduler instances from sending the same reminder at
-    the same time. A failed delivery must call release_reminder_claim().
+    A claim is automatically recoverable after stale_after_seconds. This
+    prevents a process crash between claiming and sending from blocking that
+    reminder forever.
     """
+    now = datetime.now(timezone.utc)
+    stale_before = now - timedelta(seconds=max(60, int(stale_after_seconds)))
+
     result = await _assignments().update_one(
         {
             "owner_id": int(owner_id),
             "reminders_sent": {"$ne": key},
-            "reminder_claims": {"$ne": key},
+            "$or": [
+                {"reminder_claims": {"$ne": key}},
+                {"reminder_claim_updated_at": {"$lt": stale_before}},
+                {"reminder_claim_updated_at": {"$exists": False}},
+            ],
         },
         {
             "$addToSet": {"reminder_claims": key},
-            "$set": {"reminder_claim_updated_at": datetime.now(timezone.utc)},
+            "$set": {"reminder_claim_updated_at": now},
         },
     )
     return result.modified_count == 1
