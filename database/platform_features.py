@@ -163,8 +163,69 @@ async def save_scheduled_broadcast(owner_id: int, run_at, from_chat_id: int, mes
     return doc
 
 
+async def pending_scheduled_broadcasts(owner_id: int, limit: int = 100):
+    """Return pending broadcasts so clone-bot restarts can restore JobQueue jobs."""
+    return await col(SCHEDULED).find(
+        {
+            "owner_id": int(owner_id),
+            "status": "pending",
+        }
+    ).sort("run_at", 1).to_list(length=limit)
+
+
+async def claim_scheduled_broadcast(job_id: str) -> bool:
+    """
+    Atomically move one scheduled broadcast from pending to processing.
+
+    This prevents duplicate delivery when a restored job and an old in-memory
+    JobQueue job fire at the same time.
+    """
+    now = datetime.now(timezone.utc)
+    result = await col(SCHEDULED).update_one(
+        {
+            "job_id": job_id,
+            "status": "pending",
+        },
+        {
+            "$set": {
+                "status": "processing",
+                "started_at": now,
+                "updated_at": now,
+            }
+        },
+    )
+    return result.modified_count == 1
+
+
+async def release_scheduled_broadcast(job_id: str, error: str):
+    """Return a failed startup-level job to pending for a future retry."""
+    await col(SCHEDULED).update_one(
+        {
+            "job_id": job_id,
+            "status": "processing",
+        },
+        {
+            "$set": {
+                "status": "pending",
+                "last_error": str(error)[:1000],
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$unset": {"started_at": ""},
+        },
+    )
+
+
 async def set_scheduled_status(job_id: str, status: str, result: dict | None = None):
-    await col(SCHEDULED).update_one({"job_id": job_id}, {"$set": {"status": status, "result": result or {}, "updated_at": datetime.now(timezone.utc)}})
+    update = {
+        "$set": {
+            "status": status,
+            "result": result or {},
+            "updated_at": datetime.now(timezone.utc),
+        }
+    }
+    if status != "processing":
+        update["$unset"] = {"started_at": ""}
+    await col(SCHEDULED).update_one({"job_id": job_id}, update)
 
 
 async def get_policy(key: str):
