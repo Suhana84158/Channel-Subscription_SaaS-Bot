@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
 from database.mongo import get_database
+from pymongo import ReturnDocument
 
 AUDIT = "platform_audit_logs"
 SCHEDULED = "seller_scheduled_broadcasts"
@@ -123,11 +124,99 @@ async def save_failed_delivery(owner_id: int, user_id: int, kind: str, payload: 
 
 
 async def get_failed_deliveries(owner_id: int, kind: str):
-    return await col(FAILED_DELIVERY).find({"owner_id": int(owner_id), "kind": kind, "resolved": False}).to_list(length=None)
+    return await col(FAILED_DELIVERY).find(
+        {
+            "owner_id": int(owner_id),
+            "kind": kind,
+            "resolved": False,
+        }
+    ).to_list(length=None)
+
+
+async def claim_failed_delivery(
+    doc_id,
+    owner_id: int,
+    *,
+    stale_after_seconds: int = 600,
+):
+    """
+    Atomically claim one unresolved delivery for retry.
+
+    A stale processing claim can be recovered after stale_after_seconds, so a
+    worker crash cannot block the delivery forever.
+    """
+    now = datetime.now(timezone.utc)
+    stale_before = now - timedelta(
+        seconds=max(60, int(stale_after_seconds))
+    )
+
+    return await col(FAILED_DELIVERY).find_one_and_update(
+        {
+            "_id": doc_id,
+            "owner_id": int(owner_id),
+            "resolved": False,
+            "$or": [
+                {"retry_state": {"$ne": "processing"}},
+                {"retry_claimed_at": {"$lt": stale_before}},
+                {"retry_claimed_at": {"$exists": False}},
+            ],
+        },
+        {
+            "$set": {
+                "retry_state": "processing",
+                "retry_claimed_at": now,
+                "updated_at": now,
+            },
+            "$inc": {"retry_attempts": 1},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+async def release_failed_delivery_claim(doc_id, error: str = ""):
+    await col(FAILED_DELIVERY).update_one(
+        {
+            "_id": doc_id,
+            "resolved": False,
+            "retry_state": "processing",
+        },
+        {
+            "$set": {
+                "retry_state": "pending",
+                "last_retry_error": str(error)[:500],
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$unset": {"retry_claimed_at": ""},
+        },
+    )
 
 
 async def resolve_failed_delivery(doc_id):
-    await col(FAILED_DELIVERY).update_one({"_id": doc_id}, {"$set": {"resolved": True, "resolved_at": datetime.now(timezone.utc)}})
+    """
+    Resolve only a currently claimed record.
+
+    This prevents another retry worker from resolving a record it did not own.
+    """
+    result = await col(FAILED_DELIVERY).update_one(
+        {
+            "_id": doc_id,
+            "resolved": False,
+            "retry_state": "processing",
+        },
+        {
+            "$set": {
+                "resolved": True,
+                "retry_state": "resolved",
+                "resolved_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$unset": {
+                "retry_claimed_at": "",
+                "last_retry_error": "",
+            },
+        },
+    )
+    return result.modified_count == 1
 
 
 async def create_coupon(owner_id: int, code: str, discount_type: str, value: float, usage_limit: int, expiry=None):
