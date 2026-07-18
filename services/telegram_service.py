@@ -1,7 +1,11 @@
+import logging
+
 from telegram import Bot
 
 from config import BOT_TOKEN
 from database.channels import get_all_channels
+
+logger = logging.getLogger(__name__)
 
 bot = Bot(BOT_TOKEN)
 
@@ -26,7 +30,11 @@ async def remove_user_from_channels(user_id: int):
             )
 
         except Exception:
-            pass
+            logger.exception(
+                "Failed to remove expired user from channel user_id=%s chat_id=%s",
+                user_id,
+                channel.get("chat_id"),
+            )
 
 
 async def send_expiry_message(user_id: int):
@@ -44,4 +52,7 @@ async def send_expiry_message(user_id: int):
         )
 
     except Exception:
-        pass
+        logger.exception(
+            "Failed to send expiry notification user_id=%s",
+            user_id,
+        )
