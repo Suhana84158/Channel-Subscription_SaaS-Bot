@@ -3,6 +3,7 @@ from telegram.error import TelegramError
 
 from config import BOT_TOKEN
 from database.channels import get_all_channels
+from database.payments import mark_payment_channel_delivered
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -10,13 +11,36 @@ logger = get_logger(__name__)
 bot = Bot(token=BOT_TOKEN)
 
 
-async def grant_channel_access(user_id: int):
+async def grant_channel_access(
+    user_id: int,
+    *,
+    payment_id=None,
+    already_delivered_chat_ids=None,
+):
+    """
+    Grant access and return structured delivery results.
+
+    When payment_id is supplied, each successful channel delivery is recorded
+    immediately. A retry skips channels already delivered for that payment.
+    """
     channels = await get_all_channels()
+    delivered = []
+    failed = []
+
+    skipped = {
+        int(chat_id)
+        for chat_id in (already_delivered_chat_ids or [])
+    }
 
     for channel in channels:
+        chat_id = int(channel["chat_id"])
+
+        if chat_id in skipped:
+            continue
+
         try:
             invite = await bot.create_chat_invite_link(
-                chat_id=channel["chat_id"],
+                chat_id=chat_id,
                 member_limit=1,
             )
 
@@ -29,12 +53,34 @@ async def grant_channel_access(user_id: int):
                 ),
             )
 
-        except TelegramError as exc:
+            delivered.append(chat_id)
+
+            if payment_id is not None:
+                recorded = await mark_payment_channel_delivered(
+                    payment_id,
+                    chat_id,
+                )
+                if not recorded:
+                    raise RuntimeError(
+                        "Payment delivery progress could not be recorded."
+                    )
+
+        except Exception as exc:
+            failed.append({
+                "chat_id": chat_id,
+                "error": str(exc),
+            })
             logger.exception(
-                "Failed to create invite for %s: %s",
-                channel.get("chat_id"),
-                exc,
+                "Failed granting access user_id=%s chat_id=%s",
+                user_id,
+                chat_id,
             )
+
+    return {
+        "delivered_chat_ids": delivered,
+        "failed": failed,
+        "total_channels": len(channels),
+    }
 
 
 async def revoke_channel_access(
