@@ -61,7 +61,11 @@ async def run_seller_subscription_reminders(bot):
         key = f"{expiry.isoformat()}:{label}"
 
         try:
-            claimed = await claim_reminder(owner_id, key)
+            claimed = await claim_reminder(
+                owner_id,
+                key,
+                stale_after_seconds=600,
+            )
         except Exception:
             logger.exception(
                 "Seller subscription reminder claim failed "
@@ -117,8 +121,9 @@ async def run_seller_subscription_reminders(bot):
                 owner_id,
                 key,
             )
-            # Keep the claim when finalization fails. This avoids duplicate
-            # delivery until the database issue is inspected.
+            # Keep the claim temporarily when finalization fails. The stale-claim
+            # timeout releases it automatically after 10 minutes so a transient
+            # database failure cannot block the reminder forever.
             continue
 
         await _send_admin_copies(bot, owner_id, text)
