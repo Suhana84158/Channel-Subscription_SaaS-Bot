@@ -29,7 +29,22 @@ from database.live_support import (
     list_support_templates, get_support_template, save_support_template,
     delete_support_template,
 )
-from database.platform_features import (reserve_payment_fingerprint, create_invoice, save_failed_delivery, get_failed_deliveries, resolve_failed_delivery, create_coupon, list_coupons, save_scheduled_broadcast, set_scheduled_status, audit, get_policy)
+from database.platform_features import (
+    audit,
+    claim_scheduled_broadcast,
+    create_coupon,
+    create_invoice,
+    get_failed_deliveries,
+    get_policy,
+    list_coupons,
+    pending_scheduled_broadcasts,
+    release_scheduled_broadcast,
+    reserve_payment_fingerprint,
+    resolve_failed_delivery,
+    save_failed_delivery,
+    save_scheduled_broadcast,
+    set_scheduled_status,
+)
 from database.seller_data import (
     activate_subscription, active_subscriptions, add_channel, create_payment, create_plan, delete_plan,
     ensure_seller_defaults, expired_subscriptions, get_channels, get_payment,
@@ -2937,23 +2952,125 @@ class SellerBotManager:
 
         raise ApplicationHandlerStop
 
-    async def scheduled_broadcast_job(self,context:ContextTypes.DEFAULT_TYPE):
-        job=context.job.data
-        owner=int(job["owner_id"])
-        from database.seller_data import c, USERS
-        users=await c(USERS).find({"owner_id":owner},{"user_id":1}).to_list(length=None)
-        success=failed=0
-        for user in users:
-            uid=user.get("user_id")
-            if not uid or uid==owner: continue
+    async def restore_scheduled_broadcasts(
+        self,
+        application: Application,
+        owner_id: int,
+    ):
+        """
+        Restore database-backed broadcasts after a clone-bot restart.
+
+        JobQueue entries are memory-only, so pending database jobs must be
+        registered again whenever the clone bot starts.
+        """
+        jobs = await pending_scheduled_broadcasts(owner_id)
+        now = datetime.now(timezone.utc)
+
+        for job in jobs:
+            run_at = job.get("run_at") or now
+            if run_at.tzinfo is None:
+                run_at = run_at.replace(tzinfo=timezone.utc)
+
+            existing = application.job_queue.get_jobs_by_name(
+                f"scheduled_{job['job_id']}"
+            )
+            if existing:
+                continue
+
+            application.job_queue.run_once(
+                self.scheduled_broadcast_job,
+                when=max(run_at, now),
+                data=job,
+                name=f"scheduled_{job['job_id']}",
+            )
+
+        if jobs:
+            logger.info(
+                "Restored scheduled broadcasts owner_id=%s count=%s",
+                owner_id,
+                len(jobs),
+            )
+
+    async def scheduled_broadcast_job(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
+        job = context.job.data
+        job_id = job["job_id"]
+        owner = int(job["owner_id"])
+
+        claimed = await claim_scheduled_broadcast(job_id)
+        if not claimed:
+            logger.info(
+                "Scheduled broadcast skipped because it was already claimed "
+                "job_id=%s owner_id=%s",
+                job_id,
+                owner,
+            )
+            return
+
+        try:
+            from database.seller_data import c, USERS
+
+            users = await c(USERS).find(
+                {"owner_id": owner},
+                {"user_id": 1},
+            ).to_list(length=None)
+
+            success = failed = 0
+
+            for user in users:
+                uid = user.get("user_id")
+                if not uid or uid == owner:
+                    continue
+
+                try:
+                    await context.bot.copy_message(
+                        uid,
+                        job["from_chat_id"],
+                        job["message_id"],
+                    )
+                    success += 1
+                except Exception as exc:
+                    failed += 1
+                    await save_failed_delivery(
+                        owner,
+                        uid,
+                        "scheduled_broadcast",
+                        {"job_id": job_id},
+                        str(exc),
+                    )
+
+                await asyncio.sleep(0.05)
+
+            await set_scheduled_status(
+                job_id,
+                "completed",
+                {"success": success, "failed": failed},
+            )
+
             try:
-                await context.bot.copy_message(uid,job["from_chat_id"],job["message_id"]); success+=1
-            except Exception as exc:
-                failed+=1; await save_failed_delivery(owner,uid,"scheduled_broadcast",{"job_id":job["job_id"]},str(exc))
-            await asyncio.sleep(0.05)
-        await set_scheduled_status(job["job_id"],"completed",{"success":success,"failed":failed})
-        try: await context.bot.send_message(owner,f"✅ Scheduled broadcast completed\nSuccess: {success}\nFailed: {failed}")
-        except Exception: pass
+                await context.bot.send_message(
+                    owner,
+                    "✅ Scheduled broadcast completed\n"
+                    f"Success: {success}\n"
+                    f"Failed: {failed}",
+                )
+            except Exception:
+                logger.exception(
+                    "Scheduled broadcast completion notice failed "
+                    "job_id=%s owner_id=%s",
+                    job_id,
+                    owner,
+                )
+        except Exception as exc:
+            logger.exception(
+                "Scheduled broadcast execution failed "
+                "job_id=%s owner_id=%s",
+                job_id,
+                owner,
+            )
+            await release_scheduled_broadcast(job_id, str(exc))
 
     async def welcome_media_handler(self,update:Update,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
@@ -3324,9 +3441,31 @@ class SellerBotManager:
                     ),
                     timeout=35,
                 )
-                self._running[bot_id] = RunningSellerBot(data_owner_id, bot_id, app)
+                self._running[bot_id] = RunningSellerBot(
+                    data_owner_id,
+                    bot_id,
+                    app,
+                )
                 await set_runtime_status(bot_id, "running", None)
-                logger.info("Clone bot started bot_id=%s owner_id=%s", bot_id, data_owner_id)
+
+                try:
+                    await self.restore_scheduled_broadcasts(
+                        app,
+                        data_owner_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Scheduled broadcast restoration failed "
+                        "bot_id=%s owner_id=%s",
+                        bot_id,
+                        data_owner_id,
+                    )
+
+                logger.info(
+                    "Clone bot started bot_id=%s owner_id=%s",
+                    bot_id,
+                    data_owner_id,
+                )
                 return True
             except Exception as exc:
                 logger.exception("Seller bot start failed bot_id=%s", bot_id)
