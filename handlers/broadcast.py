@@ -14,6 +14,13 @@ from telegram.ext import (
 
 from database.admins import is_admin
 from database.users import users_collection
+from database.platform_features import (
+    broadcast_cancel_requested,
+    create_broadcast_run,
+    finalize_broadcast_run,
+    request_broadcast_cancel,
+    update_broadcast_progress,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +31,7 @@ _MAX_NETWORK_RETRIES = 3
 
 # Prevent the same admin from starting overlapping broadcasts in one process.
 _broadcast_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+_active_broadcasts: dict[int, str] = {}
 
 
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -51,9 +59,23 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     message = update.effective_message
-    if message is not None:
-        await message.reply_text("❌ Broadcast cancelled.")
+
+    if user is None or message is None or not await is_admin(user.id):
+        return ConversationHandler.END
+
+    broadcast_id = _active_broadcasts.get(user.id)
+    if not broadcast_id:
+        await message.reply_text("ℹ️ No running broadcast found.")
+        return ConversationHandler.END
+
+    changed = await request_broadcast_cancel(broadcast_id, user.id)
+    await message.reply_text(
+        "🛑 Broadcast cancellation requested."
+        if changed
+        else "ℹ️ Broadcast is already finishing or cancelled."
+    )
     return ConversationHandler.END
 
 
@@ -180,6 +202,14 @@ async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "processed": 0,
         }
 
+        run = await create_broadcast_run(
+            owner_id=user.id,
+            total=total,
+            scope="main",
+        )
+        broadcast_id = run["broadcast_id"]
+        _active_broadcasts[user.id] = broadcast_id
+
         progress = await msg.reply_text(
             f"📢 Broadcast started...\nTotal users: {total}"
         )
@@ -198,6 +228,16 @@ async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             async for record in cursor:
+                if await broadcast_cancel_requested(broadcast_id):
+                    logger.info(
+                        "Broadcast cancellation observed admin_id=%s "
+                        "broadcast_id=%s processed=%s",
+                        user.id,
+                        broadcast_id,
+                        stats["processed"],
+                    )
+                    break
+
                 chat_id = record.get("user_id")
                 if not isinstance(chat_id, int):
                     stats["skipped"] += 1
@@ -212,6 +252,10 @@ async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     stats["processed"] % _PROGRESS_EVERY == 0
                     or stats["processed"] == total
                 ):
+                    await update_broadcast_progress(
+                        broadcast_id,
+                        stats,
+                    )
                     await _safe_progress_update(
                         progress,
                         "📢 Broadcast running...\n\n"
@@ -233,21 +277,41 @@ async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             stats["failed"] += max(total - stats["processed"], 0)
 
+        cancelled = await broadcast_cancel_requested(broadcast_id)
+        final_status = "cancelled" if cancelled else "completed"
+
+        await finalize_broadcast_run(
+            broadcast_id,
+            final_status,
+            stats,
+        )
+
+        heading = (
+            "🛑 Broadcast cancelled."
+            if cancelled
+            else "✅ Broadcast completed."
+        )
         await _safe_progress_update(
             progress,
-            "✅ Broadcast completed.\n\n"
+            f"{heading}\n\n"
             f"👥 Total Users: {total}\n"
+            f"📌 Processed: {stats['processed']}\n"
             f"✅ Sent: {stats['sent']}\n"
             f"🚫 Blocked: {stats['blocked']}\n"
             f"⏭ Skipped: {stats['skipped']}\n"
             f"❌ Failed: {stats['failed']}",
         )
 
+        _active_broadcasts.pop(user.id, None)
+
         logger.info(
-            "Broadcast completed admin_id=%s total=%s sent=%s blocked=%s "
-            "skipped=%s failed=%s",
+            "Broadcast finished admin_id=%s broadcast_id=%s status=%s "
+            "total=%s processed=%s sent=%s blocked=%s skipped=%s failed=%s",
             user.id,
+            broadcast_id,
+            final_status,
             total,
+            stats["processed"],
             stats["sent"],
             stats["blocked"],
             stats["skipped"],
