@@ -10,8 +10,7 @@ from database.payments import (
     get_payment,
     get_payment_history,
 )
-from database.subscriptions import get_subscription
-from services.subscription_service import activate_subscription, extend_subscription
+from services.subscription_service import fulfill_payment_subscription
 from services.channel_service import grant_channel_access
 
 
@@ -198,23 +197,15 @@ async def approve_payment_by_id(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-        subscription = await get_subscription(user_id)
-
-        if subscription and subscription.get("active"):
-            expiry = await extend_subscription(
-                user_id=user_id,
-                plan_days=plan_days,
-                duration_minutes=duration_minutes,
-            )
-            action = "renewed"
-        else:
-            expiry = await activate_subscription(
-                user_id=user_id,
-                plan_name=plan_name,
-                plan_days=plan_days,
-                duration_minutes=duration_minutes,
-            )
-            action = "activated"
+        fulfillment = await fulfill_payment_subscription(
+            user_id=user_id,
+            fulfillment_key=f"manual-payment:{payment_id}",
+            plan_name=plan_name,
+            plan_days=plan_days,
+            duration_minutes=duration_minutes,
+        )
+        expiry = fulfillment["expiry"]
+        action = fulfillment["action"]
 
         expiry_ist = format_ist(expiry)
 
@@ -311,23 +302,23 @@ async def approve_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        subscription = await get_subscription(user_id)
-
-        if subscription and subscription.get("active"):
-            expiry = await extend_subscription(
-                user_id=user_id,
-                plan_days=plan_days,
-                duration_minutes=duration_minutes,
-            )
-            action = "renewed"
-        else:
-            expiry = await activate_subscription(
-                user_id=user_id,
-                plan_name=plan_name,
-                plan_days=plan_days,
-                duration_minutes=duration_minutes,
-            )
-            action = "activated"
+        message_id = (
+            query.message.message_id
+            if query.message is not None
+            else "unknown"
+        )
+        fulfillment = await fulfill_payment_subscription(
+            user_id=user_id,
+            fulfillment_key=(
+                f"legacy-payment:{user_id}:{duration_minutes}:"
+                f"{plan_name}:{message_id}"
+            ),
+            plan_name=plan_name,
+            plan_days=plan_days,
+            duration_minutes=duration_minutes,
+        )
+        expiry = fulfillment["expiry"]
+        action = fulfillment["action"]
 
         expiry_ist = format_ist(expiry)
 
