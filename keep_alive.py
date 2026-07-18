@@ -1,13 +1,20 @@
 import asyncio
 import json
 import os
+import platform
+import sys
+import time
 from threading import Thread
 
-from flask import Flask, jsonify, redirect, request
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 _runtime_loop = None
 _main_bot = None
+_started_monotonic = time.monotonic()
+_started_at_unix = time.time()
+
+SERVICE_VERSION = os.getenv("APP_VERSION", "2.2-runtime-stability")
 
 
 def configure_runtime(loop, main_bot):
@@ -19,17 +26,135 @@ def configure_runtime(loop, main_bot):
 def _run(coro, timeout=45):
     if _runtime_loop is None:
         raise RuntimeError("Bot runtime is not ready")
-    return asyncio.run_coroutine_threadsafe(coro, _runtime_loop).result(timeout=timeout)
+    return asyncio.run_coroutine_threadsafe(
+        coro,
+        _runtime_loop,
+    ).result(timeout=timeout)
+
+
+def _memory_mb():
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return round(usage / (1024 * 1024), 2)
+        return round(usage / 1024, 2)
+    except Exception:
+        return None
+
+
+async def _runtime_health():
+    from database.mongo import (
+        ensure_database,
+        get_database_health,
+        ping_database,
+    )
+    from scheduler import scheduler_health
+    from services.bot_manager import bot_manager
+
+    mongo_ok = await ping_database(timeout=4, log_failure=False)
+
+    if not mongo_ok:
+        try:
+            await ensure_database(max_attempts=2, ping_timeout=4)
+            mongo_ok = await ping_database(
+                timeout=4,
+                log_failure=False,
+            )
+        except Exception:
+            mongo_ok = False
+
+    database = get_database_health()
+    database["status"] = "connected" if mongo_ok else "disconnected"
+
+    clone_status_method = getattr(
+        bot_manager,
+        "get_runtime_status",
+        None,
+    )
+
+    if clone_status_method is not None:
+        clone_bots = clone_status_method()
+        if asyncio.iscoroutine(clone_bots):
+            clone_bots = await clone_bots
+    else:
+        running = getattr(bot_manager, "_running", {})
+        clone_bots = {
+            "running": len(running),
+            "offline": 0,
+            "restart_count": 0,
+            "failed": 0,
+        }
+
+    scheduler = scheduler_health()
+
+    healthy = bool(
+        mongo_ok
+        and scheduler.get("running")
+        and _runtime_loop is not None
+    )
+
+    return {
+        "status": "healthy" if healthy else "degraded",
+        "service": "Telegram Subscription SaaS Bot",
+        "version": SERVICE_VERSION,
+        "runtime_ready": _runtime_loop is not None,
+        "uptime_seconds": int(time.monotonic() - _started_monotonic),
+        "started_at_unix": int(_started_at_unix),
+        "database": database,
+        "scheduler": scheduler,
+        "clone_bots": clone_bots,
+        "system": {
+            "memory_mb": _memory_mb(),
+            "python": platform.python_version(),
+            "platform": platform.system(),
+        },
+    }
 
 
 @app.route("/")
 def home():
-    return {"status": "online", "service": "Telegram Subscription Bot", "version": "2.1-gateways"}
+    return {
+        "status": "online",
+        "service": "Telegram Subscription SaaS Bot",
+        "version": SERVICE_VERSION,
+    }
 
 
 @app.route("/health")
 def health():
-    return {"status": "healthy", "runtime": bool(_runtime_loop)}
+    if _runtime_loop is None:
+        payload = {
+            "status": "starting",
+            "service": "Telegram Subscription SaaS Bot",
+            "version": SERVICE_VERSION,
+            "runtime_ready": False,
+            "uptime_seconds": int(
+                time.monotonic() - _started_monotonic
+            ),
+        }
+        return jsonify(payload), 503
+
+    try:
+        payload = _run(_runtime_health(), timeout=15)
+        status_code = (
+            200 if payload.get("status") == "healthy" else 503
+        )
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify(
+            {
+                "status": "unhealthy",
+                "service": "Telegram Subscription SaaS Bot",
+                "version": SERVICE_VERSION,
+                "runtime_ready": True,
+                "error": type(exc).__name__,
+                "uptime_seconds": int(
+                    time.monotonic() - _started_monotonic
+                ),
+            }
+        ), 503
 
 
 @app.route("/payment/return/<transaction_id>", methods=["GET", "POST"])
@@ -46,11 +171,18 @@ def payment_return(transaction_id):
 @app.route("/checkout/cashfree/<transaction_id>")
 def cashfree_checkout(transaction_id):
     from database.payment_gateways import get_gateway_transaction
+
     tx = _run(get_gateway_transaction(transaction_id))
     if not tx or not tx.get("payment_session_id"):
         return "Invalid or expired payment session", 404
-    mode = "sandbox" if tx.get("gateway_mode", "test") == "test" else "production"
+
+    mode = (
+        "sandbox"
+        if tx.get("gateway_mode", "test") == "test"
+        else "production"
+    )
     session_id = json.dumps(tx["payment_session_id"])
+
     return f"""
 <!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>
 <script src='https://sdk.cashfree.com/js/v3/cashfree.js'></script></head>
@@ -66,14 +198,23 @@ document.getElementById('pay').onclick = () => cashfree.checkout({{paymentSessio
 @app.route("/checkout/paytm/<transaction_id>")
 def paytm_checkout(transaction_id):
     from database.payment_gateways import get_gateway_transaction
+
     tx = _run(get_gateway_transaction(transaction_id))
     if not tx or not tx.get("txn_token"):
         return "Invalid or expired payment session", 404
-    host = tx.get("paytm_host", "https://securestage.paytmpayments.com")
+
+    host = tx.get(
+        "paytm_host",
+        "https://securestage.paytmpayments.com",
+    )
     mid = tx.get("paytm_mid", "")
     token = tx["txn_token"]
     amount = f"{float(tx.get('amount', 0)):.2f}"
-    action = f"{host}/theia/api/v1/showPaymentPage?mid={mid}&orderId={transaction_id}"
+    action = (
+        f"{host}/theia/api/v1/showPaymentPage"
+        f"?mid={mid}&orderId={transaction_id}"
+    )
+
     return f"""
 <!doctype html><html><body onload='document.forms[0].submit()'>
 <form method='post' action='{action}'>
@@ -84,14 +225,20 @@ def paytm_checkout(transaction_id):
 
 async def _notify_success(transaction_id):
     from database.payment_gateways import get_gateway_transaction
+
     tx = await get_gateway_transaction(transaction_id)
     if not tx or tx.get("status") != "fulfilled":
         return
+
     if tx.get("purpose") == "seller_plan":
         if _main_bot:
             fulfillment = tx.get("fulfillment") or {}
             expiry = fulfillment.get("expiry_date")
-            expiry_text = expiry.strftime("%d-%m-%Y %H:%M UTC") if hasattr(expiry, "strftime") else "-"
+            expiry_text = (
+                expiry.strftime("%d-%m-%Y %H:%M UTC")
+                if hasattr(expiry, "strftime")
+                else "-"
+            )
             await _main_bot.send_message(
                 tx["payer_user_id"],
                 f"✅ Payment verified automatically\n\n"
@@ -103,66 +250,151 @@ async def _notify_success(transaction_id):
                 "Your seller plan is now active.",
             )
         return
+
     if tx.get("purpose") == "child_subscription":
         from database.seller_data import get_channels, get_subscription
         from services.bot_manager import bot_manager
+
         running = bot_manager.get_running(tx["owner_id"])
         if not running:
             return
+
         bot = running.application.bot
         links = []
+
         for channel in await get_channels(tx["owner_id"]):
             try:
-                invite = await bot.create_chat_invite_link(channel["chat_id"], member_limit=1)
-                links.append(f"{channel.get('title','Premium Channel')}\n{invite.invite_link}")
+                invite = await bot.create_chat_invite_link(
+                    channel["chat_id"],
+                    member_limit=1,
+                )
+                links.append(
+                    f"{channel.get('title','Premium Channel')}\n"
+                    f"{invite.invite_link}"
+                )
             except Exception:
                 continue
-        sub = await get_subscription(tx["owner_id"], tx["payer_user_id"])
-        text = (
-            f"✅ Payment verified automatically\n\nGateway: {tx.get('gateway','').title()}\n"
-            f"Amount: ₹{tx.get('amount',0):g}\nPlan: {tx.get('metadata',{}).get('plan_name','Subscription')}\n"
+
+        sub = await get_subscription(
+            tx["owner_id"],
+            tx["payer_user_id"],
         )
+        text = (
+            f"✅ Payment verified automatically\n\n"
+            f"Gateway: {tx.get('gateway','').title()}\n"
+            f"Amount: ₹{tx.get('amount',0):g}\n"
+            f"Plan: {tx.get('metadata',{}).get('plan_name','Subscription')}\n"
+        )
+
         if sub and sub.get("expiry_date"):
-            text += f"Expiry: {sub['expiry_date'].strftime('%d-%m-%Y %H:%M UTC')}\n"
+            text += (
+                f"Expiry: "
+                f"{sub['expiry_date'].strftime('%d-%m-%Y %H:%M UTC')}\n"
+            )
+
         if links:
-            text += "\nJoin using your private invite link(s):\n\n" + "\n\n".join(links)
-        await bot.send_message(tx["payer_user_id"], text, disable_web_page_preview=True)
+            text += (
+                "\nJoin using your private invite link(s):\n\n"
+                + "\n\n".join(links)
+            )
+
+        await bot.send_message(
+            tx["payer_user_id"],
+            text,
+            disable_web_page_preview=True,
+        )
 
 
-@app.route("/webhooks/<gateway>/<scope>/<int:owner_id>", methods=["POST"])
+@app.route(
+    "/webhooks/<gateway>/<scope>/<int:owner_id>",
+    methods=["POST"],
+)
 def gateway_webhook(gateway, scope, owner_id):
     from services.payment_gateways import verify_and_process_webhook
+
     raw = request.get_data(cache=True)
+
     if request.is_json:
         payload = request.get_json(silent=True) or {}
     else:
         payload = request.form.to_dict(flat=True)
+
     try:
-        ok, message = _run(verify_and_process_webhook(gateway, scope, owner_id, {k.lower(): v for k, v in request.headers.items()}, raw, payload))
+        ok, message = _run(
+            verify_and_process_webhook(
+                gateway,
+                scope,
+                owner_id,
+                {
+                    key.lower(): value
+                    for key, value in request.headers.items()
+                },
+                raw,
+                payload,
+            )
+        )
+
         txid = payload.get("ORDERID") or payload.get("orderId")
+
         if not txid and gateway == "razorpay":
-            rp = payload.get("payload") or {}
-            payment = ((rp.get("payment") or {}).get("entity") or {})
-            payment_link = ((rp.get("payment_link") or {}).get("entity") or {})
-            txid = (payment.get("notes") or {}).get("transaction_id") or payment_link.get("reference_id")
+            razorpay_payload = payload.get("payload") or {}
+            payment = (
+                (razorpay_payload.get("payment") or {})
+                .get("entity")
+                or {}
+            )
+            payment_link = (
+                (razorpay_payload.get("payment_link") or {})
+                .get("entity")
+                or {}
+            )
+            txid = (
+                (payment.get("notes") or {})
+                .get("transaction_id")
+                or payment_link.get("reference_id")
+            )
+
         if not txid and isinstance(payload.get("data"), dict):
-            txid = ((payload.get("data") or {}).get("order") or {}).get("order_id")
+            txid = (
+                ((payload.get("data") or {}).get("order") or {})
+                .get("order_id")
+            )
+
         if not txid and isinstance(payload.get("payload"), dict):
             body = payload.get("payload") or {}
-            txid = body.get("merchantOrderId") or ((body.get("metaInfo") or {}).get("udf1"))
+            txid = (
+                body.get("merchantOrderId")
+                or (body.get("metaInfo") or {}).get("udf1")
+            )
+
         if txid:
             try:
                 _run(_notify_success(str(txid)), timeout=30)
             except Exception:
                 pass
-        return jsonify({"ok": ok, "message": message}), 200 if ok else 401
+
+        return (
+            jsonify({"ok": ok, "message": message}),
+            200 if ok else 401,
+        )
     except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify(
+            {"ok": False, "error": str(exc)}
+        ), 500
 
 
 def run():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), debug=False, use_reloader=False)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "10000")),
+        debug=False,
+        use_reloader=False,
+    )
 
 
 def keep_alive():
-    Thread(target=run, daemon=True).start()
+    Thread(
+        target=run,
+        daemon=True,
+        name="health-server",
+    ).start()
