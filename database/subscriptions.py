@@ -2,6 +2,8 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
+from pymongo import ReturnDocument
+
 from database.mongo import get_database
 
 COLLECTION = "subscriptions"
@@ -35,6 +37,15 @@ async def subscription_lock(user_id: int):
     lock = await _get_user_lock(user_id)
     async with lock:
         yield
+
+
+def _duration_milliseconds(
+    duration_days: int = 0,
+    duration_minutes: int = 0,
+) -> int:
+    if duration_minutes > 0:
+        return int(duration_minutes) * 60 * 1000
+    return int(duration_days) * 24 * 60 * 60 * 1000
 
 
 async def activate_subscription(
@@ -72,6 +83,181 @@ async def activate_subscription(
         )
 
     return expiry
+
+
+async def fulfill_payment_subscription(
+    user_id: int,
+    fulfillment_key: str,
+    plan_name: str,
+    duration_days: int = 0,
+    duration_minutes: int = 0,
+):
+    """
+    Atomically activate or renew a subscription once per payment key.
+
+    The fulfillment key is checked and recorded in the same MongoDB write that
+    changes the expiry date, so retries cannot extend a subscription twice.
+    """
+    key = str(fulfillment_key).strip()
+    if not key:
+        raise ValueError("fulfillment_key is required")
+
+    duration_ms = _duration_milliseconds(
+        duration_days=duration_days,
+        duration_minutes=duration_minutes,
+    )
+    if duration_ms <= 0:
+        raise ValueError("Subscription duration must be greater than zero")
+
+    now = datetime.now(timezone.utc)
+
+    document = await subscriptions_collection().find_one_and_update(
+        {"user_id": int(user_id)},
+        [
+            {
+                "$set": {
+                    "_fulfillment_keys": {
+                        "$ifNull": ["$payment_fulfillment_keys", []]
+                    },
+                    "_was_active": {
+                        "$and": [
+                            {"$eq": [{"$ifNull": ["$active", False]}, True]},
+                            {"$gt": [{"$ifNull": ["$expiry_date", now]}, now]},
+                        ]
+                    },
+                }
+            },
+            {
+                "$set": {
+                    "_already_fulfilled": {
+                        "$in": [key, "$_fulfillment_keys"]
+                    },
+                    "_base_expiry": {
+                        "$cond": [
+                            "$_was_active",
+                            "$expiry_date",
+                            now,
+                        ]
+                    },
+                }
+            },
+            {
+                "$set": {
+                    "user_id": int(user_id),
+                    "plan": {
+                        "$cond": [
+                            "$_already_fulfilled",
+                            {"$ifNull": ["$plan", plan_name]},
+                            plan_name,
+                        ]
+                    },
+                    "active": {
+                        "$cond": [
+                            "$_already_fulfilled",
+                            {"$ifNull": ["$active", True]},
+                            True,
+                        ]
+                    },
+                    "start_date": {
+                        "$cond": [
+                            "$_already_fulfilled",
+                            {"$ifNull": ["$start_date", now]},
+                            {
+                                "$cond": [
+                                    "$_was_active",
+                                    {"$ifNull": ["$start_date", now]},
+                                    now,
+                                ]
+                            },
+                        ]
+                    },
+                    "expiry_date": {
+                        "$cond": [
+                            "$_already_fulfilled",
+                            "$expiry_date",
+                            {"$add": ["$_base_expiry", duration_ms]},
+                        ]
+                    },
+                    "payment_fulfillment_keys": {
+                        "$cond": [
+                            "$_already_fulfilled",
+                            "$_fulfillment_keys",
+                            {
+                                "$concatArrays": [
+                                    "$_fulfillment_keys",
+                                    [key],
+                                ]
+                            },
+                        ]
+                    },
+                    "last_fulfillment_key": key,
+                    "last_fulfillment_applied": {
+                        "$not": ["$_already_fulfilled"]
+                    },
+                    "last_fulfillment_action": {
+                        "$cond": [
+                            "$_already_fulfilled",
+                            {
+                                "$ifNull": [
+                                    "$last_fulfillment_action",
+                                    "duplicate",
+                                ]
+                            },
+                            {
+                                "$cond": [
+                                    "$_was_active",
+                                    "renewed",
+                                    "activated",
+                                ]
+                            },
+                        ]
+                    },
+                    "last_fulfilled_at": {
+                        "$cond": [
+                            "$_already_fulfilled",
+                            "$last_fulfilled_at",
+                            now,
+                        ]
+                    },
+                    "updated_at": {
+                        "$cond": [
+                            "$_already_fulfilled",
+                            {"$ifNull": ["$updated_at", now]},
+                            now,
+                        ]
+                    },
+                    "created_at": {"$ifNull": ["$created_at", now]},
+                    "expiring": {
+                        "$cond": [
+                            "$_already_fulfilled",
+                            {"$ifNull": ["$expiring", False]},
+                            False,
+                        ]
+                    },
+                }
+            },
+            {
+                "$unset": [
+                    "_fulfillment_keys",
+                    "_was_active",
+                    "_already_fulfilled",
+                    "_base_expiry",
+                    "expired_at",
+                ]
+            },
+        ],
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if document is None:
+        raise RuntimeError("Subscription fulfillment did not return a record")
+
+    return {
+        "expiry": make_aware(document.get("expiry_date")),
+        "applied": bool(document.get("last_fulfillment_applied")),
+        "action": document.get("last_fulfillment_action", "activated"),
+    }
 
 
 async def get_subscription(user_id: int):
