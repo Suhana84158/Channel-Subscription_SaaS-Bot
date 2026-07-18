@@ -14,6 +14,7 @@ INVOICES = "seller_invoices"
 POLICIES = "platform_policies"
 PAYMENT_FINGERPRINTS = "payment_fingerprints"
 REFERRAL_LEDGER = "seller_referral_commissions"
+BROADCAST_RUNS = "broadcast_runs"
 
 
 def col(name: str):
@@ -30,6 +31,10 @@ async def initialize_platform_feature_indexes():
     await col(PAYMENT_FINGERPRINTS).create_index([("scope", 1), ("owner_id", 1), ("fingerprint", 1)], unique=True)
     await col(REFERRAL_LEDGER).create_index([("seller_id", 1), ("created_at", -1)])
     await col(POLICIES).create_index("key", unique=True)
+    await col(BROADCAST_RUNS).create_index("broadcast_id", unique=True)
+    await col(BROADCAST_RUNS).create_index(
+        [("owner_id", 1), ("status", 1), ("created_at", -1)]
+    )
     now = datetime.now(timezone.utc)
     defaults = {
         "terms": "By using this service, users and sellers agree to follow Telegram rules and provide accurate payment information.",
@@ -226,6 +231,119 @@ async def set_scheduled_status(job_id: str, status: str, result: dict | None = N
     if status != "processing":
         update["$unset"] = {"started_at": ""}
     await col(SCHEDULED).update_one({"job_id": job_id}, update)
+
+
+async def create_broadcast_run(
+    owner_id: int,
+    total: int,
+    *,
+    scope: str = "main",
+):
+    now = datetime.now(timezone.utc)
+    doc = {
+        "broadcast_id": uuid4().hex,
+        "owner_id": int(owner_id),
+        "scope": scope,
+        "status": "processing",
+        "total": int(total),
+        "processed": 0,
+        "sent": 0,
+        "failed": 0,
+        "blocked": 0,
+        "skipped": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+    await col(BROADCAST_RUNS).insert_one(doc)
+    return doc
+
+
+async def request_broadcast_cancel(
+    broadcast_id: str,
+    owner_id: int,
+) -> bool:
+    result = await col(BROADCAST_RUNS).update_one(
+        {
+            "broadcast_id": broadcast_id,
+            "owner_id": int(owner_id),
+            "status": "processing",
+        },
+        {
+            "$set": {
+                "status": "cancelling",
+                "cancel_requested_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+    return result.modified_count == 1
+
+
+async def broadcast_cancel_requested(broadcast_id: str) -> bool:
+    doc = await col(BROADCAST_RUNS).find_one(
+        {"broadcast_id": broadcast_id},
+        {"status": 1},
+    )
+    return bool(doc and doc.get("status") in {"cancelling", "cancelled"})
+
+
+async def update_broadcast_progress(
+    broadcast_id: str,
+    stats: dict,
+):
+    await col(BROADCAST_RUNS).update_one(
+        {
+            "broadcast_id": broadcast_id,
+            "status": {"$in": ["processing", "cancelling"]},
+        },
+        {
+            "$set": {
+                "processed": int(stats.get("processed", 0)),
+                "sent": int(stats.get("sent", 0)),
+                "failed": int(stats.get("failed", 0)),
+                "blocked": int(stats.get("blocked", 0)),
+                "skipped": int(stats.get("skipped", 0)),
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+
+
+async def finalize_broadcast_run(
+    broadcast_id: str,
+    status: str,
+    stats: dict,
+):
+    """
+    Finalize only an active run.
+
+    A cancelling run can become cancelled, but cannot later be overwritten as
+    completed by a racing completion path.
+    """
+    allowed_current = (
+        ["processing"]
+        if status == "completed"
+        else ["processing", "cancelling"]
+    )
+    result = await col(BROADCAST_RUNS).update_one(
+        {
+            "broadcast_id": broadcast_id,
+            "status": {"$in": allowed_current},
+        },
+        {
+            "$set": {
+                "status": status,
+                "processed": int(stats.get("processed", 0)),
+                "sent": int(stats.get("sent", 0)),
+                "failed": int(stats.get("failed", 0)),
+                "blocked": int(stats.get("blocked", 0)),
+                "skipped": int(stats.get("skipped", 0)),
+                "finished_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+    return result.modified_count == 1
 
 
 async def get_policy(key: str):
