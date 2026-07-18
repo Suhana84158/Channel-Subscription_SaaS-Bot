@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 from pymongo import ReturnDocument
+from uuid import uuid4
 
 from database.mongo import get_database
 
@@ -76,6 +77,10 @@ async def activate_subscription(
                 "$unset": {
                     "expiring": "",
                     "expired_at": "",
+                    "expiry_claim_token": "",
+                    "expiry_claimed_at": "",
+                    "expiry_notification_token": "",
+                    "expiry_notification_claimed_at": "",
                 },
                 "$setOnInsert": {"created_at": now},
             },
@@ -299,6 +304,10 @@ async def renew_subscription(
                 "$unset": {
                     "expiring": "",
                     "expired_at": "",
+                    "expiry_claim_token": "",
+                    "expiry_claimed_at": "",
+                    "expiry_notification_token": "",
+                    "expiry_notification_claimed_at": "",
                 },
                 "$setOnInsert": {"created_at": now},
             },
@@ -331,6 +340,208 @@ async def expire_subscription(
                 "expired_at": now,
                 "updated_at": now,
             }
+        },
+    )
+    return result.modified_count == 1
+
+
+async def claim_expired_subscription(
+    user_id: int,
+    *,
+    now=None,
+    stale_after_seconds: int = 900,
+):
+    """
+    Atomically claim an expired active subscription for one worker.
+
+    Stale claims are recoverable after stale_after_seconds. Renewals clear the
+    claim fields, so a renewed subscription cannot be expired by an old worker.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    stale_before = now - timedelta(
+        seconds=max(60, int(stale_after_seconds))
+    )
+    claim_token = uuid4().hex
+
+    document = await subscriptions_collection().find_one_and_update(
+        {
+            "user_id": int(user_id),
+            "active": True,
+            "expiry_date": {"$lte": now},
+            "$or": [
+                {"expiry_claim_token": {"$exists": False}},
+                {"expiry_claim_token": None},
+                {"expiry_claimed_at": {"$lt": stale_before}},
+            ],
+        },
+        {
+            "$set": {
+                "expiring": True,
+                "expiry_claim_token": claim_token,
+                "expiry_claimed_at": now,
+                "updated_at": now,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if document is None:
+        return None
+
+    document["_claim_token"] = claim_token
+    return document
+
+
+async def release_expiry_claim(
+    user_id: int,
+    claim_token: str,
+    error: str = "",
+) -> bool:
+    now = datetime.now(timezone.utc)
+    result = await subscriptions_collection().update_one(
+        {
+            "user_id": int(user_id),
+            "active": True,
+            "expiry_claim_token": str(claim_token),
+        },
+        {
+            "$set": {
+                "expiring": False,
+                "last_expiry_error": str(error)[:500],
+                "updated_at": now,
+            },
+            "$unset": {
+                "expiry_claim_token": "",
+                "expiry_claimed_at": "",
+            },
+        },
+    )
+    return result.modified_count == 1
+
+
+async def complete_expiry_claim(
+    user_id: int,
+    claim_token: str,
+    expected_expiry,
+) -> bool:
+    """
+    Finalize only the subscription claimed by this worker and only if the
+    expiry value did not change while channel access was being revoked.
+    """
+    now = datetime.now(timezone.utc)
+    result = await subscriptions_collection().update_one(
+        {
+            "user_id": int(user_id),
+            "active": True,
+            "expiry_date": expected_expiry,
+            "expiry_claim_token": str(claim_token),
+        },
+        {
+            "$set": {
+                "active": False,
+                "expiring": False,
+                "expired_at": now,
+                "updated_at": now,
+                "expiry_notification_sent": False,
+            },
+            "$unset": {
+                "expiry_claim_token": "",
+                "expiry_claimed_at": "",
+                "last_expiry_error": "",
+            },
+        },
+    )
+    return result.modified_count == 1
+
+
+async def claim_expiry_notification(
+    user_id: int,
+    *,
+    stale_after_seconds: int = 900,
+):
+    now = datetime.now(timezone.utc)
+    stale_before = now - timedelta(
+        seconds=max(60, int(stale_after_seconds))
+    )
+    token = uuid4().hex
+
+    document = await subscriptions_collection().find_one_and_update(
+        {
+            "user_id": int(user_id),
+            "active": False,
+            "expiry_notification_sent": {"$ne": True},
+            "$or": [
+                {"expiry_notification_token": {"$exists": False}},
+                {"expiry_notification_token": None},
+                {"expiry_notification_claimed_at": {"$lt": stale_before}},
+            ],
+        },
+        {
+            "$set": {
+                "expiry_notification_token": token,
+                "expiry_notification_claimed_at": now,
+                "updated_at": now,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if document is None:
+        return None
+
+    return token
+
+
+async def complete_expiry_notification(
+    user_id: int,
+    token: str,
+) -> bool:
+    now = datetime.now(timezone.utc)
+    result = await subscriptions_collection().update_one(
+        {
+            "user_id": int(user_id),
+            "active": False,
+            "expiry_notification_token": str(token),
+        },
+        {
+            "$set": {
+                "expiry_notification_sent": True,
+                "expiry_notification_sent_at": now,
+                "updated_at": now,
+            },
+            "$unset": {
+                "expiry_notification_token": "",
+                "expiry_notification_claimed_at": "",
+                "last_expiry_notification_error": "",
+            },
+        },
+    )
+    return result.modified_count == 1
+
+
+async def release_expiry_notification(
+    user_id: int,
+    token: str,
+    error: str = "",
+) -> bool:
+    now = datetime.now(timezone.utc)
+    result = await subscriptions_collection().update_one(
+        {
+            "user_id": int(user_id),
+            "active": False,
+            "expiry_notification_token": str(token),
+        },
+        {
+            "$set": {
+                "last_expiry_notification_error": str(error)[:500],
+                "updated_at": now,
+            },
+            "$unset": {
+                "expiry_notification_token": "",
+                "expiry_notification_claimed_at": "",
+            },
         },
     )
     return result.modified_count == 1
