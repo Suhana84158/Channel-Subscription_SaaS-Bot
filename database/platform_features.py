@@ -254,8 +254,49 @@ async def validate_coupon(owner_id: int, code: str, amount: float):
     return max(0.0, amount - discount), None
 
 
-async def use_coupon(owner_id: int, code: str):
-    await col(SELLER_COUPONS).update_one({"owner_id": int(owner_id), "code": code.strip().upper()}, {"$inc": {"used_count": 1}})
+async def use_coupon(owner_id: int, code: str) -> bool:
+    """Atomically consume one seller coupon use without exceeding its limit."""
+    now = datetime.now(timezone.utc)
+    coupon = await col(SELLER_COUPONS).find_one_and_update(
+        {
+            "owner_id": int(owner_id),
+            "code": code.strip().upper(),
+            "active": True,
+            "$expr": {
+                "$lt": [
+                    {"$ifNull": ["$used_count", 0]},
+                    {"$ifNull": ["$usage_limit", 0]},
+                ]
+            },
+            "$or": [
+                {"expiry": None},
+                {"expiry": {"$exists": False}},
+                {"expiry": {"$gt": now}},
+            ],
+        },
+        {
+            "$inc": {"used_count": 1},
+            "$set": {"updated_at": now},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    return coupon is not None
+
+
+async def release_coupon_use(owner_id: int, code: str) -> bool:
+    """Return one coupon use when the related payment/action fails."""
+    result = await col(SELLER_COUPONS).update_one(
+        {
+            "owner_id": int(owner_id),
+            "code": code.strip().upper(),
+            "used_count": {"$gt": 0},
+        },
+        {
+            "$inc": {"used_count": -1},
+            "$set": {"updated_at": datetime.now(timezone.utc)},
+        },
+    )
+    return result.modified_count == 1
 
 
 async def save_scheduled_broadcast(owner_id: int, run_at, from_chat_id: int, message_id: int, audience: str = "all"):
