@@ -17,6 +17,8 @@ from database.payment_gateways import (
     get_gateway_config,
     get_gateway_transaction,
     get_transaction_by_gateway_order,
+    gateway_is_ready,
+    gateway_missing_fields,
     mark_transaction_failed,
     mark_transaction_fulfilled,
     mark_transaction_fulfillment_retry,
@@ -115,6 +117,9 @@ async def create_checkout(transaction: dict) -> dict:
     settings = (cfg.get("gateways") or {}).get(gateway) or {}
     if not settings.get("enabled"):
         raise GatewayError(f"{gateway.title()} is disabled")
+    if not gateway_is_ready(gateway, settings):
+        missing = ", ".join(gateway_missing_fields(gateway, settings))
+        raise GatewayError(f"{gateway.title()} credentials are incomplete: {missing}")
     if gateway == "razorpay":
         result = await _create_razorpay(transaction, settings)
     elif gateway == "cashfree":
