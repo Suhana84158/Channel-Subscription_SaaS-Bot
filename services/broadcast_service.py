@@ -8,6 +8,7 @@ from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, Tele
 from database.broadcast import (
     claim_recipient,
     claim_run,
+    exhaust_retry_limit,
     finalize_if_done,
     finish_recipient,
     get_run,
@@ -61,8 +62,10 @@ async def process_broadcast(bot, broadcast_id: str) -> None:
                 return
             recipient = await claim_recipient(broadcast_id)
             if not recipient:
+                await exhaust_retry_limit(broadcast_id)
                 if await finalize_if_done(broadcast_id):
                     return
+                await renew_run_lease(broadcast_id)
                 await asyncio.sleep(2)
                 continue
             status, error, retry_after = await _deliver(bot, run, int(recipient["user_id"]))
