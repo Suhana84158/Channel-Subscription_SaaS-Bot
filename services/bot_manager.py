@@ -12,7 +12,10 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Conflict, InvalidToken, TelegramError
 from telegram.ext import Application, ApplicationHandlerStop, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from database.seller_subscriptions import effective_plan, plan_limit_warning, current_plan_text, get_config, seller_access_state, usage_warning
+from database.seller_subscriptions import (
+    effective_plan, plan_limit_warning, current_plan_text, get_config,
+    seller_access_state, usage_warning, bot_runtime_allowed,
+)
 from database.payment_gateways import (
     SUPPORTED_GATEWAYS, create_gateway_transaction, get_gateway_config,
     save_gateway_config, set_gateway_preferences, gateway_history,
@@ -3503,6 +3506,23 @@ class SellerBotManager:
                 return False
 
             bot_id = int(record["bot_id"])
+            seller_account_id = int(record["owner_id"])
+            allowed, quota = await bot_runtime_allowed(seller_account_id, bot_id)
+            if not allowed:
+                limit = quota.get("limit", 0)
+                position = quota.get("position")
+                reason = (
+                    f"Clone bot position {position} exceeds seller plan limit {limit}"
+                    if position is not None
+                    else f"Seller plan allows {limit} clone bots"
+                )
+                await set_runtime_status(bot_id, "plan_limit_paused", reason)
+                logger.warning(
+                    "Clone bot blocked by seller plan bot_id=%s owner_id=%s position=%s limit=%s",
+                    bot_id, seller_account_id, position, limit,
+                )
+                return False
+
             token = await get_decrypted_bot_token(bot_id)
             if not token:
                 await set_runtime_status(bot_id, "token_missing", "Missing encrypted token")
@@ -3510,7 +3530,6 @@ class SellerBotManager:
 
             app: Optional[Application] = None
             data_owner_id = int(record.get("data_owner_id") or record["owner_id"])
-            seller_account_id = int(record["owner_id"])
             try:
                 await asyncio.wait_for(
                     ensure_seller_defaults(data_owner_id, record.get("bot_name", "Subscription Bot")),
