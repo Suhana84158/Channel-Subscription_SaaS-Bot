@@ -1,6 +1,7 @@
 import logging
 
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import CommandHandler, ContextTypes
 
 from database.admins import is_admin
@@ -21,10 +22,16 @@ async def statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         text = await build_platform_statistics_text()
-        await message.reply_text(text=text, parse_mode="HTML")
+        await message.reply_text(
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
     except Exception:
-        logger.exception("Failed to build platform statistics")
-        await message.reply_text("❌ Statistics load nahi ho payi. Please try again.")
+        logger.exception("Failed to build platform statistics for admin_id=%s", user.id)
+        await message.reply_text(
+            "❌ Statistics load nahi ho payi. Thodi der baad dobara try karo."
+        )
 
 
 def statistics_handler():
