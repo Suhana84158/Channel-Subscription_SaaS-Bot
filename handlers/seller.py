@@ -853,8 +853,16 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 checkout = await create_checkout(tx)
                 text = (
                     f"💳 {gateway.title()} Payment\n\n"
-                    f"Plan: {plan.get('name')}\nAmount: ₹{plan.get('price',0):g}\n"
+                    f"Plan: {plan.get('name')}\n"
+                    f"Amount: ₹{plan.get('price',0):g}\n"
+                    f"Duration: {plan.get('duration_days', 30)} days\n"
                     f"Transaction: {tx['transaction_id']}\n\n"
+                    "📊 Plan Limitations\n"
+                    f"• Clone Bots: {_limit_text(plan.get('bot_limit', 1))}\n"
+                    f"• Active Subscribers: {_limit_text(plan.get('active_subscriber_limit', 25))}\n"
+                    f"• Channels/Groups: {_limit_text(plan.get('channel_limit', 1))}\n"
+                    f"• Subscription Plans: {_limit_text(plan.get('plan_limit', 2))}\n"
+                    f"• Admins: {_limit_text(plan.get('admin_limit', 1))}\n\n"
                     "Payment successful hone ke baad plan automatically activate hoga."
                 )
                 rows.append([InlineKeyboardButton("💳 Pay Now", url=checkout.get("checkout_url"))])
