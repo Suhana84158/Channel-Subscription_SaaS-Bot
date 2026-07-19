@@ -25,6 +25,8 @@ from database.seller_subscriptions import (
     subscription_history,
 )
 from services.bot_manager import bot_manager
+from services.invite_resend_lock import resend_invites_safely
+from database.subscription_guard import get_active_invite, save_invite
 from database.seller_data import (
     get_seller_settings, set_seller_setting, stats as seller_stats,
     get_channels, add_channel, remove_channel,
@@ -460,117 +462,150 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Clone bot not found.", show_alert=True)
             return
 
-        if _channel_lock(owner_id).locked():
-            await q.answer(
-                "Another channel operation is already running. Please wait.",
-                show_alert=True,
-            )
-            return
+        await q.edit_message_text("⏳ Preparing invite links...")
 
-        await q.edit_message_text("⏳ Preparing fresh invite links...")
+        async def _run_resend():
+            async with _channel_lock(owner_id):
+                running = bot_manager.get_running(bot_id) or bot_manager.get_running(owner_id)
+                if not running:
+                    return {"error": "not_running"}
 
-        async with _channel_lock(owner_id):
-            running = bot_manager.get_running(bot_id) or bot_manager.get_running(owner_id)
-            if not running:
-                await q.edit_message_text(
-                    "❌ Clone bot is not running. Resume it first.",
-                    reply_markup=channels_markup(bot_id),
-                )
-                return
+                channels = tuple(await get_channels(owner_id))
+                if not channels:
+                    return {"error": "no_channels"}
 
-            # This immutable snapshot cannot change while resend is running because
-            # add/remove operations use the same per-seller lock.
-            channels = tuple(await get_channels(owner_id))
-            if not channels:
-                await q.edit_message_text(
-                    "❌ No channel/group connected.",
-                    reply_markup=channels_markup(bot_id),
-                )
-                return
+                now = datetime.now(timezone.utc)
+                subs = await get_database()["seller_subscriptions"].find(
+                    {
+                        "owner_id": owner_id,
+                        "active": True,
+                        "expiry_date": {"$gt": now},
+                    },
+                    {"user_id": 1},
+                ).to_list(length=5000)
 
-            db = get_database()
-            now = datetime.now(timezone.utc)
-            subs = await db["seller_subscriptions"].find(
-                {
-                    "owner_id": owner_id,
-                    "active": True,
-                    "expiry_date": {"$gt": now},
-                },
-                {"user_id": 1},
-            ).to_list(length=5000)
+                sent = failed = skipped = reused = created = 0
+                for sub in subs:
+                    uid = int(sub.get("user_id") or 0)
+                    if not uid:
+                        skipped += 1
+                        continue
 
-            sent = failed = skipped = 0
-            for sub in subs:
-                uid = int(sub.get("user_id") or 0)
-                if not uid:
-                    skipped += 1
-                    continue
+                    links = []
+                    for channel in channels:
+                        chat_id = int(channel["chat_id"])
+                        try:
+                            invite_doc = await get_active_invite(owner_id, uid, chat_id)
+                            invite_link = (invite_doc or {}).get("invite_link")
 
-                links = []
-                for channel in channels:
-                    chat_id = int(channel["chat_id"])
+                            if invite_link:
+                                reused += 1
+                            else:
+                                invite = await running.application.bot.create_chat_invite_link(
+                                    chat_id,
+                                    member_limit=1,
+                                )
+                                invite_link = invite.invite_link
+                                await save_invite(owner_id, uid, chat_id, invite_link)
+                                created += 1
+
+                            links.append(
+                                f"{channel.get('title', 'Channel/Group')}: {invite_link}"
+                            )
+                        except TelegramError as exc:
+                            logger.warning(
+                                "Invite creation failed owner_id=%s bot_id=%s "
+                                "user_id=%s chat_id=%s error=%s",
+                                owner_id,
+                                bot_id,
+                                uid,
+                                chat_id,
+                                exc,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Unexpected invite creation failure owner_id=%s "
+                                "bot_id=%s user_id=%s chat_id=%s",
+                                owner_id,
+                                bot_id,
+                                uid,
+                                chat_id,
+                            )
+
+                    if not links:
+                        failed += 1
+                        continue
+
                     try:
-                        invite = await running.application.bot.create_chat_invite_link(
-                            chat_id,
-                            member_limit=1,
+                        await running.application.bot.send_message(
+                            uid,
+                            "🔗 Your invite links:\n\n" + "\n".join(links),
+                            disable_web_page_preview=True,
                         )
-                        links.append(
-                            f"{channel.get('title', 'Channel/Group')}: {invite.invite_link}"
-                        )
+                        sent += 1
                     except TelegramError as exc:
+                        failed += 1
                         logger.warning(
-                            "Invite creation failed owner_id=%s bot_id=%s "
-                            "user_id=%s chat_id=%s error=%s",
+                            "Invite resend delivery failed owner_id=%s bot_id=%s "
+                            "user_id=%s error=%s",
                             owner_id,
                             bot_id,
                             uid,
-                            chat_id,
                             exc,
                         )
                     except Exception:
+                        failed += 1
                         logger.exception(
-                            "Unexpected invite creation failure owner_id=%s "
-                            "bot_id=%s user_id=%s chat_id=%s",
+                            "Unexpected invite delivery failure owner_id=%s "
+                            "bot_id=%s user_id=%s",
                             owner_id,
                             bot_id,
                             uid,
-                            chat_id,
                         )
 
-                if not links:
-                    failed += 1
-                    continue
+                    await asyncio.sleep(0.04)
 
-                try:
-                    await running.application.bot.send_message(
-                        uid,
-                        "🔗 Your fresh invite links:\n\n" + "\n".join(links),
-                        disable_web_page_preview=True,
-                    )
-                    sent += 1
-                except TelegramError as exc:
-                    failed += 1
-                    logger.warning(
-                        "Invite resend delivery failed owner_id=%s bot_id=%s "
-                        "user_id=%s error=%s",
-                        owner_id,
-                        bot_id,
-                        uid,
-                        exc,
-                    )
-                except Exception:
-                    failed += 1
-                    logger.exception(
-                        "Unexpected invite delivery failure owner_id=%s "
-                        "bot_id=%s user_id=%s",
-                        owner_id,
-                        bot_id,
-                        uid,
-                    )
+                return {
+                    "sent": sent,
+                    "failed": failed,
+                    "skipped": skipped,
+                    "reused": reused,
+                    "created": created,
+                }
+
+        started, result = await resend_invites_safely(
+            owner_id,
+            bot_id,
+            _run_resend,
+        )
+        if not started:
+            await q.edit_message_text(
+                "⏳ Invite resend is already running. Please wait.",
+                reply_markup=channels_markup(bot_id),
+            )
+            return
+
+        result = result or {}
+        if result.get("error") == "not_running":
+            await q.edit_message_text(
+                "❌ Clone bot is not running. Resume it first.",
+                reply_markup=channels_markup(bot_id),
+            )
+            return
+        if result.get("error") == "no_channels":
+            await q.edit_message_text(
+                "❌ No channel/group connected.",
+                reply_markup=channels_markup(bot_id),
+            )
+            return
 
         await q.edit_message_text(
             "✅ Invite link resend completed.\n\n"
-            f"Sent: {sent}\nFailed: {failed}\nSkipped: {skipped}",
+            f"Sent: {result.get('sent', 0)}\n"
+            f"Failed: {result.get('failed', 0)}\n"
+            f"Skipped: {result.get('skipped', 0)}\n"
+            f"Reused links: {result.get('reused', 0)}\n"
+            f"New links: {result.get('created', 0)}",
             reply_markup=channels_markup(bot_id),
         )
         return
