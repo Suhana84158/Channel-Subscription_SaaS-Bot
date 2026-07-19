@@ -91,7 +91,7 @@ async def _verify_cashfree_payment(
 ) -> tuple[str, dict]:
     """Re-query Cashfree before fulfillment and verify the paid order details."""
     order_id = str(transaction["transaction_id"])
-    base = _cashfree_base(settings.get("mode", "test"))
+    base = _cashfree_base("live")
     headers = _cashfree_headers(settings)
 
     order = await _request(
@@ -140,7 +140,7 @@ async def test_gateway_connection(scope: str, owner_id: int, gateway: str) -> di
     """Validate stored credentials without creating or charging a payment."""
     cfg = await get_gateway_config(scope, owner_id, decrypt=True)
     settings = (cfg.get("gateways") or {}).get(gateway) or {}
-    mode = settings.get("mode", "test")
+    mode = "live"
     if gateway == "razorpay":
         key_id, key_secret = settings.get("key_id"), settings.get("key_secret")
         if not key_id or not key_secret:
@@ -206,7 +206,7 @@ async def _create_razorpay(tx: dict, s: dict) -> dict:
 
 
 async def _create_cashfree(tx: dict, s: dict) -> dict:
-    mode = s.get("mode", "test")
+    mode = "live"
     base = _cashfree_base(mode)
     amount = round(float(tx["amount"]), 2)
     if amount <= 0:
