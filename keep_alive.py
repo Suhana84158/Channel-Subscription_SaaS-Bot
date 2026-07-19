@@ -307,57 +307,11 @@ async def _notify_success(transaction_id):
         return
 
     if tx.get("purpose") == "child_subscription":
-        from database.seller_data import get_channels, get_subscription
-        from services.bot_manager import bot_manager
-
-        running = bot_manager.get_running(tx["owner_id"])
-        if not running:
-            return
-
-        bot = running.application.bot
-        links = []
-
-        for channel in await get_channels(tx["owner_id"]):
-            try:
-                invite = await bot.create_chat_invite_link(
-                    channel["chat_id"],
-                    member_limit=1,
-                )
-                links.append(
-                    f"{channel.get('title','Premium Channel')}\n"
-                    f"{invite.invite_link}"
-                )
-            except Exception:
-                continue
-
-        sub = await get_subscription(
-            tx["owner_id"],
-            tx["payer_user_id"],
-        )
-        text = (
-            f"✅ Payment verified automatically\n\n"
-            f"Gateway: {tx.get('gateway','').title()}\n"
-            f"Amount: ₹{tx.get('amount',0):g}\n"
-            f"Plan: {tx.get('metadata',{}).get('plan_name','Subscription')}\n"
-        )
-
-        if sub and sub.get("expiry_date"):
-            text += (
-                f"Expiry: "
-                f"{sub['expiry_date'].strftime('%d-%m-%Y %H:%M UTC')}\n"
-            )
-
-        if links:
-            text += (
-                "\nJoin using your private invite link(s):\n\n"
-                + "\n\n".join(links)
-            )
-
-        await bot.send_message(
-            tx["payer_user_id"],
-            text,
-            disable_web_page_preview=True,
-        )
+        # services.payment_gateways.fulfill_transaction() already activates the
+        # subscription and calls deliver_subscription_access(), which sends the
+        # single success message and fresh invite link(s). Sending from this
+        # return/webhook notifier as well creates duplicate links.
+        return
 
 
 @app.route(
@@ -429,7 +383,10 @@ def gateway_webhook(gateway, scope, owner_id):
                 or (body.get("metaInfo") or {}).get("udf1")
             )
 
-        if txid:
+        # Notify only when this webhook performed the first successful
+        # fulfillment. Duplicate webhook deliveries return "already processed"
+        # or "already processing" and must not send another success message.
+        if txid and ok and message == "processed":
             try:
                 _run(_notify_success(str(txid)), timeout=30)
             except Exception:
