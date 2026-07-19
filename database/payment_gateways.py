@@ -13,13 +13,26 @@ CONFIGS = "payment_gateway_configs"
 TRANSACTIONS = "gateway_transactions"
 EVENTS = "gateway_webhook_events"
 
-SUPPORTED_GATEWAYS = ("razorpay", "cashfree", "phonepe", "paytm")
+SUPPORTED_GATEWAYS = ("razorpay", "cashfree")
 SECRET_FIELDS = {
     "razorpay": {"key_secret", "webhook_secret"},
     "cashfree": {"client_secret"},
-    "phonepe": {"client_secret", "webhook_password"},
-    "paytm": {"merchant_key"},
 }
+REQUIRED_FIELDS = {
+    "razorpay": ("key_id", "key_secret", "webhook_secret"),
+    "cashfree": ("client_id", "client_secret"),
+}
+VALID_MODES = {"test", "live"}
+
+
+def gateway_missing_fields(gateway: str, settings: dict | None) -> list[str]:
+    gateway = gateway.lower().strip()
+    settings = settings or {}
+    return [field for field in REQUIRED_FIELDS.get(gateway, ()) if not str(settings.get(field, "")).strip()]
+
+
+def gateway_is_ready(gateway: str, settings: dict | None) -> bool:
+    return gateway in SUPPORTED_GATEWAYS and not gateway_missing_fields(gateway, settings)
 
 
 def _configs():
@@ -83,7 +96,14 @@ async def save_gateway_config(
     for key, value in values.items():
         if isinstance(value, str):
             value = value.strip()
+        if key == "mode" and value not in VALID_MODES:
+            raise ValueError("Mode must be test or live")
         item[key] = value
+
+    if item.get("enabled") and not gateway_is_ready(gateway, item):
+        missing = ", ".join(gateway_missing_fields(gateway, item))
+        raise ValueError(f"Set required credentials first: {missing}")
+
     encrypted = dict(item)
     for key in SECRET_FIELDS.get(gateway, set()):
         if encrypted.get(key):
@@ -133,7 +153,12 @@ async def set_gateway_preferences(
 
 async def enabled_gateways(scope: str, owner_id: int = 0) -> list[str]:
     cfg = await get_gateway_config(scope, owner_id, decrypt=True)
-    return [name for name in SUPPORTED_GATEWAYS if (cfg.get("gateways") or {}).get(name, {}).get("enabled")]
+    gateways = cfg.get("gateways") or {}
+    return [
+        name
+        for name in SUPPORTED_GATEWAYS
+        if gateways.get(name, {}).get("enabled") and gateway_is_ready(name, gateways.get(name))
+    ]
 
 
 async def create_gateway_transaction(
