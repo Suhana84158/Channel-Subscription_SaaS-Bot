@@ -16,6 +16,7 @@ POLICIES = "platform_policies"
 PAYMENT_FINGERPRINTS = "payment_fingerprints"
 REFERRAL_LEDGER = "seller_referral_commissions"
 BROADCAST_RUNS = "broadcast_runs"
+BROADCAST_DELIVERIES = "broadcast_deliveries"
 
 
 def col(name: str):
@@ -35,6 +36,13 @@ async def initialize_platform_feature_indexes():
     await col(BROADCAST_RUNS).create_index("broadcast_id", unique=True)
     await col(BROADCAST_RUNS).create_index(
         [("owner_id", 1), ("status", 1), ("created_at", -1)]
+    )
+    await col(BROADCAST_DELIVERIES).create_index(
+        [("broadcast_id", 1), ("user_id", 1)],
+        unique=True,
+    )
+    await col(BROADCAST_DELIVERIES).create_index(
+        [("broadcast_id", 1), ("status", 1)]
     )
     now = datetime.now(timezone.utc)
     defaults = {
@@ -345,6 +353,54 @@ async def create_broadcast_run(
     }
     await col(BROADCAST_RUNS).insert_one(doc)
     return doc
+
+
+async def reserve_broadcast_delivery(broadcast_id: str, user_id: int) -> bool:
+    """Atomically reserve one recipient for one broadcast run.
+
+    The unique index guarantees that the same run cannot deliver to the same
+    Telegram user twice, even when callbacks overlap inside one process.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        await col(BROADCAST_DELIVERIES).insert_one(
+            {
+                "broadcast_id": str(broadcast_id),
+                "user_id": int(user_id),
+                "status": "processing",
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        return True
+    except Exception as exc:
+        text = str(exc).lower()
+        if "duplicate" in text or "e11000" in text:
+            return False
+        raise
+
+
+async def finish_broadcast_delivery(
+    broadcast_id: str,
+    user_id: int,
+    status: str,
+) -> bool:
+    """Store the final result without allowing a second sender to overwrite it."""
+    result = await col(BROADCAST_DELIVERIES).update_one(
+        {
+            "broadcast_id": str(broadcast_id),
+            "user_id": int(user_id),
+            "status": "processing",
+        },
+        {
+            "$set": {
+                "status": str(status),
+                "finished_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+    return result.modified_count == 1
 
 
 async def request_broadcast_cancel(
