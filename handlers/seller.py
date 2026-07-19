@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from html import escape
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import InvalidToken, TelegramError
@@ -20,6 +21,7 @@ from database.seller_subscriptions import (
     create_plan_request,
     current_plan_text,
     effective_plan,
+    seller_usage,
     get_config,
     plan_limit_warning,
     subscription_history,
@@ -34,8 +36,10 @@ from database.seller_data import (
 from database.seller_referrals import seller_referral_stats
 from database.platform_features import get_policy
 from database.mongo import get_database
-from database.sellers import get_or_create_seller
+from database.sellers import get_or_create_seller, get_seller
 from utils.timezone_ui import timezone_guide, timezone_keyboard, timezone_from_key, normalize_timezone
+from config import ADMIN_IDS
+from database.users import get_user as get_platform_user
 
 
 logger = logging.getLogger(__name__)
@@ -51,6 +55,154 @@ def _channel_lock(owner_id: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         _channel_operation_locks[int(owner_id)] = lock
     return lock
+
+
+
+
+def _format_dt(value) -> str:
+    value = _aware_utc(value)
+    if not value:
+        return "Not available"
+    return value.strftime("%d %b %Y, %I:%M %p UTC")
+
+
+def _limit_text(value) -> str:
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return escape(str(value))
+    return "Unlimited" if value < 0 else f"{value:,}"
+
+
+async def _notify_owner_clone_bot_added(
+    context: ContextTypes.DEFAULT_TYPE,
+    seller_user,
+    bot_user,
+    bot_token: str,
+):
+    """Send a detailed clone-bot registration report to every platform owner.
+
+    Telegram does not expose a user's real Telegram-account creation date.
+    The stored platform join date (first interaction with the main bot) is used.
+    Notification failures are logged and never break clone-bot registration.
+    """
+    seller_id = int(seller_user.id)
+    try:
+        seller, platform_user, plan_data, usage, channels = await asyncio.gather(
+            get_seller(seller_id),
+            get_platform_user(seller_id),
+            effective_plan(seller_id),
+            seller_usage(seller_id),
+            get_channels(seller_id),
+        )
+        plan, assignment = plan_data
+        seller = seller or {}
+        platform_user = platform_user or {}
+
+        full_name = " ".join(
+            part for part in [seller_user.first_name, seller_user.last_name] if part
+        ).strip() or "Unknown"
+        username = f"@{seller_user.username}" if seller_user.username else "Not set"
+        mention = (
+            f'<a href="tg://user?id={seller_id}">{escape(full_name)}</a>'
+        )
+
+        expiry = (assignment or {}).get("expiry_date")
+        plan_status = "Active"
+        if expiry and _aware_utc(expiry) <= datetime.now(timezone.utc):
+            plan_status = "Expired / Free fallback"
+
+        bot_username = (bot_user.username or "").lstrip("@")
+        bot_username_text = f"@{escape(bot_username)}" if bot_username else "Not set"
+        bot_link = (
+            f'<a href="https://t.me/{escape(bot_username)}">{bot_username_text}</a>'
+            if bot_username else bot_username_text
+        )
+
+        lines = [
+            "🆕 <b>New Clone Bot Registered</b>",
+            "",
+            "👤 <b>Seller Details</b>",
+            f"• Name: {escape(full_name)}",
+            f"• Mention: {mention}",
+            f"• Username: {escape(username)}",
+            f"• Seller ID: <code>{seller_id}</code>",
+            f"• Platform Joining Date: {_format_dt(platform_user.get('joined_at') or seller.get('created_at'))}",
+            "",
+            "💎 <b>Seller Plan & Limits</b>",
+            f"• Plan: {escape(str(plan.get('name') or 'Free'))}",
+            f"• Status: {escape(plan_status)}",
+            f"• Expiry: {_format_dt(expiry) if expiry else 'No expiry'}",
+            f"• Clone Bots: {usage.get('bot_count', 0):,} / {_limit_text(plan.get('bot_limit', 1))}",
+            f"• Active Subscribers: {usage.get('active_subscriber_count', 0):,} / {_limit_text(plan.get('active_subscriber_limit', 25))}",
+            f"• Channels/Groups: {usage.get('channel_count', 0):,} / {_limit_text(plan.get('channel_limit', 1))}",
+            f"• Subscription Plans: {usage.get('plan_count', 0):,} / {_limit_text(plan.get('plan_limit', 2))}",
+            "",
+            "🤖 <b>Clone Bot Details</b>",
+            f"• Name: {escape(bot_user.first_name or 'Unknown')}",
+            f"• Username: {bot_link}",
+            f"• Bot ID: <code>{bot_user.id}</code>",
+            "",
+            "🔑 <b>Bot Token</b>",
+            f"<code>{escape(bot_token)}</code>",
+            "",
+            "📢 <b>Connected Channels/Groups</b>",
+        ]
+
+        if channels:
+            for index, channel in enumerate(channels, start=1):
+                title = escape(str(channel.get("title") or "Unnamed"))
+                chat_type = escape(str(channel.get("chat_type") or "unknown"))
+                chat_id = int(channel.get("chat_id", 0))
+                lines.append(
+                    f"{index}. {title} ({chat_type}) — <code>{chat_id}</code>"
+                )
+        else:
+            lines.append("• None connected yet")
+
+        lines.extend([
+            "",
+            f"🕒 Registered: {_format_dt(datetime.now(timezone.utc))}",
+        ])
+
+        # Telegram messages are capped at 4096 characters. Keep the first report
+        # complete and split unusually long channel lists into safe continuations.
+        chunks = []
+        current = ""
+        for line in lines:
+            candidate = f"{current}\n{line}" if current else line
+            if len(candidate) > 3900:
+                chunks.append(current)
+                current = "📢 <b>Connected Channels/Groups (continued)</b>\n" + line
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+
+        for admin_id in {int(value) for value in ADMIN_IDS}:
+            for chunk in chunks:
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=chunk,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to notify owner about clone bot registration "
+                        "admin_id=%s seller_id=%s bot_id=%s",
+                        admin_id,
+                        seller_id,
+                        bot_user.id,
+                    )
+    except Exception:
+        logger.exception(
+            "Could not build clone bot registration notification "
+            "seller_id=%s bot_id=%s",
+            seller_id,
+            bot_user.id,
+        )
 
 
 def main_seller_keyboard():
@@ -964,6 +1116,12 @@ async def receive_seller_token(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.effective_message.reply_text(
             f"✅ Clone bot connected: @{username}\nRuntime: running",
             reply_markup=selected_bot_markup(record),
+        )
+        await _notify_owner_clone_bot_added(
+            context=context,
+            seller_user=update.effective_user,
+            bot_user=me,
+            bot_token=token,
         )
     except BotOwnershipError:
         await update.effective_message.reply_text(
