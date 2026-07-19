@@ -8,18 +8,17 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import TIMEZONE
 from scheduler.expiry_worker import check_expired_users
+from scheduler.payment_recovery import recover_payments_job
 
 logger = logging.getLogger(__name__)
 
-_JOB_DEFAULTS = {
-    "coalesce": True,
-    "max_instances": 1,
-    "misfire_grace_time": 120,
-}
-
 scheduler = AsyncIOScheduler(
     timezone=TIMEZONE,
-    job_defaults=_JOB_DEFAULTS,
+    job_defaults={
+        "coalesce": True,
+        "max_instances": 1,
+        "misfire_grace_time": 120,
+    },
 )
 
 _listener_added = False
@@ -28,10 +27,8 @@ _shutdown_requested = False
 _started_at: datetime | None = None
 _last_restart_at: datetime | None = None
 _restart_count = 0
-_start_lock: asyncio.Lock | None = None
 
-# Every job is kept here so startup and recovery can reconcile the scheduler
-# without creating duplicates.
+# Job definitions are retained so a recovered scheduler can restore every job.
 _registered_jobs: dict[str, dict[str, Any]] = {}
 
 
@@ -43,20 +40,16 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
-def _get_start_lock() -> asyncio.Lock:
-    global _start_lock
-    if _start_lock is None:
-        _start_lock = asyncio.Lock()
-    return _start_lock
-
-
 def _job_listener(event) -> None:
-    if getattr(event, "exception", None):
-        exc = event.exception
+    if event.exception:
         logger.error(
             "Scheduler job failed job_id=%s",
             event.job_id,
-            exc_info=(type(exc), exc, exc.__traceback__),
+            exc_info=(
+                type(event.exception),
+                event.exception,
+                event.exception.__traceback__,
+            ),
         )
     elif event.code == EVENT_JOB_MISSED:
         logger.warning("Scheduler job was missed job_id=%s", event.job_id)
@@ -64,8 +57,10 @@ def _job_listener(event) -> None:
 
 def _ensure_listener() -> None:
     global _listener_added
+
     if _listener_added:
         return
+
     scheduler.add_listener(
         _job_listener,
         EVENT_JOB_ERROR | EVENT_JOB_MISSED,
@@ -79,7 +74,7 @@ def _remember_job(
     trigger: str,
     job_id: str,
     replace_existing: bool = True,
-    **kwargs: Any,
+    **kwargs,
 ) -> None:
     _registered_jobs[job_id] = {
         "func": func,
@@ -90,6 +85,21 @@ def _remember_job(
     }
 
 
+def _register_job(definition: dict[str, Any]) -> None:
+    scheduler.add_job(**definition)
+
+
+def _restore_registered_jobs() -> None:
+    for job_id, definition in list(_registered_jobs.items()):
+        try:
+            _register_job(definition)
+        except Exception:
+            logger.exception(
+                "Unable to restore scheduler job job_id=%s",
+                job_id,
+            )
+
+
 def _register_core_jobs() -> None:
     _remember_job(
         func=check_expired_users,
@@ -98,86 +108,52 @@ def _register_core_jobs() -> None:
         job_id="subscription_expiry_check",
         replace_existing=True,
     )
-
-
-def _reconcile_jobs() -> None:
-    """Create missing jobs and replace stale definitions atomically by ID."""
-    configured_ids = set(_registered_jobs)
-
-    for definition in _registered_jobs.values():
-        scheduler.add_job(**definition)
-
-    # Only remove jobs managed by this module. Unknown APScheduler jobs are
-    # preserved so another component is not accidentally disrupted.
-    existing_ids = {job.id for job in scheduler.get_jobs()}
-    missing = configured_ids - existing_ids
-    if missing:
-        logger.error("Scheduler reconciliation left missing jobs=%s", sorted(missing))
-
-
-def _start_scheduler_now() -> None:
-    global _started_at
-
-    _ensure_listener()
-    _register_core_jobs()
-    _reconcile_jobs()
-
-    if not scheduler.running:
-        scheduler.start()
-        _started_at = _started_at or _utcnow()
-
-    # A second reconciliation after start protects jobs added while the
-    # scheduler was stopped and remains safe because all IDs replace existing.
-    _reconcile_jobs()
-
-
-def start_scheduler() -> None:
-    """Start once and restore all registered jobs without duplication."""
-    global _shutdown_requested
-    _shutdown_requested = False
-    _start_scheduler_now()
-    _start_watchdog()
-    logger.info("Scheduler ready jobs=%s", len(scheduler.get_jobs()))
-
-
-def restart_scheduler() -> bool:
-    """Recover a stopped scheduler and reconcile every registered job."""
-    global _last_restart_at, _restart_count, _shutdown_requested
-    _shutdown_requested = False
-
-    try:
-        _start_scheduler_now()
-        _restart_count += 1
-        _last_restart_at = _utcnow()
-        _start_watchdog()
-        logger.info(
-            "[RECOVERY] Scheduler reconciled restart_count=%s jobs=%s",
-            _restart_count,
-            len(scheduler.get_jobs()),
-        )
-        return True
-    except Exception:
-        logger.exception("[RECOVERY] Scheduler recovery failed")
-        return False
+    _remember_job(
+        func=recover_payments_job,
+        trigger="interval",
+        minutes=5,
+        job_id="payment_orphan_recovery",
+        replace_existing=True,
+    )
+    _restore_registered_jobs()
 
 
 async def _scheduler_watchdog() -> None:
+    global _last_restart_at, _restart_count
+
     logger.info("Scheduler watchdog started")
 
     while not _shutdown_requested:
         try:
             await asyncio.sleep(60)
+
             if _shutdown_requested:
                 break
 
-            # Reconcile even while running. This restores any job that was
-            # accidentally removed at runtime and replaces stale definitions.
-            async with _get_start_lock():
-                if not scheduler.running:
-                    logger.warning("[RECOVERY] Scheduler stopped unexpectedly")
-                    restart_scheduler()
-                else:
-                    _reconcile_jobs()
+            if scheduler.running:
+                continue
+
+            logger.warning(
+                "[RECOVERY] Scheduler stopped unexpectedly; restarting"
+            )
+
+            try:
+                scheduler.start()
+                _restore_registered_jobs()
+                _restart_count += 1
+                _last_restart_at = _utcnow()
+
+                logger.info(
+                    "[RECOVERY] Scheduler restarted successfully "
+                    "restart_count=%s jobs=%s",
+                    _restart_count,
+                    len(scheduler.get_jobs()),
+                )
+            except Exception:
+                logger.exception(
+                    "[RECOVERY] Scheduler restart failed"
+                )
+
         except asyncio.CancelledError:
             break
         except Exception:
@@ -188,13 +164,16 @@ async def _scheduler_watchdog() -> None:
 
 def _start_watchdog() -> None:
     global _watchdog_task
+
     if _watchdog_task and not _watchdog_task.done():
         return
 
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        logger.warning("Scheduler watchdog requires a running event loop")
+        logger.warning(
+            "Scheduler watchdog was not started because no event loop is running"
+        )
         return
 
     _watchdog_task = loop.create_task(
@@ -203,9 +182,58 @@ def _start_watchdog() -> None:
     )
 
 
+def start_scheduler() -> None:
+    """Start APScheduler safely and register all regular jobs."""
+    global _shutdown_requested, _started_at
+
+    _shutdown_requested = False
+    _ensure_listener()
+    _register_core_jobs()
+
+    if not scheduler.running:
+        scheduler.start()
+        _started_at = _started_at or _utcnow()
+        logger.info(
+            "Scheduler started jobs=%s",
+            len(scheduler.get_jobs()),
+        )
+
+    _start_watchdog()
+
+
+def restart_scheduler() -> bool:
+    """Restart the scheduler without creating duplicate jobs."""
+    global _last_restart_at, _restart_count, _shutdown_requested
+
+    _shutdown_requested = False
+
+    try:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+
+        scheduler.start()
+        _restore_registered_jobs()
+
+        _restart_count += 1
+        _last_restart_at = _utcnow()
+        _start_watchdog()
+
+        logger.info(
+            "[RECOVERY] Scheduler manually restarted "
+            "restart_count=%s jobs=%s",
+            _restart_count,
+            len(scheduler.get_jobs()),
+        )
+        return True
+    except Exception:
+        logger.exception("[RECOVERY] Scheduler manual restart failed")
+        return False
+
+
 def shutdown_scheduler() -> None:
-    """Stop background scheduling during graceful application shutdown."""
+    """Stop the scheduler and its watchdog during graceful shutdown."""
     global _shutdown_requested, _watchdog_task
+
     _shutdown_requested = True
 
     if _watchdog_task and not _watchdog_task.done():
@@ -218,27 +246,25 @@ def shutdown_scheduler() -> None:
 
 
 def scheduler_health() -> dict[str, Any]:
+    """Return scheduler information for the runtime health endpoint."""
     now = _utcnow()
     uptime_seconds = (
-        int((now - _started_at).total_seconds()) if _started_at else 0
+        int((now - _started_at).total_seconds())
+        if _started_at
+        else 0
     )
 
+    jobs = []
     try:
         jobs = scheduler.get_jobs()
     except Exception:
         logger.exception("Unable to read scheduler jobs")
-        jobs = []
-
-    configured_ids = sorted(_registered_jobs)
-    active_ids = sorted(job.id for job in jobs)
 
     return {
         "running": bool(scheduler.running),
         "status": "running" if scheduler.running else "stopped",
         "jobs": len(jobs),
-        "job_ids": active_ids,
-        "configured_job_ids": configured_ids,
-        "missing_job_ids": sorted(set(configured_ids) - set(active_ids)),
+        "job_ids": sorted(job.id for job in jobs),
         "watchdog_running": bool(
             _watchdog_task and not _watchdog_task.done()
         ),
@@ -250,34 +276,29 @@ def scheduler_health() -> dict[str, Any]:
 
 
 def add_interval_job(
-    func: Callable,
+    func,
     job_id: str,
     minutes: int,
     replace_existing: bool = True,
 ) -> None:
-    if minutes <= 0:
-        raise ValueError("minutes must be greater than zero")
-
-    _remember_job(
-        func=func,
-        trigger="interval",
-        minutes=minutes,
-        job_id=job_id,
-        replace_existing=replace_existing,
-    )
-
-    if scheduler.running:
-        _reconcile_jobs()
+    definition = {
+        "func": func,
+        "trigger": "interval",
+        "minutes": minutes,
+        "id": job_id,
+        "replace_existing": replace_existing,
+    }
+    _registered_jobs[job_id] = definition
+    _register_job(definition)
 
 
-def add_cron_job(func: Callable, job_id: str, **kwargs: Any) -> None:
-    _remember_job(
-        func=func,
-        trigger="cron",
-        job_id=job_id,
-        replace_existing=True,
+def add_cron_job(func, job_id: str, **kwargs) -> None:
+    definition = {
+        "func": func,
+        "trigger": "cron",
+        "id": job_id,
+        "replace_existing": True,
         **kwargs,
-    )
-
-    if scheduler.running:
-        _reconcile_jobs()
+    }
+    _registered_jobs[job_id] = definition
+    _register_job(definition)
