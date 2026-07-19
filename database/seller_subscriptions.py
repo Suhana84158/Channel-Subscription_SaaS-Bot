@@ -522,6 +522,40 @@ async def bot_runtime_allowed(owner_id: int, bot_id: int):
     return False, {"limit": limit, "position": None, "plan": plan}
 
 
+def normalize_plan_limit(value, default: int = 0) -> int:
+    """Return a safe integer limit. -1 means unlimited."""
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(-1, value)
+
+
+async def resource_limit_status(owner_id: int, resource: str):
+    """Return current usage and whether another resource may be created."""
+    plan, _ = await effective_plan(int(owner_id))
+    usage = await seller_usage(int(owner_id))
+    mapping = {
+        "bot": ("bot_count", "bot_limit", 1),
+        "subscriber": ("active_subscriber_count", "active_subscriber_limit", 25),
+        "channel": ("channel_count", "channel_limit", 1),
+        "plan": ("plan_count", "plan_limit", 2),
+        "admin": ("admin_count", "admin_limit", 1),
+    }
+    if resource not in mapping:
+        raise ValueError(f"Unknown resource: {resource}")
+    usage_key, limit_key, default = mapping[resource]
+    used = int(usage.get(usage_key, 0) or 0)
+    limit = normalize_plan_limit(plan.get(limit_key), default)
+    return {
+        "allowed": limit < 0 or used < limit,
+        "used": used,
+        "limit": limit,
+        "plan": plan,
+        "resource": resource,
+    }
+
+
 def validate_plan_limits(*values: int):
     """Validate owner-configured limits. -1 means unlimited; lower values are invalid."""
     parsed = []

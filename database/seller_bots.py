@@ -5,6 +5,7 @@ from pymongo.errors import DuplicateKeyError
 from utils.crypto import decrypt_secret, encrypt_secret
 
 COLLECTION = "seller_bots"
+CREATION_LOCKS = "seller_bot_creation_locks"
 
 
 class BotOwnershipError(RuntimeError):
@@ -13,6 +14,10 @@ class BotOwnershipError(RuntimeError):
 
 def seller_bots_collection():
     return get_database()[COLLECTION]
+
+
+def seller_bot_creation_locks_collection():
+    return get_database()[CREATION_LOCKS]
 
 
 async def initialize_seller_bot_indexes():
@@ -30,6 +35,9 @@ async def initialize_seller_bot_indexes():
     await col.create_index("bot_username_normalized", unique=True)
     await col.create_index("active")
     await col.create_index([("owner_id", 1), ("created_at", 1)])
+    locks = seller_bot_creation_locks_collection()
+    await locks.create_index("owner_id", unique=True)
+    await locks.create_index("expires_at", expireAfterSeconds=0)
 
     # Preserve the existing first bot's old owner-scoped data.
     cursor = col.find({"data_owner_id": {"$exists": False}})
@@ -38,6 +46,35 @@ async def initialize_seller_bot_indexes():
             {"_id": record["_id"]},
             {"$set": {"data_owner_id": int(record["owner_id"])}}
         )
+
+
+async def claim_bot_creation(owner_id: int, lease_seconds: int = 120):
+    """Acquire a short owner-scoped lease for clone-bot create/replace flow."""
+    owner_id = int(owner_id)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=max(30, int(lease_seconds)))
+    try:
+        return await seller_bot_creation_locks_collection().find_one_and_update(
+            {
+                "owner_id": owner_id,
+                "$or": [
+                    {"expires_at": {"$exists": False}},
+                    {"expires_at": {"$lte": now}},
+                ],
+            },
+            {
+                "$set": {"owner_id": owner_id, "claimed_at": now, "expires_at": expires_at},
+                "$inc": {"claim_count": 1},
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        return None
+
+
+async def release_bot_creation(owner_id: int):
+    return await seller_bot_creation_locks_collection().delete_one({"owner_id": int(owner_id)})
 
 
 async def get_bot(owner_id: int):
