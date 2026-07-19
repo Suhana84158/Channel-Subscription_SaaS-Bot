@@ -9,6 +9,7 @@ from telegram.ext import Application, MessageHandler, filters
 from config import ADMIN_IDS, BOT_TOKEN
 from database.admins import initialize_admins
 from database.deleting_messages import initialize_deleting_message_indexes
+from database.broadcast import initialize_broadcast_indexes
 from database.live_support import initialize_live_support_indexes
 from database.mongo import close_database, connect_database, ping_database
 from database.payment_gateways import initialize_payment_gateway_indexes
@@ -20,7 +21,7 @@ from database.seller_referrals import initialize_seller_referral_indexes
 from database.seller_subscriptions import initialize_seller_subscription_indexes
 from database.settings import initialize_default_settings
 from handlers.admin import admin_handlers, receive_upi_qr
-from handlers.broadcast import broadcast_handler
+from handlers.broadcast import broadcast_extra_handlers, broadcast_handler
 from handlers.errors import error_handler
 from handlers.help import help_callback_handler, help_handler
 from handlers.main_dashboard import main_dashboard_handlers
@@ -51,6 +52,7 @@ from scheduler import (
 )
 from scheduler_jobs.seller_subscriptions import run_seller_subscription_reminders
 from services.bot_manager import bot_manager
+from services.broadcast_service import resume_broadcasts
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +156,7 @@ async def post_init(application: Application) -> None:
         ("live support indexes", initialize_live_support_indexes),
         ("deleting message indexes", initialize_deleting_message_indexes),
         ("performance indexes", initialize_performance_indexes),
+        ("broadcast queue indexes", initialize_broadcast_indexes),
     ]
 
     for name, initializer in critical_initializers:
@@ -179,12 +182,11 @@ async def post_init(application: Application) -> None:
     configure_runtime(asyncio.get_running_loop(), application.bot)
 
     try:
+        start_scheduler()
+
         async def seller_subscription_reminder_job() -> None:
             await run_seller_subscription_reminders(application.bot)
 
-        # Register every job before starting APScheduler. This removes the
-        # startup gap in which only the expiry job existed and lets the
-        # scheduler restore the complete registry in one reconciliation.
         add_cron_job(
             seller_subscription_reminder_job,
             "seller_subscription_reminders",
@@ -196,10 +198,12 @@ async def post_init(application: Application) -> None:
             "clone_bot_runtime_watchdog",
             minutes=2,
         )
-        start_scheduler()
     except Exception:
         logger.exception("Scheduler startup failed.")
         raise RuntimeError("Unable to start scheduler.") from None
+
+    resumed_broadcasts = await resume_broadcasts(application.bot)
+    logger.info("Resumed broadcast queues=%s", resumed_broadcasts)
 
     restored = 0
     try:
@@ -295,6 +299,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(referral_callback())
 
     application.add_handler(broadcast_handler())
+    application.add_handlers(broadcast_extra_handlers())
     application.add_handler(
         MessageHandler(filters.PHOTO, receive_upi_qr),
         group=-1,
