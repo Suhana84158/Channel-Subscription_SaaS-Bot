@@ -128,8 +128,71 @@ async def finalize_if_done(broadcast_id: str) -> bool:
 
 
 async def request_cancel(broadcast_id: str, owner_id: int) -> bool:
-    result = await _col(RUNS).update_one({"broadcast_id": broadcast_id, "owner_id": int(owner_id), "status": {"$in": ["pending", "processing"]}}, {"$set": {"status": "cancelled", "updated_at": _now(), "finished_at": _now()}, "$unset": {"lease_until": ""}})
-    return result.modified_count == 1
+    now = _now()
+    result = await _col(RUNS).update_one(
+        {
+            "broadcast_id": broadcast_id,
+            "owner_id": int(owner_id),
+            "status": {"$in": ["pending", "processing"]},
+        },
+        {
+            "$set": {"status": "cancelled", "updated_at": now, "finished_at": now},
+            "$unset": {"lease_until": ""},
+        },
+    )
+    if result.modified_count != 1:
+        return False
+
+    # Make unfinished recipient rows terminal so status counts remain truthful.
+    await _col(RECIPIENTS).update_many(
+        {
+            "broadcast_id": broadcast_id,
+            "status": {"$in": ["pending", "processing", "retry"]},
+        },
+        {
+            "$set": {"status": "skipped", "updated_at": now, "last_error": "Broadcast cancelled by owner."},
+            "$unset": {"lease_until": "", "next_retry_at": ""},
+        },
+    )
+    await refresh_run_stats(broadcast_id)
+    return True
+
+
+async def get_latest_run_for_owner(owner_id: int) -> dict | None:
+    """Return the owner's newest broadcast, including after a restart."""
+    return await _col(RUNS).find_one(
+        {"owner_id": int(owner_id)},
+        sort=[("created_at", -1)],
+    )
+
+
+async def exhaust_retry_limit(broadcast_id: str, max_attempts: int = 4) -> int:
+    """Move recipients that used every retry to a terminal failed state.
+
+    Without this transition a broadcast can remain in processing forever:
+    those rows are no longer claimable, but finalize_if_done still sees retry.
+    """
+    now = _now()
+    result = await _col(RECIPIENTS).update_many(
+        {
+            "broadcast_id": broadcast_id,
+            "status": {"$in": ["retry", "processing"]},
+            "attempts": {"$gte": max(1, int(max_attempts))},
+            "$or": [
+                {"lease_until": {"$exists": False}},
+                {"lease_until": {"$lte": now}},
+            ],
+        },
+        {
+            "$set": {
+                "status": "failed",
+                "last_error": "Maximum broadcast delivery attempts reached.",
+                "updated_at": now,
+            },
+            "$unset": {"lease_until": "", "next_retry_at": ""},
+        },
+    )
+    return int(result.modified_count)
 
 
 async def get_run(broadcast_id: str) -> dict | None:

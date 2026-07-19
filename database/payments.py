@@ -71,7 +71,10 @@ async def expire_stale_pending_payments(
 
     query = {
         "status": "pending",
-        "created_at": {"$lt": cutoff},
+        "$or": [
+            {"created_at": {"$lt": cutoff}},
+            {"created_at": {"$exists": False}, "updated_at": {"$lt": cutoff}},
+        ],
     }
     if user_id is not None:
         query["user_id"] = int(user_id)
@@ -106,6 +109,20 @@ async def create_payment(
     than creating duplicate admin approval requests.
     """
     await ensure_payment_indexes()
+
+    plan = str(plan or "").strip()
+    if not plan:
+        raise ValueError("Payment plan is required.")
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Payment amount is invalid.") from exc
+    if amount < 0:
+        raise ValueError("Payment amount cannot be negative.")
+    if duration_minutes is not None and int(duration_minutes) <= 0:
+        raise ValueError("Payment duration must be positive.")
+    utr = str(utr).strip()[:100] if utr is not None else None
+
     await expire_stale_pending_payments(user_id)
 
     now = datetime.now(timezone.utc)
