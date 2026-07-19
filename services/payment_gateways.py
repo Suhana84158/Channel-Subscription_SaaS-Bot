@@ -23,7 +23,7 @@ from database.payment_gateways import (
     reserve_webhook_event,
     update_gateway_transaction,
 )
-from database.seller_data import activate_subscription, get_plan, create_automatic_payment
+from database.seller_data import activate_subscription, get_plan, create_automatic_payment, get_subscription
 from database.seller_subscriptions import assign_plan_with_history, get_paid_plan
 from database.platform_features import create_invoice, audit
 
@@ -498,12 +498,44 @@ async def fulfill_transaction(tx: dict) -> None:
             seller_id, tx["payer_user_id"], plan, tx["gateway"],
             tx["transaction_id"], tx.get("gateway_payment_id", ""),
         )
-        sub = await activate_subscription(
-            seller_id, tx["payer_user_id"], plan["name"],
-            plan["duration_minutes"], tx["amount"], plan.get("duration_text"),
-        )
+
+        # Only the first fulfillment attempt may add validity. A webhook or
+        # recovery retry must never extend the same purchase a second time.
+        if payment.get("_created_now"):
+            expiry = await activate_subscription(
+                seller_id, tx["payer_user_id"], plan["name"],
+                plan["duration_minutes"], tx["amount"], plan.get("duration_text"),
+            )
+        else:
+            existing_sub = await get_subscription(seller_id, tx["payer_user_id"])
+            expiry = (existing_sub or {}).get("expiry_date")
+
         invoice = await create_invoice(seller_id, tx["payer_user_id"], payment, "Seller")
         await audit("child_gateway_payment_paid", tx["payer_user_id"], seller_id, {"transaction_id": tx["transaction_id"], "gateway": tx["gateway"], "invoice_no": invoice.get("invoice_no")})
-        await mark_transaction_fulfilled(tx["transaction_id"], {"expiry_date": sub.get("expiry_date"), "invoice_no": invoice.get("invoice_no")})
+        await mark_transaction_fulfilled(
+            tx["transaction_id"],
+            {"expiry_date": expiry, "invoice_no": invoice.get("invoice_no")},
+        )
+
+        # Fulfillment is already safely recorded. Invite delivery is best effort
+        # and can be retried separately without charging or extending again.
+        try:
+            from services.bot_manager import bot_manager
+            delivery = await bot_manager.deliver_subscription_access(
+                seller_id, tx["payer_user_id"]
+            )
+            await audit(
+                "child_gateway_access_delivery",
+                tx["payer_user_id"],
+                seller_id,
+                {"transaction_id": tx["transaction_id"], **delivery},
+            )
+        except Exception as exc:
+            await audit(
+                "child_gateway_access_delivery_failed",
+                tx["payer_user_id"],
+                seller_id,
+                {"transaction_id": tx["transaction_id"], "error": str(exc)[:500]},
+            )
         return
     raise GatewayError("Unsupported transaction purpose")
