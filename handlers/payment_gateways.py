@@ -51,8 +51,6 @@ def _payment_header(scope: str, cfg: dict) -> str:
         f"{_status_icon(bool(cf.get('enabled')))} Cashfree: {'Enabled' if cf.get('enabled') else 'Disabled'}\n"
         f"   Client ID: {_masked(cf.get('client_id'))}\n"
         f"   Client Secret: {'Added' if cf.get('client_secret') else 'Not added'}\n"
-        f"{_status_icon(bool(cfg.get('manual_enabled', True)))} Manual Payment: "
-        f"{'Enabled' if cfg.get('manual_enabled', True) else 'Disabled'}\n\n"
         "Automatic gateways always use LIVE mode."
     )
 
@@ -66,12 +64,7 @@ def _home_keyboard(scope: str, cfg: dict):
             f"{'✅' if enabled else '❌'} {title}",
             callback_data=f"pgcfg_{scope}_{name}",
         )])
-    manual_enabled = bool(cfg.get("manual_enabled", True))
     rows += [
-        [InlineKeyboardButton(
-            f"{'✅' if manual_enabled else '❌'} Manual Payment — {'ON' if manual_enabled else 'OFF'}",
-            callback_data=f"pgcfg_{scope}_manualtoggle",
-        )],
         [InlineKeyboardButton("📜 Gateway History", callback_data=f"pgcfg_{scope}_history")],
         [InlineKeyboardButton("⬅ Back", callback_data="sub_mgmt_payment" if scope == "owner" else "main_seller_dashboard")],
     ]
@@ -79,12 +72,26 @@ def _home_keyboard(scope: str, cfg: dict):
 
 
 def _gateway_keyboard(scope: str, gateway: str, enabled: bool):
-    return _kb([
+    rows = [
         [InlineKeyboardButton("⛔ Disable" if enabled else "✅ Enable", callback_data=f"pgcfg_{scope}_{gateway}_toggle")],
-        [InlineKeyboardButton("🔑 Set / Replace Credentials", callback_data=f"pgcfg_{scope}_{gateway}_credentials")],
+    ]
+    if gateway == "cashfree":
+        rows += [
+            [InlineKeyboardButton("🆔 Set App ID", callback_data=f"pgcfg_{scope}_{gateway}_field_client_id")],
+            [InlineKeyboardButton("🔐 Set Secret Key", callback_data=f"pgcfg_{scope}_{gateway}_field_client_secret")],
+        ]
+    else:
+        rows += [
+            [InlineKeyboardButton("🆔 Set Key ID", callback_data=f"pgcfg_{scope}_{gateway}_field_key_id")],
+            [InlineKeyboardButton("🔐 Set Key Secret", callback_data=f"pgcfg_{scope}_{gateway}_field_key_secret")],
+            [InlineKeyboardButton("🪝 Set Webhook Secret", callback_data=f"pgcfg_{scope}_{gateway}_field_webhook_secret")],
+        ]
+    rows += [
+        [InlineKeyboardButton("📋 Enter All Credentials Together", callback_data=f"pgcfg_{scope}_{gateway}_credentials")],
         [InlineKeyboardButton("✅ Test Connection", callback_data=f"pgcfg_{scope}_{gateway}_test")],
         [InlineKeyboardButton("⬅ Back", callback_data=f"pgcfg_{scope}_home")],
-    ])
+    ]
+    return _kb(rows)
 
 
 def _gateway_header(scope: str, gateway: str, gcfg: dict) -> str:
@@ -212,6 +219,27 @@ async def gateway_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    if suffix.startswith("field_"):
+        field = suffix.replace("field_", "", 1)
+        allowed = {
+            "razorpay": {"key_id", "key_secret", "webhook_secret"},
+            "cashfree": {"client_id", "client_secret"},
+        }
+        if field not in allowed.get(gateway, set()):
+            return
+        labels = {
+            "key_id": "Razorpay Key ID", "key_secret": "Razorpay Key Secret",
+            "webhook_secret": "Razorpay Webhook Secret",
+            "client_id": "Cashfree App ID / Client ID",
+            "client_secret": "Cashfree Secret Key",
+        }
+        context.user_data["pgcfg_wait"] = {"scope": scope, "owner_id": owner_id, "gateway": gateway, "field": field}
+        await q.edit_message_text(
+            f"Send {labels[field]} in one message.\n\nFor security, your message will be deleted after saving.",
+            reply_markup=_kb([[InlineKeyboardButton("⬅ Back", callback_data=f"pgcfg_{scope}_{gateway}")]]),
+        )
+        return
+
     if suffix == "credentials":
         context.user_data["pgcfg_wait"] = {"scope": scope, "owner_id": owner_id, "gateway": gateway}
         await q.edit_message_text(_credential_help(gateway), reply_markup=_kb([[InlineKeyboardButton("⬅ Back", callback_data=f"pgcfg_{scope}_{gateway}")]]))
@@ -224,10 +252,15 @@ async def gateway_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if state["scope"] == "owner" and not await is_admin(update.effective_user.id):
         return
-    values = [x.strip() for x in (update.effective_message.text or "").split("|")]
+    raw = (update.effective_message.text or "").strip()
+    values = [x.strip() for x in raw.split("|")]
     gateway = state["gateway"]
     try:
-        if gateway == "razorpay" and len(values) == 3:
+        if state.get("field"):
+            if not raw:
+                raise ValueError("Value cannot be empty")
+            payload = {state["field"]: raw}
+        elif gateway == "razorpay" and len(values) == 3:
             payload = {"key_id": values[0], "key_secret": values[1], "webhook_secret": values[2]}
         elif gateway == "cashfree" and len(values) == 2:
             payload = {"client_id": values[0], "client_secret": values[1]}
