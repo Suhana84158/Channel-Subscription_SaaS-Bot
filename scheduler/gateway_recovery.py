@@ -27,7 +27,11 @@ async def recover_gateway_transactions_job() -> None:
             continue
         try:
             current = await get_gateway_transaction(transaction_id)
-            if not current or current.get("status") == "fulfilled":
+            if (
+                not current
+                or current.get("status") == "fulfilled"
+                or current.get("fulfilled_at") is not None
+            ):
                 continue
 
             if current.get("status") == "verification_pending" and current.get("gateway") == "cashfree":
