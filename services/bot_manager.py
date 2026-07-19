@@ -3511,6 +3511,14 @@ class SellerBotManager:
 
             bot_id = int(record["bot_id"])
             seller_account_id = int(record["owner_id"])
+            access = await seller_access_state(seller_account_id)
+            if not access.get("allowed"):
+                await set_runtime_status(
+                    bot_id,
+                    f"subscription_{access.get('reason', 'blocked')}",
+                    access.get("message") or "Seller subscription does not allow runtime startup",
+                )
+                return False
             allowed, quota = await bot_runtime_allowed(seller_account_id, bot_id)
             if not allowed:
                 limit = quota.get("limit", 0)

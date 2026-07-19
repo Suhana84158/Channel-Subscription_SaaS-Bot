@@ -3,6 +3,7 @@ from telegram.error import TelegramError
 
 from config import BOT_TOKEN
 from database.channels import get_all_channels
+from database.seller_data import get_channels as get_seller_channels
 from database.payments import mark_payment_channel_delivered
 from database.subscription_guard import get_active_invite, save_invite
 from logging_config import get_logger
@@ -25,7 +26,12 @@ async def grant_channel_access(
     When payment_id is supplied, each successful channel delivery is recorded
     immediately. A retry skips channels already delivered for that payment.
     """
-    channels = await get_all_channels()
+    channels = (
+        await get_seller_channels(int(owner_id))
+        if int(owner_id or 0)
+        else await get_all_channels()
+    )
+    channels = [channel for channel in channels if channel.get("active", True)]
     delivered = []
     failed = []
 
@@ -64,13 +70,12 @@ async def grant_channel_access(
             delivered.append(chat_id)
 
             if payment_id is not None:
-                recorded = await mark_payment_channel_delivered(
-                    payment_id,
-                    chat_id,
-                )
+                recorded = await mark_payment_channel_delivered(payment_id, chat_id)
                 if not recorded:
-                    raise RuntimeError(
-                        "Payment delivery progress could not be recorded."
+                    logger.error(
+                        "Access sent but payment progress was not recorded payment_id=%s chat_id=%s",
+                        payment_id,
+                        chat_id,
                     )
 
         except Exception as exc:
