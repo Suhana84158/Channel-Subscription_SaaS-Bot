@@ -40,6 +40,7 @@ from database.sellers import get_or_create_seller, get_seller
 from utils.timezone_ui import timezone_guide, timezone_keyboard, timezone_from_key, normalize_timezone
 from config import ADMIN_IDS
 from database.users import get_user as get_platform_user
+from database.payment_gateways import SUPPORTED_GATEWAYS, get_gateway_config
 
 
 logger = logging.getLogger(__name__)
@@ -803,7 +804,18 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             typ = "upgrade" if float(p.get("price", 0)) >= float(current.get("price", 0)) else "downgrade"
             rows.append([InlineKeyboardButton(f"Select {p.get('name')}", callback_data=f"seller_buy_{typ}_{p.get('plan_id')}")])
         rows.append([InlineKeyboardButton("⬅ Back", callback_data="main_home")])
-        await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+        markup = InlineKeyboardMarkup(rows)
+        text = "\n".join(lines)
+        # A seller payment screen may be a photo (QR code). Telegram cannot use
+        # edit_message_text on photo messages, so replace it with a normal text message.
+        if q.message and (q.message.photo or q.message.document):
+            try:
+                await q.message.delete()
+            except TelegramError:
+                pass
+            await context.bot.send_message(chat_id=q.message.chat_id, text=text, reply_markup=markup)
+        else:
+            await q.edit_message_text(text, reply_markup=markup)
         return
 
     if action.startswith("seller_buy_"):
@@ -824,11 +836,41 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"UPI ID: {cfg.get('payment_upi_id') or 'Not Set'}\n\n"
             "Pay and upload your payment screenshot."
         )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📤 Upload Payment Screenshot", callback_data=f"seller_manual_{request_type}_{plan_id}")],
-            [InlineKeyboardButton("⬅ Back", callback_data="seller_upgrade_plan")],
-        ])
-        if cfg.get("payment_qr_file_id"):
+        gateway_cfg = await get_gateway_config("owner", 0, decrypt=True)
+        gateways = gateway_cfg.get("gateways") or {}
+        enabled_gateways = [
+            gateway for gateway in SUPPORTED_GATEWAYS
+            if bool((gateways.get(gateway) or {}).get("enabled"))
+        ]
+        default_gateway = str(gateway_cfg.get("default_gateway") or "manual")
+        if default_gateway in enabled_gateways:
+            enabled_gateways.remove(default_gateway)
+            enabled_gateways.insert(0, default_gateway)
+
+        rows = [
+            [InlineKeyboardButton(
+                f"💳 Pay with {gateway.title()}",
+                callback_data=f"pgsp_{gateway}_{request_type}_{plan_id}",
+            )]
+            for gateway in enabled_gateways
+        ]
+        manual_enabled = bool(gateway_cfg.get("manual_enabled", True))
+        if manual_enabled:
+            rows.append([
+                InlineKeyboardButton(
+                    "📤 Upload Payment Screenshot",
+                    callback_data=f"seller_manual_{request_type}_{plan_id}",
+                )
+            ])
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data="seller_upgrade_plan")])
+        kb = InlineKeyboardMarkup(rows)
+
+        if not enabled_gateways and not manual_enabled:
+            text += "\n\n⚠️ No payment method is currently available. Please contact support."
+
+        # Show the UPI QR only while manual payment is enabled. With manual
+        # payment disabled, sellers should see automatic gateway buttons directly.
+        if cfg.get("payment_qr_file_id") and manual_enabled:
             await q.message.reply_photo(cfg["payment_qr_file_id"], caption=text, reply_markup=kb)
         else:
             await q.edit_message_text(text, reply_markup=kb)
