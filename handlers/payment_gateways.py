@@ -75,19 +75,8 @@ def _gateway_keyboard(scope: str, gateway: str, enabled: bool):
     rows = [
         [InlineKeyboardButton("⛔ Disable" if enabled else "✅ Enable", callback_data=f"pgcfg_{scope}_{gateway}_toggle")],
     ]
-    if gateway == "cashfree":
-        rows += [
-            [InlineKeyboardButton("🆔 Set App ID", callback_data=f"pgcfg_{scope}_{gateway}_field_client_id")],
-            [InlineKeyboardButton("🔐 Set Secret Key", callback_data=f"pgcfg_{scope}_{gateway}_field_client_secret")],
-        ]
-    else:
-        rows += [
-            [InlineKeyboardButton("🆔 Set Key ID", callback_data=f"pgcfg_{scope}_{gateway}_field_key_id")],
-            [InlineKeyboardButton("🔐 Set Key Secret", callback_data=f"pgcfg_{scope}_{gateway}_field_key_secret")],
-            [InlineKeyboardButton("🪝 Set Webhook Secret", callback_data=f"pgcfg_{scope}_{gateway}_field_webhook_secret")],
-        ]
     rows += [
-        [InlineKeyboardButton("📋 Enter All Credentials Together", callback_data=f"pgcfg_{scope}_{gateway}_credentials")],
+        [InlineKeyboardButton("🔐 Set / Replace Credentials", callback_data=f"pgcfg_{scope}_{gateway}_credentials")],
         [InlineKeyboardButton("✅ Test Connection", callback_data=f"pgcfg_{scope}_{gateway}_test")],
         [InlineKeyboardButton("⬅ Back", callback_data=f"pgcfg_{scope}_home")],
     ]
