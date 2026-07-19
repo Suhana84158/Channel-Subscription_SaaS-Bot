@@ -176,11 +176,14 @@ async def create_automatic_payment(owner_id,user_id,plan,gateway,transaction_id,
         "payment_method":gateway,"gateway_payment_id":str(gateway_payment_id or ""),
         "status":"approved","admin_id":0,"processed_at":now,"created_at":now,"updated_at":now,
     }
-    await c(PAYMENTS).update_one(
+    result=await c(PAYMENTS).update_one(
         {"owner_id":int(owner_id),"payment_id":str(transaction_id)},
         {"$setOnInsert":doc},upsert=True,
     )
-    return await c(PAYMENTS).find_one({"owner_id":int(owner_id),"payment_id":str(transaction_id)})
+    payment=await c(PAYMENTS).find_one({"owner_id":int(owner_id),"payment_id":str(transaction_id)})
+    if payment is not None:
+        payment["_created_now"] = result.upserted_id is not None
+    return payment
 async def get_payment(owner_id,payment_id): return await c(PAYMENTS).find_one({"owner_id":owner_id,"payment_id":payment_id})
 async def pending_payments(owner_id): return await c(PAYMENTS).find({"owner_id":owner_id,"status":"pending"}).sort("created_at",-1).to_list(length=50)
 async def payment_history(owner_id): return await c(PAYMENTS).find({"owner_id":owner_id,"status":{"$in":["approved","rejected"]}}).sort("updated_at",-1).to_list(length=50)

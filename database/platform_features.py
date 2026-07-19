@@ -109,11 +109,20 @@ async def release_payment_fingerprint(
 
 
 async def create_invoice(owner_id: int, user_id: int, payment: dict, seller_name: str = "Seller"):
+    payment_id = payment.get("payment_id")
+    if payment_id:
+        existing = await col(INVOICES).find_one({
+            "owner_id": int(owner_id),
+            "payment_id": payment_id,
+        })
+        if existing:
+            return existing
+
     invoice_no = f"INV-{datetime.now(timezone.utc):%Y%m%d}-{uuid4().hex[:8].upper()}"
     doc = {
         "owner_id": int(owner_id), "user_id": int(user_id), "invoice_no": invoice_no,
         "seller_name": seller_name, "plan": payment.get("plan", "Plan"),
-        "amount": float(payment.get("amount", 0) or 0), "payment_id": payment.get("payment_id"),
+        "amount": float(payment.get("amount", 0) or 0), "payment_id": payment_id,
         "created_at": datetime.now(timezone.utc),
     }
     await col(INVOICES).insert_one(doc)
