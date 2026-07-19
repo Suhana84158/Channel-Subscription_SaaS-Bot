@@ -237,6 +237,7 @@ async def claim_transaction_fulfillment(
     return await _transactions().find_one_and_update(
         {
             "transaction_id": transaction_id,
+            "fulfilled_at": {"$exists": False},
             "$or": [
                 {"status": {"$in": ["paid", "paid_unfulfilled"]}},
                 {
@@ -328,11 +329,12 @@ async def recoverable_gateway_transactions(limit: int = 100) -> list[dict]:
     """Return paid transactions that can safely be fulfilled or retried."""
     now = datetime.now(timezone.utc)
     query = {
+        "fulfilled_at": {"$exists": False},
         "$or": [
             {"status": {"$in": ["paid", "paid_unfulfilled"]}},
             {"status": "fulfilling", "fulfillment_lease_until": {"$lte": now}},
             {"status": "verification_pending", "updated_at": {"$lte": now - timedelta(minutes=2)}},
-        ]
+        ],
     }
     return await _transactions().find(query).sort("updated_at", 1).limit(max(1, min(int(limit), 500))).to_list(length=max(1, min(int(limit), 500)))
 
