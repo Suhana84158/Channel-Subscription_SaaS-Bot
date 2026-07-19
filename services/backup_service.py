@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import io
 import json
 from datetime import datetime, timezone
 from typing import Any
 
-from pymongo import ReplaceOne
+from pymongo import ReturnDocument, UpdateOne
 
 BACKUP_FORMAT = "telegram-saas-backup"
 BACKUP_VERSION = 1
 MAX_BACKUP_BYTES = 20 * 1024 * 1024
+MAX_DECOMPRESSED_BYTES = 100 * 1024 * 1024
 MAX_RECORDS = 50_000
+RESTORE_LOCK_ID = "global_backup_restore"
+RESTORE_LOCK_SECONDS = 30 * 60
 
 ALLOWED_COLLECTIONS = (
     "sellers",
@@ -104,13 +108,34 @@ async def create_backup(db) -> tuple[bytes, dict[str, Any]]:
     return compressed, envelope["manifest"]
 
 
+def _safe_decompress(raw: bytes) -> bytes:
+    """Decompress gzip data with a hard output limit to block gzip bombs."""
+    if raw[:2] != b"\x1f\x8b":
+        if len(raw) > MAX_DECOMPRESSED_BYTES:
+            raise ValueError("Backup JSON exceeds the decompressed safety limit")
+        return raw
+
+    output = io.BytesIO()
+    total = 0
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(raw), mode="rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_DECOMPRESSED_BYTES:
+                    raise ValueError("Decompressed backup exceeds the 100 MB safety limit")
+                output.write(chunk)
+    except (OSError, EOFError) as exc:
+        raise ValueError("Invalid gzip backup") from exc
+    return output.getvalue()
+
+
 def parse_backup(raw: bytes) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
     if len(raw) > MAX_BACKUP_BYTES:
         raise ValueError("Backup file exceeds the 20 MB safety limit")
-    try:
-        decoded = gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw
-    except OSError as exc:
-        raise ValueError("Invalid gzip backup") from exc
+    decoded = _safe_decompress(raw)
     try:
         envelope = json.loads(decoded.decode("utf-8"), object_hook=_object_hook)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -168,20 +193,84 @@ def _identity_filter(collection: str, document: dict[str, Any]) -> dict[str, Any
     return None
 
 
-async def restore_backup(db, raw: bytes) -> dict[str, int]:
+async def _claim_restore_lock(db, actor_id: int) -> str | None:
+    """Allow only one restore at a time across all bot processes."""
+    from datetime import timedelta
+    from uuid import uuid4
+
+    now = datetime.now(timezone.utc)
+    token = uuid4().hex
+    await db["backup_restore_locks"].create_index("expires_at", expireAfterSeconds=0)
+    claimed = await db["backup_restore_locks"].find_one_and_update(
+        {
+            "_id": RESTORE_LOCK_ID,
+            "$or": [
+                {"expires_at": {"$lte": now}},
+                {"expires_at": {"$exists": False}},
+            ],
+        },
+        {
+            "$set": {
+                "token": token,
+                "actor_id": int(actor_id),
+                "claimed_at": now,
+                "expires_at": now + timedelta(seconds=RESTORE_LOCK_SECONDS),
+            }
+        },
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return token if claimed and claimed.get("token") == token else None
+
+
+async def _release_restore_lock(db, token: str) -> None:
+    await db["backup_restore_locks"].delete_one(
+        {"_id": RESTORE_LOCK_ID, "token": token}
+    )
+
+
+async def restore_backup(db, raw: bytes, *, actor_id: int = 0) -> dict[str, int]:
     collections, manifest = parse_backup(raw)
-    result = {"records": int(manifest["records"]), "restored": 0, "skipped": 0}
-    # Validation above completes before the first database write. Restore is
-    # non-destructive and idempotent: it never deletes current records.
-    for name, records in collections.items():
-        operations = []
-        for document in records:
-            identity = _identity_filter(name, document)
-            if identity is None:
-                result["skipped"] += 1
-                continue
-            operations.append(ReplaceOne(identity, document, upsert=True))
-        if operations:
-            write = await db[name].bulk_write(operations, ordered=False)
-            result["restored"] += write.matched_count + write.upserted_count
-    return result
+    token = await _claim_restore_lock(db, actor_id)
+    if not token:
+        raise ValueError("Another backup restore is already running")
+
+    result = {
+        "records": int(manifest["records"]),
+        "inserted": 0,
+        "existing": 0,
+        "skipped": 0,
+    }
+    try:
+        # Restore is intentionally non-destructive. Existing records are left
+        # untouched; only records missing from the live database are inserted.
+        # This prevents an old backup from silently overwriting newer payments,
+        # subscriptions, tokens, or seller settings.
+        for name, records in collections.items():
+            operations = []
+            seen: set[str] = set()
+            for document in records:
+                identity = _identity_filter(name, document)
+                if identity is None:
+                    result["skipped"] += 1
+                    continue
+
+                identity_key = json.dumps(
+                    identity, default=_json_default, sort_keys=True, separators=(",", ":")
+                )
+                if identity_key in seen:
+                    result["skipped"] += 1
+                    continue
+                seen.add(identity_key)
+                operations.append(
+                    UpdateOne(identity, {"$setOnInsert": document}, upsert=True)
+                )
+
+            if operations:
+                write = await db[name].bulk_write(operations, ordered=False)
+                inserted = int(write.upserted_count or 0)
+                result["inserted"] += inserted
+                result["existing"] += len(operations) - inserted
+        return result
+    finally:
+        await _release_restore_lock(db, token)
