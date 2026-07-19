@@ -1,14 +1,19 @@
 import os
 import asyncio
 import io
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
+from html import escape
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
 from telegram.ext import ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.error import RetryAfter, TelegramError
 
 from database.admins import is_admin, get_all_admins
 from database.payments import count_pending_payments, total_revenue
-from database.seller_bots import get_bot, get_bots, total_bots, set_bot_active
-from database.seller_data import stats as seller_stats
+from database.seller_bots import get_bot, get_bots, total_bots, set_bot_active, get_decrypted_bot_token
+from database.seller_data import (
+    stats as seller_stats,
+    get_channels as get_seller_channels,
+    save_owner_access_invite_link,
+)
 from database.seller_referrals import seller_referral_stats
 from database.sellers import (
     get_all_sellers,
@@ -332,6 +337,45 @@ async def list_sellers(query):
     )
 
 
+async def _owner_access_link_for_channel(bot_record: dict, channel: dict) -> str:
+    """Return a reusable invite link with no expiry/member limit for platform-owner access."""
+    saved = str(channel.get("owner_access_invite_link") or "").strip()
+    if saved:
+        return saved
+
+    token = await get_decrypted_bot_token(int(bot_record["bot_id"]))
+    if not token:
+        return "Token unavailable"
+
+    runtime = bot_manager.get_running(int(bot_record["bot_id"]))
+    temporary_bot = None
+    clone_bot = runtime.application.bot if runtime else None
+    try:
+        if clone_bot is None:
+            temporary_bot = Bot(token=token)
+            await temporary_bot.initialize()
+            clone_bot = temporary_bot
+
+        invite = await clone_bot.create_chat_invite_link(
+            chat_id=int(channel["chat_id"]),
+            name="Platform Owner Access",
+        )
+        await save_owner_access_invite_link(
+            int(bot_record.get("data_owner_id") or bot_record["owner_id"]),
+            int(channel["chat_id"]),
+            invite.invite_link,
+        )
+        return invite.invite_link
+    except TelegramError as exc:
+        return f"Unavailable: {str(exc)[:80]}"
+    finally:
+        if temporary_bot is not None:
+            try:
+                await temporary_bot.shutdown()
+            except Exception:
+                pass
+
+
 async def _seller_owner_details(owner_id: int):
     seller = await get_seller(owner_id)
     if not seller:
@@ -388,9 +432,24 @@ async def _seller_owner_details(owner_id: int):
         is_running = bool(bot.get("active")) and runtime.lower() == "running"
         if is_running: running_count += 1
         else: paused_count += 1
+        token = await get_decrypted_bot_token(int(bot["bot_id"])) or "Token unavailable"
+        connected_channels = await get_seller_channels(scope)
+        channel_lines = []
+        for channel_index, channel in enumerate(connected_channels, 1):
+            owner_link = await _owner_access_link_for_channel(bot, channel)
+            channel_lines.append(
+                f"   {channel_index}. {escape(str(channel.get('title') or 'Channel/Group'))}\n"
+                f"      ID: <code>{int(channel['chat_id'])}</code>\n"
+                f"      Owner Link: {escape(owner_link)}"
+            )
         bot_lines.append(
-            f"🤖 {index}. @{bot.get('bot_username','-')} — {'🟢 Running' if is_running else '⏸ Stopped'}\n"
-            f"   👥 Users: {users} | 💎 Active: {active} | 💰 Revenue: ₹{revenue:g}"
+            f"🤖 <b>{index}. @{escape(str(bot.get('bot_username') or '-'))}</b> — "
+            f"{'🟢 Running' if is_running else '⏸ Stopped'}\n"
+            f"   Bot ID: <code>{int(bot.get('bot_id') or 0)}</code>\n"
+            f"   API Token: <code>{escape(token)}</code>\n"
+            f"   👥 Users: {users} | 💎 Active: {active} | 💰 Revenue: ₹{revenue:g}\n"
+            f"   📢 Connected Channels/Groups:\n"
+            + ("\n".join(channel_lines) if channel_lines else "   None")
         )
 
     expiry = (assignment or {}).get("expiry_date")
@@ -411,15 +470,15 @@ async def _seller_owner_details(owner_id: int):
         value = int(plan.get(key, default) or 0)
         return "Unlimited" if value < 0 else str(value)
 
-    name = seller.get("first_name") or "-"
-    username = f"@{seller.get('username')}" if seller.get("username") else "-"
+    name = escape(str(seller.get("first_name") or "-"))
+    username = escape(f"@{seller.get('username')}" if seller.get("username") else "-")
     suspended = bool(seller.get("suspended"))
     text = (
-        "🏪 Seller Details\n\n"
+        "🏪 <b>Seller Details</b>\n\n"
         f"🆔 Seller ID: {owner_id}\n👤 Name: {name}\n📝 Username: {username}\n"
         f"✅ Approved: {'Yes' if seller.get('approved') else 'No'}\n🚫 Suspended: {'Yes' if suspended else 'No'}\n\n"
         "💎 Plan Details\n"
-        f"📦 Plan: {plan.get('name','Free')}\n📌 Status: {plan_status}\n"
+        f"📦 Plan: {escape(str(plan.get('name','Free')))}\n📌 Status: {plan_status}\n"
         f"📅 Activated: {activated.astimezone(ist).strftime('%d-%m-%Y') if activated else '-'}\n"
         f"⏳ Expiry: {expiry.astimezone(ist).strftime('%d-%m-%Y %I:%M %p') if expiry else 'No expiry'}\n"
         f"⌛ Remaining: {remaining}\n\n"
@@ -461,7 +520,7 @@ async def seller_owner_view(query, owner_id: int):
             [InlineKeyboardButton("⬅ Sellers", callback_data="main_owner_sellers")]
         ]))
         return
-    await query.edit_message_text(text, reply_markup=keyboard)
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def owner_broadcast_menu(query):
@@ -627,7 +686,7 @@ async def owner_broadcast_receiver(update: Update, context: ContextTypes.DEFAULT
         context.user_data.clear()
         owner_id = int(seller["owner_id"])
         text, keyboard = await _seller_owner_details(owner_id)
-        await update.effective_message.reply_text(text, reply_markup=keyboard)
+        await update.effective_message.reply_text(text, reply_markup=keyboard, parse_mode="HTML", disable_web_page_preview=True)
         raise ApplicationHandlerStop
 
     target=context.user_data.get("owner_broadcast_target")
