@@ -19,12 +19,6 @@ from database.payments import (
 )
 from services.subscription_service import fulfill_payment_subscription
 from services.channel_service import grant_channel_access
-from config import REFERRAL_BONUS_DAYS
-from database.referrals import (
-    claim_referral_reward,
-    complete_referral_reward,
-    fail_referral_reward,
-)
 
 
 def format_ist(dt):
@@ -41,39 +35,6 @@ async def safe_edit(query, text: str, reply_markup=None):
             await query.edit_message_text(text, reply_markup=reply_markup)
         except Exception:
             pass
-
-
-async def reward_referrer_once(*, referred_id: int, payment_id: str, context):
-    reward_days = max(0, int(REFERRAL_BONUS_DAYS))
-    if reward_days <= 0:
-        return None
-
-    referral = await claim_referral_reward(referred_id, payment_id)
-    if not referral:
-        return None
-
-    referrer_id = int(referral["referrer_id"])
-    try:
-        reward = await fulfill_payment_subscription(
-            user_id=referrer_id,
-            fulfillment_key=f"referral:{referred_id}",
-            plan_name="Referral Reward",
-            plan_days=reward_days,
-        )
-        await complete_referral_reward(referred_id, payment_id, reward_days)
-        try:
-            await context.bot.send_message(
-                referrer_id,
-                "🎉 Referral Reward Added!\n\n"
-                f"Reward: {reward_days} free day(s).\n"
-                f"New expiry: {format_ist(reward['expiry'])}",
-            )
-        except Exception:
-            pass
-        return reward
-    except Exception as exc:
-        await fail_referral_reward(referred_id, payment_id, str(exc))
-        raise
 
 
 async def fulfill_approved_payment(
@@ -163,12 +124,6 @@ async def fulfill_approved_payment(
             raise RuntimeError(
                 "Payment fulfillment completion could not be saved."
             )
-
-        await reward_referrer_once(
-            referred_id=user_id,
-            payment_id=payment_id,
-            context=context,
-        )
 
         return {
             "completed": True,
