@@ -1,52 +1,31 @@
+import logging
+
 from telegram import Update
-from telegram.ext import (
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import CommandHandler, ContextTypes
 
 from database.admins import is_admin
-from database.users import total_users
-from database.channels import total_channels
-from database.payments import total_revenue
-from database.subscriptions import subscriptions_collection
+from services.statistics_service import build_platform_statistics_text
+
+logger = logging.getLogger(__name__)
 
 
-async def statistics(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not await is_admin(update.effective_user.id):
-        await update.message.reply_text(
-            "❌ You are not authorized."
-        )
+async def statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
         return
 
-    users = await total_users()
-    channels = await total_channels()
-    revenue = await total_revenue()
+    if not await is_admin(user.id):
+        await message.reply_text("❌ You are not authorized.")
+        return
 
-    active_subscriptions = (
-        await subscriptions_collection().count_documents(
-            {"active": True}
-        )
-    )
-
-    text = (
-        "📊 *Bot Statistics*\n\n"
-        f"👥 Total Users: *{users}*\n"
-        f"💎 Active Subscriptions: *{active_subscriptions}*\n"
-        f"📢 Total Channels: *{channels}*\n"
-        f"💰 Total Revenue: *₹{revenue}*"
-    )
-
-    await update.message.reply_text(
-        text=text,
-        parse_mode="Markdown",
-    )
+    try:
+        text = await build_platform_statistics_text()
+        await message.reply_text(text=text, parse_mode="Markdown")
+    except Exception:
+        logger.exception("Failed to build platform statistics")
+        await message.reply_text("❌ Statistics load nahi ho payi. Please try again.")
 
 
 def statistics_handler():
-    return CommandHandler(
-        "stats",
-        statistics,
-    )
+    return CommandHandler("stats", statistics)
