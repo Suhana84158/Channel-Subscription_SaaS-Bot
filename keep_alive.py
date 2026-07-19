@@ -185,6 +185,101 @@ def payment_return(transaction_id):
     )
 
 
+@app.route("/checkout/razorpay/<transaction_id>")
+def razorpay_checkout(transaction_id):
+    from database.payment_gateways import get_gateway_transaction
+
+    tx = _run(get_gateway_transaction(transaction_id))
+    if (
+        not tx
+        or tx.get("gateway") != "razorpay"
+        or not tx.get("gateway_order_id")
+        or not tx.get("razorpay_key_id")
+    ):
+        return "Invalid or expired Razorpay order", 404
+
+    options = {
+        "key": tx["razorpay_key_id"],
+        "amount": int(round(float(tx.get("amount", 0)) * 100)),
+        "currency": str(tx.get("currency") or "INR").upper(),
+        "name": "Subscription Payment",
+        "description": (tx.get("metadata") or {}).get("description", tx.get("purpose", "Subscription")),
+        "order_id": tx["gateway_order_id"],
+        "notes": {"transaction_id": transaction_id},
+    }
+    options_json = json.dumps(options).replace("</", "<\\/")
+    transaction_json = json.dumps(transaction_id)
+
+    return f"""
+<!doctype html>
+<html>
+<head>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<script src='https://checkout.razorpay.com/v1/checkout.js'></script>
+</head>
+<body style='font-family:sans-serif;text-align:center;padding:30px'>
+<h2>Razorpay Secure Checkout</h2>
+<p>Transaction: {transaction_id}</p>
+<button id='pay' style='padding:14px 24px;font-size:18px'>Pay Now</button>
+<p id='status'></p>
+<script>
+const options = {options_json};
+options.handler = async function (response) {{
+  const status = document.getElementById('status');
+  status.textContent = 'Verifying payment securely...';
+  try {{
+    const result = await fetch('/payment/razorpay/complete/' + encodeURIComponent({transaction_json}), {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify(response)
+    }});
+    const data = await result.json();
+    if (!result.ok || !data.ok) throw new Error(data.message || 'Verification failed');
+    status.textContent = 'Payment verified. You may return to Telegram.';
+    window.location.href = '/payment/return/' + encodeURIComponent({transaction_json});
+  }} catch (error) {{
+    status.textContent = 'Payment verification failed: ' + error.message;
+  }}
+}};
+options.modal = {{ondismiss: function () {{
+  document.getElementById('status').textContent = 'Payment window closed.';
+}}}};
+const checkout = new Razorpay(options);
+document.getElementById('pay').onclick = function (event) {{
+  event.preventDefault();
+  checkout.open();
+}};
+checkout.open();
+</script>
+</body>
+</html>"""
+
+
+@app.route("/payment/razorpay/complete/<transaction_id>", methods=["POST"])
+def razorpay_complete(transaction_id):
+    from services.payment_gateways import verify_razorpay_checkout
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        ok, message = _run(
+            verify_razorpay_checkout(
+                transaction_id,
+                str(payload.get("razorpay_payment_id") or ""),
+                str(payload.get("razorpay_order_id") or ""),
+                str(payload.get("razorpay_signature") or ""),
+            ),
+            timeout=45,
+        )
+        if ok:
+            try:
+                _run(_notify_success(transaction_id), timeout=30)
+            except Exception:
+                pass
+        return jsonify({"ok": bool(ok), "message": message}), (200 if ok else 400)
+    except Exception as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 500
+
+
 @app.route("/checkout/cashfree/<transaction_id>")
 def cashfree_checkout(transaction_id):
     from database.payment_gateways import get_gateway_transaction
