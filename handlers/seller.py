@@ -33,7 +33,6 @@ from database.seller_referrals import seller_referral_stats
 from database.platform_features import get_policy
 from database.mongo import get_database
 from database.sellers import get_or_create_seller
-from database.subscription_guard import get_active_invite, save_invite
 from utils.timezone_ui import timezone_guide, timezone_keyboard, timezone_from_key, normalize_timezone
 
 
@@ -511,19 +510,12 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for channel in channels:
                     chat_id = int(channel["chat_id"])
                     try:
-                        invite_doc = await get_active_invite(owner_id, uid, chat_id)
-                        invite_link = (invite_doc or {}).get("invite_link")
-
-                        if not invite_link:
-                            invite = await running.application.bot.create_chat_invite_link(
-                                chat_id,
-                                member_limit=1,
-                            )
-                            invite_link = invite.invite_link
-                            await save_invite(owner_id, uid, chat_id, invite_link)
-
+                        invite = await running.application.bot.create_chat_invite_link(
+                            chat_id,
+                            member_limit=1,
+                        )
                         links.append(
-                            f"{channel.get('title', 'Channel/Group')}: {invite_link}"
+                            f"{channel.get('title', 'Channel/Group')}: {invite.invite_link}"
                         )
                     except TelegramError as exc:
                         logger.warning(
@@ -716,6 +708,8 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Username: @{record.get('bot_username')}\n"
                     f"Status: {'Active' if record.get('active') else 'Paused'}\n"
                     f"Runtime: {record.get('runtime_status','unknown')}\n"
+                    f"Recovery failures: {int(record.get('consecutive_recovery_failures', 0))}\n"
+                    f"Next retry: {record.get('next_recovery_at') or '-'}\n"
                     f"Error: {record.get('runtime_error') or '-'}",
                     reply_markup=selected_bot_markup(record),
                 )
