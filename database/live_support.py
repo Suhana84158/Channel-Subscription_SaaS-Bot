@@ -27,6 +27,7 @@ async def initialize_live_support_indexes():
     await c(MESSAGE_LINKS).create_index("created_at", expireAfterSeconds=60 * 60 * 24 * 180)
     await c(BLOCKS).create_index([("owner_id", 1), ("user_id", 1)], unique=True)
     await c(TEMPLATES).create_index([("owner_id", 1), ("command", 1)], unique=True)
+    await initialize_live_support_delivery_indexes()
 
 
 async def get_live_support_settings(owner_id: int):
@@ -271,4 +272,87 @@ async def delete_support_template(owner_id: int, command: str):
     command = str(command or "").strip().lower().lstrip("/")
     return await c(TEMPLATES).delete_one(
         {"owner_id": int(owner_id), "command": command}
+    )
+
+# Delivery receipts make forwarding idempotent across retries and restarts.
+DELIVERIES = "clone_live_support_deliveries"
+
+
+async def initialize_live_support_delivery_indexes():
+    await c(DELIVERIES).create_index(
+        [("owner_id", 1), ("direction", 1), ("source_chat_id", 1), ("source_message_id", 1)],
+        unique=True,
+    )
+    await c(DELIVERIES).create_index("updated_at", expireAfterSeconds=60 * 60 * 24 * 180)
+
+
+async def claim_support_delivery(
+    owner_id: int,
+    direction: str,
+    source_chat_id: int,
+    source_message_id: int,
+    *,
+    stale_seconds: int = 300,
+):
+    """Claim one support message exactly once, recovering stale attempts."""
+    from datetime import timedelta
+    from pymongo import ReturnDocument
+
+    now = datetime.now(timezone.utc)
+    stale_before = now - timedelta(seconds=max(60, int(stale_seconds)))
+    key = {
+        "owner_id": int(owner_id),
+        "direction": str(direction),
+        "source_chat_id": int(source_chat_id),
+        "source_message_id": int(source_message_id),
+    }
+
+    existing = await c(DELIVERIES).find_one(key)
+    if existing and existing.get("status") == "completed":
+        return None
+
+    return await c(DELIVERIES).find_one_and_update(
+        {
+            **key,
+            "$or": [
+                {"status": {"$in": ["pending", "failed"]}},
+                {"status": "processing", "claimed_at": {"$lt": stale_before}},
+                {"status": {"$exists": False}},
+            ],
+        },
+        {
+            "$set": {
+                "status": "processing",
+                "claimed_at": now,
+                "updated_at": now,
+            },
+            "$setOnInsert": {"created_at": now},
+            "$inc": {"attempts": 1},
+        },
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+async def complete_support_delivery(receipt_id, **details):
+    now = datetime.now(timezone.utc)
+    clean = {k: v for k, v in details.items() if v is not None}
+    clean.update({"status": "completed", "completed_at": now, "updated_at": now})
+    await c(DELIVERIES).update_one(
+        {"_id": receipt_id, "status": "processing"},
+        {"$set": clean, "$unset": {"claimed_at": "", "last_error": ""}},
+    )
+
+
+async def fail_support_delivery(receipt_id, error: str):
+    await c(DELIVERIES).update_one(
+        {"_id": receipt_id, "status": "processing"},
+        {
+            "$set": {
+                "status": "failed",
+                "last_error": str(error)[:500],
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$unset": {"claimed_at": ""},
+        },
     )
