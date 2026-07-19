@@ -17,8 +17,6 @@ from database.payment_gateways import (
     get_gateway_config,
     get_gateway_transaction,
     get_transaction_by_gateway_order,
-    gateway_is_ready,
-    gateway_missing_fields,
     mark_transaction_failed,
     mark_transaction_fulfilled,
     mark_transaction_fulfillment_retry,
@@ -80,6 +78,64 @@ def _cashfree_headers(settings: dict, *, idempotency_key: str | None = None) -> 
     return headers
 
 
+def _amount_matches(left: Any, right: Any, tolerance: float = 0.01) -> bool:
+    try:
+        return abs(float(left) - float(right)) <= tolerance
+    except (TypeError, ValueError):
+        return False
+
+
+async def _verify_cashfree_payment(
+    transaction: dict,
+    settings: dict,
+) -> tuple[str, dict]:
+    """Re-query Cashfree before fulfillment and verify the paid order details."""
+    order_id = str(transaction["transaction_id"])
+    base = _cashfree_base(settings.get("mode", "test"))
+    headers = _cashfree_headers(settings)
+
+    order = await _request(
+        "GET",
+        f"{base}/orders/{order_id}",
+        headers=headers,
+    )
+    if str(order.get("order_status", "")).upper() != "PAID":
+        raise GatewayError("Cashfree order is not PAID")
+    if str(order.get("order_currency", "")).upper() != str(
+        transaction.get("currency", "INR")
+    ).upper():
+        raise GatewayError("Cashfree currency mismatch")
+    if not _amount_matches(order.get("order_amount"), transaction.get("amount")):
+        raise GatewayError("Cashfree amount mismatch")
+
+    payments = await _request(
+        "GET",
+        f"{base}/orders/{order_id}/payments",
+        headers=headers,
+    )
+    if not isinstance(payments, list):
+        raise GatewayError("Cashfree payment verification response is invalid")
+
+    successful = next(
+        (
+            item
+            for item in reversed(payments)
+            if str(item.get("payment_status", "")).upper() == "SUCCESS"
+            and str(item.get("payment_currency", transaction.get("currency", "INR"))).upper()
+            == str(transaction.get("currency", "INR")).upper()
+            and _amount_matches(item.get("payment_amount"), transaction.get("amount"))
+        ),
+        None,
+    )
+    if not successful:
+        raise GatewayError("No matching successful Cashfree payment found")
+
+    payment_id = str(successful.get("cf_payment_id") or "")
+    if not payment_id:
+        raise GatewayError("Cashfree payment ID is missing")
+    return payment_id, {"order": order, "payment": successful}
+
+
 async def test_gateway_connection(scope: str, owner_id: int, gateway: str) -> dict:
     """Validate stored credentials without creating or charging a payment."""
     cfg = await get_gateway_config(scope, owner_id, decrypt=True)
@@ -117,9 +173,6 @@ async def create_checkout(transaction: dict) -> dict:
     settings = (cfg.get("gateways") or {}).get(gateway) or {}
     if not settings.get("enabled"):
         raise GatewayError(f"{gateway.title()} is disabled")
-    if not gateway_is_ready(gateway, settings):
-        missing = ", ".join(gateway_missing_fields(gateway, settings))
-        raise GatewayError(f"{gateway.title()} credentials are incomplete: {missing}")
     if gateway == "razorpay":
         result = await _create_razorpay(transaction, settings)
     elif gateway == "cashfree":
@@ -134,71 +187,53 @@ async def create_checkout(transaction: dict) -> dict:
     return result
 
 
-def _razorpay_headers(key_id: str, key_secret: str) -> dict[str, str]:
-    auth = base64.b64encode(f"{key_id}:{key_secret}".encode("utf-8")).decode("ascii")
-    return {
-        "Authorization": f"Basic {auth}",
-        "Content-Type": "application/json",
-    }
-
-
 async def _create_razorpay(tx: dict, s: dict) -> dict:
-    """Create a Razorpay Order and return our hosted Standard Checkout URL."""
     key_id, key_secret = s.get("key_id"), s.get("key_secret")
     if not key_id or not key_secret:
         raise GatewayError("Razorpay credentials are incomplete")
-
-    amount_subunits = int(round(float(tx["amount"]) * 100))
-    if amount_subunits < 100:
-        raise GatewayError("Razorpay amount must be at least ₹1")
-
+    auth = base64.b64encode(f"{key_id}:{key_secret}".encode()).decode()
     payload = {
-        "amount": amount_subunits,
-        "currency": str(tx.get("currency") or "INR").upper(),
-        "receipt": tx["transaction_id"][:40],
-        "notes": {
-            "transaction_id": tx["transaction_id"],
-            "scope": tx["scope"],
-            "owner_id": str(tx["owner_id"]),
-            "purpose": tx["purpose"],
-        },
+        "amount": int(round(tx["amount"] * 100)),
+        "currency": tx["currency"],
+        "reference_id": tx["transaction_id"],
+        "description": tx["metadata"].get("description", tx["purpose"]),
+        "callback_url": f"{_base_url()}/payment/return/{tx['transaction_id']}",
+        "callback_method": "get",
+        "notes": {"transaction_id": tx["transaction_id"], "scope": tx["scope"], "owner_id": str(tx["owner_id"])},
     }
-    data = await _request(
-        "POST",
-        "https://api.razorpay.com/v1/orders",
-        headers=_razorpay_headers(str(key_id), str(key_secret)),
-        json=payload,
-    )
-    order_id = str(data.get("id") or "")
-    if not order_id:
-        raise GatewayError(f"Razorpay order ID missing: {data}")
-
-    return {
-        "gateway_order_id": order_id,
-        "checkout_url": f"{_base_url()}/checkout/razorpay/{tx['transaction_id']}",
-        "gateway_response": data,
-        "razorpay_key_id": str(key_id),
-        "status": "pending",
-    }
+    data = await _request("POST", "https://api.razorpay.com/v1/payment_links", headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"}, json=payload)
+    return {"gateway_order_id": data.get("id", ""), "checkout_url": data.get("short_url", ""), "gateway_response": data, "status": "pending"}
 
 
 async def _create_cashfree(tx: dict, s: dict) -> dict:
     mode = s.get("mode", "test")
     base = _cashfree_base(mode)
+    amount = round(float(tx["amount"]), 2)
+    if amount <= 0:
+        raise GatewayError("Cashfree amount must be greater than zero")
+
+    metadata = tx.get("metadata") or {}
+    raw_phone = "".join(ch for ch in str(metadata.get("phone", "")) if ch.isdigit())
+    phone = raw_phone[-10:] if len(raw_phone) >= 10 else "9999999999"
+    email = str(
+        metadata.get("email")
+        or f"telegram{tx['payer_user_id']}@example.com"
+    ).strip()
+
     payload = {
         "order_id": tx["transaction_id"],
-        "order_amount": tx["amount"],
-        "order_currency": tx["currency"],
+        "order_amount": amount,
+        "order_currency": str(tx["currency"]).upper(),
         "customer_details": {
             "customer_id": str(tx["payer_user_id"]),
-            "customer_phone": tx["metadata"].get("phone", "9999999999"),
-            "customer_email": tx["metadata"].get("email", f"telegram{tx['payer_user_id']}@example.com"),
+            "customer_phone": phone,
+            "customer_email": email,
         },
         "order_meta": {
             "return_url": f"{_base_url()}/payment/return/{tx['transaction_id']}",
             "notify_url": f"{_base_url()}/webhooks/cashfree/{tx['scope']}/{tx['owner_id']}",
         },
-        "order_note": tx["metadata"].get("description", tx["purpose"]),
+        "order_note": metadata.get("description", tx["purpose"]),
     }
     data = await _request(
         "POST",
@@ -206,8 +241,20 @@ async def _create_cashfree(tx: dict, s: dict) -> dict:
         headers=_cashfree_headers(s, idempotency_key=tx["transaction_id"]),
         json=payload,
     )
+    session_id = str(data.get("payment_session_id") or "")
+    if not session_id:
+        raise GatewayError("Cashfree payment session was not returned")
+
     checkout = f"{_base_url()}/checkout/cashfree/{tx['transaction_id']}"
-    return {"gateway_order_id": data.get("cf_order_id", tx["transaction_id"]), "payment_session_id": data.get("payment_session_id", ""), "checkout_url": checkout, "gateway_response": data, "gateway_mode": s.get("mode", "test"), "status": "pending"}
+    return {
+        "gateway_order_id": tx["transaction_id"],
+        "cashfree_cf_order_id": str(data.get("cf_order_id") or ""),
+        "payment_session_id": session_id,
+        "checkout_url": checkout,
+        "gateway_response": data,
+        "gateway_mode": mode,
+        "status": "pending",
+    }
 
 
 async def _phonepe_token(s: dict) -> str:
@@ -258,92 +305,6 @@ async def _create_paytm(tx: dict, s: dict) -> dict:
     return {"gateway_order_id": tx["transaction_id"], "txn_token": txn_token, "checkout_url": f"{_base_url()}/checkout/paytm/{tx['transaction_id']}", "gateway_response": data, "status": "pending", "paytm_host": host, "paytm_mid": mid}
 
 
-async def _complete_successful_transaction(
-    tx: dict,
-    payment_id: str,
-    raw_event: dict,
-) -> tuple[bool, str]:
-    if tx.get("status") == "fulfilled":
-        return True, "already processed"
-
-    await claim_transaction_success(
-        tx["transaction_id"],
-        str(payment_id),
-        raw_event,
-    )
-    work = await claim_transaction_fulfillment(tx["transaction_id"])
-    if not work:
-        current = await get_gateway_transaction(tx["transaction_id"])
-        if current and current.get("status") == "fulfilled":
-            return True, "already processed"
-        return True, "already processing"
-
-    try:
-        await fulfill_transaction(work)
-    except Exception as exc:
-        await mark_transaction_fulfillment_retry(
-            tx["transaction_id"],
-            str(exc),
-        )
-        raise
-    return True, "processed"
-
-
-async def verify_razorpay_checkout(
-    transaction_id: str,
-    razorpay_payment_id: str,
-    razorpay_order_id: str,
-    razorpay_signature: str,
-) -> tuple[bool, str]:
-    """Verify Standard Checkout response and fulfil only a captured payment."""
-    tx = await get_gateway_transaction(str(transaction_id))
-    if not tx or tx.get("gateway") != "razorpay":
-        return False, "unknown transaction"
-    if tx.get("status") == "fulfilled":
-        return True, "already processed"
-    if not razorpay_payment_id or not razorpay_order_id or not razorpay_signature:
-        return False, "missing Razorpay payment details"
-    if str(tx.get("gateway_order_id") or "") != str(razorpay_order_id):
-        return False, "order mismatch"
-
-    cfg = await get_gateway_config(tx["scope"], tx["owner_id"], decrypt=True)
-    settings = (cfg.get("gateways") or {}).get("razorpay") or {}
-    key_id = str(settings.get("key_id") or "")
-    key_secret = str(settings.get("key_secret") or "")
-    if not key_id or not key_secret:
-        return False, "Razorpay credentials unavailable"
-
-    signed = f"{razorpay_order_id}|{razorpay_payment_id}".encode("utf-8")
-    expected = hmac.new(
-        key_secret.encode("utf-8"),
-        signed,
-        hashlib.sha256,
-    ).hexdigest()
-    if not hmac.compare_digest(expected, str(razorpay_signature)):
-        return False, "invalid payment signature"
-
-    payment = await _request(
-        "GET",
-        f"https://api.razorpay.com/v1/payments/{razorpay_payment_id}",
-        headers=_razorpay_headers(key_id, key_secret),
-    )
-    if str(payment.get("order_id") or "") != str(razorpay_order_id):
-        return False, "payment order mismatch"
-    expected_amount = int(round(float(tx.get("amount", 0)) * 100))
-    if int(payment.get("amount") or 0) != expected_amount:
-        return False, "payment amount mismatch"
-    if str(payment.get("currency") or "").upper() != str(tx.get("currency") or "INR").upper():
-        return False, "payment currency mismatch"
-    if payment.get("status") != "captured":
-        return False, f"payment is not captured ({payment.get('status', 'unknown')})"
-
-    return await _complete_successful_transaction(
-        tx,
-        str(razorpay_payment_id),
-        payment,
-    )
-
-
 async def verify_and_process_webhook(gateway: str, scope: str, owner_id: int, headers: dict[str, str], raw_body: bytes, payload: dict) -> tuple[bool, str]:
     cfg = await get_gateway_config(scope, owner_id, decrypt=True)
     s = (cfg.get("gateways") or {}).get(gateway) or {}
@@ -353,20 +314,14 @@ async def verify_and_process_webhook(gateway: str, scope: str, owner_id: int, he
         if not secret or not hmac.compare_digest(expected, headers.get("x-razorpay-signature", "")):
             return False, "invalid signature"
         event = payload.get("event", "")
-        body = payload.get("payload") or {}
-        payment_entity = ((body.get("payment") or {}).get("entity") or {})
-        order_entity = ((body.get("order") or {}).get("entity") or {})
-        payment_link_entity = ((body.get("payment_link") or {}).get("entity") or {})
-        notes = payment_entity.get("notes") or order_entity.get("notes") or {}
-        txid = notes.get("transaction_id") or payment_link_entity.get("reference_id")
+        entity = (((payload.get("payload") or {}).get("payment") or {}).get("entity") or {})
+        order = (((payload.get("payload") or {}).get("payment_link") or {}).get("entity") or {})
+        txid = (entity.get("notes") or {}).get("transaction_id") or order.get("reference_id")
         success = event in {"payment.captured", "order.paid", "payment_link.paid"}
-        payment_id = str(payment_entity.get("id") or "")
-        event_entity_id = (
-            payment_entity.get("id")
-            or order_entity.get("id")
-            or payment_link_entity.get("id")
-        )
-        event_key = f"{payload.get('account_id', '')}:{event}:{event_entity_id}"
+        payment_id = entity.get("id", "")
+        if not payment_id and order.get("payments"):
+            payment_id = order.get("payments", [{}])[-1].get("payment_id", "")
+        event_key = payload.get("account_id", "") + ":" + event + ":" + str(entity.get("id") or order.get("id"))
     elif gateway == "cashfree":
         timestamp = headers.get("x-webhook-timestamp", "")
         signature = headers.get("x-webhook-signature", "")
@@ -382,9 +337,15 @@ async def verify_and_process_webhook(gateway: str, scope: str, owner_id: int, he
         data = payload.get("data") or {}
         order, payment = data.get("order") or {}, data.get("payment") or {}
         txid = order.get("order_id")
-        success = payment.get("payment_status") == "SUCCESS"
+        payment_status = str(payment.get("payment_status", "")).upper()
+        success = payment_status == "SUCCESS"
         payment_id = str(payment.get("cf_payment_id", ""))
-        event_key = headers.get("x-idempotency-key") or payment_id or hashlib.sha256(raw_body).hexdigest()
+        event_type = str(payload.get("type") or "PAYMENT_EVENT")
+        event_key = (
+            headers.get("x-idempotency-key")
+            or f"{event_type}:{txid}:{payment_id}:{payment_status}"
+            or hashlib.sha256(raw_body).hexdigest()
+        )
     elif gateway == "phonepe":
         username = s.get("webhook_username", "")
         password = s.get("webhook_password", "")
@@ -417,35 +378,24 @@ async def verify_and_process_webhook(gateway: str, scope: str, owner_id: int, he
         tx = await get_transaction_by_gateway_order(gateway, str(txid))
     if not tx:
         return False, "unknown transaction"
+    if tx.get("gateway") != gateway:
+        return False, "gateway mismatch"
+    if tx.get("scope") != scope or int(tx.get("owner_id", -1)) != int(owner_id):
+        return False, "payment scope mismatch"
 
-    # ``order.paid`` may not include the payment entity. Resolve the captured
-    # payment from the order before marking the transaction successful.
-    if gateway == "razorpay" and success and not payment_id:
-        key_id = str(s.get("key_id") or "")
-        key_secret = str(s.get("key_secret") or "")
-        order_id = str(tx.get("gateway_order_id") or "")
-        if not key_id or not key_secret or not order_id:
-            return False, "Razorpay order verification unavailable"
-        payments_data = await _request(
-            "GET",
-            f"https://api.razorpay.com/v1/orders/{order_id}/payments",
-            headers=_razorpay_headers(key_id, key_secret),
-        )
-        captured = next(
-            (
-                item
-                for item in (payments_data.get("items") or [])
-                if item.get("status") == "captured"
-                and int(item.get("amount") or 0)
-                == int(round(float(tx.get("amount", 0)) * 100))
-                and str(item.get("currency") or "").upper()
-                == str(tx.get("currency") or "INR").upper()
-            ),
-            None,
-        )
-        if not captured:
-            return False, "captured Razorpay payment not found"
-        payment_id = str(captured.get("id") or "")
+    if gateway == "cashfree" and success:
+        try:
+            verified_payment_id, verified_payload = await _verify_cashfree_payment(tx, s)
+        except GatewayError as exc:
+            await update_gateway_transaction(
+                tx["transaction_id"],
+                status="verification_pending",
+                verification_error=str(exc)[:500],
+                last_gateway_event=payload,
+            )
+            return False, str(exc)
+        payment_id = verified_payment_id
+        payload = {**payload, "server_verification": verified_payload}
 
     fresh_event = await reserve_webhook_event(
         gateway,
@@ -454,18 +404,48 @@ async def verify_and_process_webhook(gateway: str, scope: str, owner_id: int, he
     )
     if not success:
         if fresh_event:
-            await mark_transaction_failed(
-                tx["transaction_id"],
-                "gateway reported failure",
-                payload,
-            )
-        return True, "failure recorded"
+            if gateway == "cashfree":
+                # Cashfree permits multiple payment attempts for one order. A
+                # failed attempt must not permanently close the Telegram order.
+                await update_gateway_transaction(
+                    tx["transaction_id"],
+                    status="pending",
+                    last_gateway_failure=payload,
+                    failure_reason="Cashfree payment attempt failed",
+                )
+            else:
+                await mark_transaction_failed(
+                    tx["transaction_id"],
+                    "gateway reported failure",
+                    payload,
+                )
+        return True, "failure attempt recorded"
 
-    return await _complete_successful_transaction(
-        tx,
+    if tx.get("status") == "fulfilled":
+        return True, "already processed"
+
+    await claim_transaction_success(
+        tx["transaction_id"],
         str(payment_id),
         payload,
     )
+
+    work = await claim_transaction_fulfillment(tx["transaction_id"])
+    if not work:
+        current = await get_gateway_transaction(tx["transaction_id"])
+        if current and current.get("status") == "fulfilled":
+            return True, "already processed"
+        return True, "already processing"
+
+    try:
+        await fulfill_transaction(work)
+    except Exception as exc:
+        await mark_transaction_fulfillment_retry(
+            tx["transaction_id"],
+            str(exc),
+        )
+        raise
+    return True, "processed"
 
 
 async def fulfill_transaction(tx: dict) -> None:
