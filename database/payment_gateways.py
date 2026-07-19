@@ -54,6 +54,9 @@ async def initialize_payment_gateway_indexes():
     await _transactions().create_index([("scope", 1), ("owner_id", 1), ("created_at", -1)])
     await _transactions().create_index([("status", 1), ("updated_at", -1)])
     await _events().create_index([("gateway", 1), ("event_key", 1)], unique=True)
+    await _events().create_index("created_at", expireAfterSeconds=30 * 24 * 60 * 60)
+    await _transactions().create_index([("status", 1), ("fulfillment_lease_until", 1)])
+    await _transactions().create_index([("gateway_payment_id", 1)], sparse=True)
 
 
 async def get_gateway_config(scope: str, owner_id: int = 0, decrypt: bool = False) -> dict:
@@ -319,3 +322,40 @@ async def reserve_webhook_event(
 
 async def gateway_history(scope: str, owner_id: int, limit: int = 50) -> list[dict]:
     return await _transactions().find({"scope": scope, "owner_id": int(owner_id)}).sort("created_at", -1).to_list(length=limit)
+
+
+async def recoverable_gateway_transactions(limit: int = 100) -> list[dict]:
+    """Return paid transactions that can safely be fulfilled or retried."""
+    now = datetime.now(timezone.utc)
+    query = {
+        "$or": [
+            {"status": {"$in": ["paid", "paid_unfulfilled"]}},
+            {"status": "fulfilling", "fulfillment_lease_until": {"$lte": now}},
+            {"status": "verification_pending", "updated_at": {"$lte": now - timedelta(minutes=2)}},
+        ]
+    }
+    return await _transactions().find(query).sort("updated_at", 1).limit(max(1, min(int(limit), 500))).to_list(length=max(1, min(int(limit), 500)))
+
+
+async def gateway_transaction_stats(scope: str, owner_id: int) -> dict:
+    pipeline = [
+        {"$match": {"scope": scope, "owner_id": int(owner_id)}},
+        {"$group": {
+            "_id": {"gateway": "$gateway", "status": "$status"},
+            "count": {"$sum": 1},
+            "amount": {"$sum": "$amount"},
+        }},
+    ]
+    rows = await _transactions().aggregate(pipeline).to_list(length=None)
+    result: dict[str, dict] = {}
+    for row in rows:
+        key = row.get("_id") or {}
+        gateway = str(key.get("gateway") or "unknown")
+        status = str(key.get("status") or "unknown")
+        bucket = result.setdefault(gateway, {"total": 0, "amount": 0.0, "statuses": {}})
+        count = int(row.get("count") or 0)
+        amount = float(row.get("amount") or 0)
+        bucket["total"] += count
+        bucket["amount"] += amount
+        bucket["statuses"][status] = {"count": count, "amount": amount}
+    return result
