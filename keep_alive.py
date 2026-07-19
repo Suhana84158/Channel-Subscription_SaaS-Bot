@@ -288,7 +288,7 @@ async def _notify_success(transaction_id):
     if tx.get("purpose") == "seller_plan":
         if _main_bot:
             from config import ADMIN_IDS
-            from database.seller_subscriptions import get_paid_plan
+            from database.seller_subscriptions import get_assignment, get_paid_plan
 
             fulfillment = tx.get("fulfillment") or {}
             metadata = tx.get("metadata") or {}
@@ -314,6 +314,9 @@ async def _notify_success(transaction_id):
             username_text = f"@{seller_username}" if seller_username else "Not Set"
             payment_date = tx.get("paid_at") or tx.get("fulfilled_at") or tx.get("updated_at")
             expiry_date = fulfillment.get("expiry_date")
+            if not expiry_date:
+                assignment = await get_assignment(int(tx["payer_user_id"]))
+                expiry_date = (assignment or {}).get("expiry_date")
             duration_days = int(plan.get("duration_days") or 0)
             duration_text = f"{duration_days} days" if duration_days else "Unlimited"
             plan_name = str(plan.get("name") or metadata.get("description") or "Seller Plan")
