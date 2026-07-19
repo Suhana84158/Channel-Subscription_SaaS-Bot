@@ -68,6 +68,52 @@ async def save_invite(owner_id: int, user_id: int, chat_id: int, invite_link: st
         },
         upsert=True,
     )
+    await deactivate_other_invites(
+        owner_id,
+        user_id,
+        chat_id,
+        invite_link,
+    )
+
+
+async def get_active_invite(owner_id: int, user_id: int, chat_id: int):
+    """Return the latest unused active invite for one user and chat."""
+    return await _c(INVITES).find_one(
+        {
+            "owner_id": int(owner_id),
+            "user_id": int(user_id),
+            "chat_id": int(chat_id),
+            "active": True,
+            "used": False,
+        },
+        sort=[("updated_at", -1)],
+    )
+
+
+async def deactivate_other_invites(
+    owner_id: int,
+    user_id: int,
+    chat_id: int,
+    keep_invite_link: str,
+):
+    """Keep one current invite active and retire older duplicates."""
+    now = datetime.now(timezone.utc)
+    await _c(INVITES).update_many(
+        {
+            "owner_id": int(owner_id),
+            "user_id": int(user_id),
+            "chat_id": int(chat_id),
+            "invite_link": {"$ne": keep_invite_link},
+            "active": True,
+        },
+        {
+            "$set": {
+                "active": False,
+                "replaced_at": now,
+                "updated_at": now,
+            }
+        },
+    )
 
 
 async def mark_invite_used(owner_id: int, invite_link: str):
