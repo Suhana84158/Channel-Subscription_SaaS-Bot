@@ -11,6 +11,7 @@ from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, fil
 
 from database.admins import is_admin
 from database.mongo import get_database
+from database.health_monitoring import get_health_summary, record_health_snapshot
 from database.platform_features import audit, get_policy, recent_audit
 from database.seller_bots import get_all_active_bots
 from database.sellers import get_all_sellers
@@ -228,13 +229,30 @@ async def _health_snapshot(context: ContextTypes.DEFAULT_TYPE) -> tuple[str, lis
     if telegram_latency_ms is not None:
         telegram_line += f" ({telegram_latency_ms} ms)"
 
+    monitor = await record_health_snapshot(
+        source="owner_dashboard",
+        raw_healthy=database_ok and telegram_ok,
+        details={
+            "database_ok": database_ok,
+            "telegram_ok": telegram_ok,
+            "offline_clone_bots": len(offline_bots),
+            "running_clone_bots": running_count,
+        },
+    )
+    history = await get_health_summary(24)
+    availability = history.get("availability_percent")
+    availability_text = f"{availability:.2f}%" if availability is not None else "Collecting data"
+
     text = (
         "🩺 Platform Health\n\n"
         "🌐 Core Services\n"
         f"• Database: {db_line}\n"
         f"• Telegram API: {telegram_line}\n"
         f"• Main Bot: {bot_username}\n"
-        f"• Process Uptime: {_format_duration(now - _PROCESS_STARTED_AT)}\n\n"
+        f"• Process Uptime: {_format_duration(now - _PROCESS_STARTED_AT)}\n"
+        f"• 24h Availability: {availability_text}\n"
+        f"• Monitor State: {monitor['status'].title()} "
+        f"({monitor['consecutive_failures']}/{monitor['failure_threshold']} failures)\n\n"
         "🤖 Clone Bots\n"
         f"• Configured: {len(bots)}\n"
         f"• Running: 🟢 {running_count}\n"
