@@ -1,3 +1,5 @@
+import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from database.mongo import get_database
 from pymongo import ReturnDocument
@@ -49,6 +51,24 @@ def _assignments():
     return get_database()[ASSIGNMENTS]
 
 
+_CONFIG_CACHE_TTL_SECONDS = 15.0
+_config_cache: dict | None = None
+_config_cache_at = 0.0
+_defaults_ready = False
+_defaults_lock = asyncio.Lock()
+
+
+async def _ensure_defaults_once():
+    global _defaults_ready
+    if _defaults_ready:
+        return
+    async with _defaults_lock:
+        if _defaults_ready:
+            return
+        await initialize_defaults()
+        _defaults_ready = True
+
+
 async def initialize_seller_subscription_indexes():
     await _settings().create_index("key", unique=True)
     await _assignments().create_index("owner_id", unique=True)
@@ -78,15 +98,30 @@ async def initialize_defaults():
     )
 
 
-async def get_config():
-    await initialize_defaults()
-    return await _settings().find_one({"key": "config"}) or {}
+async def get_config(force_refresh: bool = False):
+    global _config_cache, _config_cache_at
+    await _ensure_defaults_once()
+    now = time.monotonic()
+    if (
+        not force_refresh
+        and _config_cache is not None
+        and now - _config_cache_at < _CONFIG_CACHE_TTL_SECONDS
+    ):
+        return dict(_config_cache)
+
+    config = await _settings().find_one({"key": "config"}) or {}
+    _config_cache = dict(config)
+    _config_cache_at = now
+    return dict(config)
 
 
 async def update_config(**values):
+    global _config_cache, _config_cache_at
     values["updated_at"] = datetime.now(timezone.utc)
     await _settings().update_one({"key": "config"}, {"$set": values}, upsert=True)
-    return await get_config()
+    _config_cache = None
+    _config_cache_at = 0.0
+    return await get_config(force_refresh=True)
 
 
 async def get_paid_plan(plan_id: str):
@@ -121,14 +156,19 @@ async def get_assignment(owner_id: int):
 
 async def assign_plan(owner_id: int, plan_id: str, days: int | None = None, source="owner"):
     now = datetime.now(timezone.utc)
-    config = await get_config()
-    if plan_id == "free":
+    # A custom paid plan may also be named/id-ed "free". Gateway purchases
+    # pass a positive duration, so do not confuse that paid plan with the
+    # platform's permanent free tier.
+    is_permanent_free_tier = plan_id == "free" and days is None
+    if is_permanent_free_tier:
         expiry = None
     else:
         plan = await get_paid_plan(plan_id)
         if not plan:
             raise ValueError("Paid plan not found")
         duration = int(days or plan.get("duration_days", 30))
+        if duration <= 0:
+            raise ValueError("Plan duration must be greater than zero")
         expiry = now + timedelta(days=duration)
     await _assignments().update_one(
         {"owner_id": int(owner_id)},
@@ -216,12 +256,18 @@ async def plan_limit_warning(owner_id: int):
 async def seller_usage(owner_id: int):
     from database.seller_bots import count_owner_bots
     from database.seller_data import active_subscriptions, get_channels, get_plans
-    bot_count = await count_owner_bots(owner_id)
+
+    bot_count, subscriptions, channels, plans = await asyncio.gather(
+        count_owner_bots(owner_id),
+        active_subscriptions(owner_id),
+        get_channels(owner_id),
+        get_plans(owner_id),
+    )
     return {
         "bot_count": bot_count,
-        "active_subscriber_count": len(await active_subscriptions(owner_id)),
-        "channel_count": len(await get_channels(owner_id)),
-        "plan_count": len(await get_plans(owner_id)),
+        "active_subscriber_count": len(subscriptions),
+        "channel_count": len(channels),
+        "plan_count": len(plans),
     }
 
 
