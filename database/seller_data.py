@@ -83,6 +83,20 @@ async def add_channel(owner_id,chat_id,title,chat_type):
     await c(CHANNELS).update_one({"owner_id":owner_id,"chat_id":int(chat_id)},{"$set":{"title":title,"chat_type":chat_type,"active":True,"updated_at":now},"$setOnInsert":{"owner_id":owner_id,"chat_id":int(chat_id),"created_at":now}},upsert=True)
     return await c(CHANNELS).find_one({"owner_id":owner_id,"chat_id":int(chat_id)})
 async def get_channels(owner_id): return await c(CHANNELS).find({"owner_id":owner_id,"active":True}).to_list(length=100)
+
+
+async def save_owner_access_invite_link(owner_id:int, chat_id:int, invite_link:str):
+    """Store the reusable, no-expiry owner access link for one connected chat."""
+    now=datetime.now(timezone.utc)
+    result=await c(CHANNELS).update_one(
+        {"owner_id":int(owner_id),"chat_id":int(chat_id),"active":True},
+        {"$set":{
+            "owner_access_invite_link":str(invite_link),
+            "owner_access_link_updated_at":now,
+            "updated_at":now,
+        }},
+    )
+    return result.matched_count>0
 async def remove_channel(owner_id,chat_id): return (await c(CHANNELS).update_one({"owner_id":owner_id,"chat_id":int(chat_id)},{"$set":{"active":False,"updated_at":datetime.now(timezone.utc)}})).matched_count>0
 
 
