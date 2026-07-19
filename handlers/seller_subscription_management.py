@@ -314,13 +314,25 @@ async def receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             x=[z.strip() for z in text.split("|")];
             if len(x)!=8: raise ValueError("Need 8 values")
             name,price,days,bots,subs,channels,plans,admins=x; pid=context.user_data.get("sub_plan_id") or re.sub(r"[^a-z0-9]+","_",name.lower()).strip("_")
-            if not pid: raise ValueError("Plan name must contain letters or numbers")
-            duration=max(1,int(days))
+            name=name.strip()
+            if not pid or not name: raise ValueError("Plan name must contain letters or numbers")
+            if len(name) > 40: raise ValueError("Plan name must be 40 characters or less")
+            parsed_price=float(price)
+            if parsed_price < 0: raise ValueError("Price cannot be negative")
+            duration=int(days)
+            if duration < 1 or duration > 3650: raise ValueError("Duration must be between 1 and 3650 days")
             limits=validate_plan_limits(bots,subs,channels,plans,admins)
-            await save_paid_plan({"plan_id":pid,"name":name,"price":max(0,float(price)),"duration_days":duration,"bot_limit":limits[0],"active_subscriber_limit":limits[1],"channel_limit":limits[2],"plan_limit":limits[3],"admin_limit":limits[4],"broadcast_enabled":True,"coupon_enabled":True,"referral_enabled":True,"analytics_enabled":True,"branding_enabled":True,"active":True})
+            await save_paid_plan({"plan_id":pid,"name":name,"price":parsed_price,"duration_days":duration,"bot_limit":limits[0],"active_subscriber_limit":limits[1],"channel_limit":limits[2],"plan_limit":limits[3],"admin_limit":limits[4],"broadcast_enabled":True,"coupon_enabled":True,"referral_enabled":True,"analytics_enabled":True,"branding_enabled":True,"active":True})
         elif mode=="trial":
-            days,pid=[x.strip() for x in text.split("|",1)]; await update_config(trial_days=max(1,int(days)),trial_plan_id=pid)
-        elif mode=="branding": await update_config(branding_text=text)
+            days,pid=[x.strip() for x in text.split("|",1)]
+            trial_days=int(days)
+            if trial_days < 1 or trial_days > 365: raise ValueError("Trial days must be between 1 and 365")
+            if not await get_paid_plan(pid): raise ValueError("Trial plan ID does not exist")
+            await update_config(trial_days=trial_days,trial_plan_id=pid)
+        elif mode=="branding":
+            if not text: raise ValueError("Branding text required")
+            if len(text) > 120: raise ValueError("Branding text must be 120 characters or less")
+            await update_config(branding_text=text)
         elif mode=="seller_lookup":
             seller=None
             if text.startswith("@"):

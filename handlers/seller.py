@@ -8,11 +8,13 @@ from datetime import datetime, timezone, timedelta
 
 from database.seller_bots import (
     BotOwnershipError,
+    claim_bot_creation,
     count_owner_bots,
     delete_bot,
     get_bot,
     get_bot_by_bot_id,
     get_bots,
+    release_bot_creation,
     save_bot,
     set_bot_active,
 )
@@ -22,6 +24,7 @@ from database.seller_subscriptions import (
     effective_plan,
     get_config,
     plan_limit_warning,
+    resource_limit_status,
     subscription_history,
 )
 from services.bot_manager import bot_manager
@@ -277,7 +280,7 @@ async def selected_panel_text(owner_id: int, record, user) -> str:
     db = get_database()
     now = __import__('datetime').datetime.now(__import__('datetime').timezone.utc)
     bot_limit = int(plan.get('bot_limit', 1))
-    user_limit = int(plan.get('subscriber_limit', plan.get('user_limit', 0) or 0))
+    user_limit = int(plan.get('active_subscriber_limit', 25) or 0)
     channel_limit = int(plan.get('channel_limit', 1))
     plan_limit = int(plan.get('plan_limit', 2))
     bots_used = await count_owner_bots(owner_id)
@@ -893,7 +896,22 @@ async def receive_seller_token(update: Update, context: ContextTypes.DEFAULT_TYP
     token = text
     owner_id = int(update.effective_user.id)
     replace_bot_id = context.user_data.get("replace_clone_bot_id")
+    creation_claim = await claim_bot_creation(owner_id)
+    if not creation_claim:
+        await update.effective_message.reply_text(
+            "⏳ Another clone-bot create/replace request is already running. Please try again shortly."
+        )
+        return
     try:
+        if not replace_bot_id:
+            quota = await resource_limit_status(owner_id, "bot")
+            if not quota["allowed"]:
+                context.user_data.clear()
+                await update.effective_message.reply_text(
+                    plan_limit_warning(quota["plan"], "Clone Bots", quota["used"], quota["limit"]),
+                    reply_markup=limit_keyboard(),
+                )
+                return
         temp = Bot(token=token)
         me = await temp.get_me()
         existing_token_record = await get_bot_by_bot_id(me.id)
@@ -985,6 +1003,8 @@ async def receive_seller_token(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.effective_message.reply_text(
             "❌ Clone bot could not be connected. Please try again."
         )
+    finally:
+        await release_bot_creation(owner_id)
 
 
 async def receive_seller_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
