@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import os
 import platform
@@ -6,7 +7,7 @@ import sys
 import time
 from threading import Thread
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, make_response, request
 
 app = Flask(__name__)
 _runtime_loop = None
@@ -185,126 +186,68 @@ def payment_return(transaction_id):
     )
 
 
-@app.route("/checkout/razorpay/<transaction_id>")
-def razorpay_checkout(transaction_id):
-    from database.payment_gateways import get_gateway_transaction
-
-    tx = _run(get_gateway_transaction(transaction_id))
-    if (
-        not tx
-        or tx.get("gateway") != "razorpay"
-        or not tx.get("gateway_order_id")
-        or not tx.get("razorpay_key_id")
-    ):
-        return "Invalid or expired Razorpay order", 404
-
-    options = {
-        "key": tx["razorpay_key_id"],
-        "amount": int(round(float(tx.get("amount", 0)) * 100)),
-        "currency": str(tx.get("currency") or "INR").upper(),
-        "name": "Subscription Payment",
-        "description": (tx.get("metadata") or {}).get("description", tx.get("purpose", "Subscription")),
-        "order_id": tx["gateway_order_id"],
-        "notes": {"transaction_id": transaction_id},
-    }
-    options_json = json.dumps(options).replace("</", "<\\/")
-    transaction_json = json.dumps(transaction_id)
-
-    return f"""
-<!doctype html>
-<html>
-<head>
-<meta name='viewport' content='width=device-width,initial-scale=1'>
-<script src='https://checkout.razorpay.com/v1/checkout.js'></script>
-</head>
-<body style='font-family:sans-serif;text-align:center;padding:30px'>
-<h2>Razorpay Secure Checkout</h2>
-<p>Transaction: {transaction_id}</p>
-<button id='pay' style='padding:14px 24px;font-size:18px'>Pay Now</button>
-<p id='status'></p>
-<script>
-const options = {options_json};
-options.handler = async function (response) {{
-  const status = document.getElementById('status');
-  status.textContent = 'Verifying payment securely...';
-  try {{
-    const result = await fetch('/payment/razorpay/complete/' + encodeURIComponent({transaction_json}), {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify(response)
-    }});
-    const data = await result.json();
-    if (!result.ok || !data.ok) throw new Error(data.message || 'Verification failed');
-    status.textContent = 'Payment verified. You may return to Telegram.';
-    window.location.href = '/payment/return/' + encodeURIComponent({transaction_json});
-  }} catch (error) {{
-    status.textContent = 'Payment verification failed: ' + error.message;
-  }}
-}};
-options.modal = {{ondismiss: function () {{
-  document.getElementById('status').textContent = 'Payment window closed.';
-}}}};
-const checkout = new Razorpay(options);
-document.getElementById('pay').onclick = function (event) {{
-  event.preventDefault();
-  checkout.open();
-}};
-checkout.open();
-</script>
-</body>
-</html>"""
-
-
-@app.route("/payment/razorpay/complete/<transaction_id>", methods=["POST"])
-def razorpay_complete(transaction_id):
-    from services.payment_gateways import verify_razorpay_checkout
-
-    payload = request.get_json(silent=True) or {}
-    try:
-        ok, message = _run(
-            verify_razorpay_checkout(
-                transaction_id,
-                str(payload.get("razorpay_payment_id") or ""),
-                str(payload.get("razorpay_order_id") or ""),
-                str(payload.get("razorpay_signature") or ""),
-            ),
-            timeout=45,
-        )
-        if ok:
-            try:
-                _run(_notify_success(transaction_id), timeout=30)
-            except Exception:
-                pass
-        return jsonify({"ok": bool(ok), "message": message}), (200 if ok else 400)
-    except Exception as exc:
-        return jsonify({"ok": False, "message": str(exc)}), 500
-
-
 @app.route("/checkout/cashfree/<transaction_id>")
 def cashfree_checkout(transaction_id):
     from database.payment_gateways import get_gateway_transaction
 
     tx = _run(get_gateway_transaction(transaction_id))
-    if not tx or not tx.get("payment_session_id"):
-        return "Invalid or expired payment session", 404
+    if (
+        not tx
+        or tx.get("gateway") != "cashfree"
+        or not tx.get("payment_session_id")
+        or tx.get("status") in {"failed", "fulfilled"}
+    ):
+        return "Invalid or expired Cashfree payment session", 404
 
     mode = (
         "sandbox"
         if tx.get("gateway_mode", "test") == "test"
         else "production"
     )
-    session_id = json.dumps(tx["payment_session_id"])
+    session_id = json.dumps(str(tx["payment_session_id"]))
+    safe_transaction_id = html.escape(str(transaction_id))
 
-    return f"""
-<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>
-<script src='https://sdk.cashfree.com/js/v3/cashfree.js'></script></head>
+    page = f"""
+<!doctype html>
+<html>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Cashfree Secure Checkout</title>
+<script src='https://sdk.cashfree.com/js/v3/cashfree.js'></script>
+</head>
 <body style='font-family:sans-serif;text-align:center;padding:30px'>
-<h2>Cashfree Secure Checkout</h2><p>Transaction: {transaction_id}</p>
+<h2>Cashfree Secure Checkout</h2>
+<p>Transaction: {safe_transaction_id}</p>
 <button id='pay' style='padding:14px 24px;font-size:18px'>Pay Now</button>
+<p id='error' style='color:#b00020'></p>
 <script>
 const cashfree = Cashfree({{mode: {json.dumps(mode)}}});
-document.getElementById('pay').onclick = () => cashfree.checkout({{paymentSessionId: {session_id}, redirectTarget: '_self'}});
-</script></body></html>"""
+const button = document.getElementById('pay');
+button.onclick = async () => {{
+  button.disabled = true;
+  document.getElementById('error').textContent = '';
+  try {{
+    await cashfree.checkout({{
+      paymentSessionId: {session_id},
+      redirectTarget: '_self'
+    }});
+  }} catch (error) {{
+    document.getElementById('error').textContent =
+      'Unable to open checkout. Please return to Telegram and try again.';
+    button.disabled = false;
+  }}
+}};
+</script>
+</body>
+</html>
+"""
+    response = make_response(page, 200)
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 @app.route("/checkout/paytm/<transaction_id>")
@@ -424,7 +367,14 @@ async def _notify_success(transaction_id):
 def gateway_webhook(gateway, scope, owner_id):
     from services.payment_gateways import verify_and_process_webhook
 
+    if gateway not in {"razorpay", "cashfree", "phonepe", "paytm"}:
+        return jsonify({"ok": False, "error": "Unsupported gateway"}), 404
+    if scope not in {"owner", "seller"}:
+        return jsonify({"ok": False, "error": "Invalid payment scope"}), 404
+
     raw = request.get_data(cache=True)
+    if len(raw) > 1_000_000:
+        return jsonify({"ok": False, "error": "Webhook body too large"}), 413
 
     if request.is_json:
         payload = request.get_json(silent=True) or {}
