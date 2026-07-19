@@ -13,7 +13,7 @@ from database.seller_subscriptions import (
     current_plan_text, decide_seller_payment, delete_paid_plan, get_config,
     get_paid_plan, get_seller_payment, pending_seller_payments, save_paid_plan,
     seller_revenue_summary, set_subscription_suspension, subscription_history,
-    update_config, usage_warning,
+    update_config, usage_warning, validate_plan_limits,
 )
 
 
@@ -306,14 +306,18 @@ async def receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not text: raise ValueError("UPI Name required")
             await update_config(payment_upi_name=text)
         elif mode=="free":
-            v=[int(x.strip()) for x in text.split("|")];
-            if len(v)!=5: raise ValueError("Need 5 values")
+            raw=[x.strip() for x in text.split("|")]
+            if len(raw)!=5: raise ValueError("Need 5 values")
+            v=validate_plan_limits(*raw)
             cfg=await get_config(); p=dict(cfg.get("free_plan",{})); p.update(bot_limit=v[0],active_subscriber_limit=v[1],channel_limit=v[2],plan_limit=v[3],admin_limit=v[4],branding_enabled=True); await update_config(free_plan=p)
         elif mode in {"paid_add","paid_edit"}:
             x=[z.strip() for z in text.split("|")];
             if len(x)!=8: raise ValueError("Need 8 values")
             name,price,days,bots,subs,channels,plans,admins=x; pid=context.user_data.get("sub_plan_id") or re.sub(r"[^a-z0-9]+","_",name.lower()).strip("_")
-            await save_paid_plan({"plan_id":pid,"name":name,"price":float(price),"duration_days":int(days),"bot_limit":int(bots),"active_subscriber_limit":int(subs),"channel_limit":int(channels),"plan_limit":int(plans),"admin_limit":int(admins),"broadcast_enabled":True,"coupon_enabled":True,"referral_enabled":True,"analytics_enabled":True,"branding_enabled":True,"active":True})
+            if not pid: raise ValueError("Plan name must contain letters or numbers")
+            duration=max(1,int(days))
+            limits=validate_plan_limits(bots,subs,channels,plans,admins)
+            await save_paid_plan({"plan_id":pid,"name":name,"price":max(0,float(price)),"duration_days":duration,"bot_limit":limits[0],"active_subscriber_limit":limits[1],"channel_limit":limits[2],"plan_limit":limits[3],"admin_limit":limits[4],"broadcast_enabled":True,"coupon_enabled":True,"referral_enabled":True,"analytics_enabled":True,"branding_enabled":True,"active":True})
         elif mode=="trial":
             days,pid=[x.strip() for x in text.split("|",1)]; await update_config(trial_days=max(1,int(days)),trial_plan_id=pid)
         elif mode=="branding": await update_config(branding_text=text)
