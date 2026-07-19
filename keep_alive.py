@@ -1,6 +1,5 @@
 import asyncio
 import json
-import html
 import os
 import platform
 import sys
@@ -155,9 +154,10 @@ def health():
 
     try:
         payload = _run(_runtime_health(), timeout=15)
-        status_code = (
-            200 if payload.get("status") == "healthy" else 503
-        )
+        # A transient failure is reported as "degraded" but still returns 200.
+        # External monitors should mark the service down only after the configured
+        # consecutive-failure threshold changes the state to "unhealthy".
+        status_code = 503 if payload.get("status") == "unhealthy" else 200
         return jsonify(payload), status_code
     except Exception as exc:
         return jsonify(
@@ -179,7 +179,7 @@ def payment_return(transaction_id):
     return (
         "<html><body style='font-family:sans-serif;text-align:center;padding:40px'>"
         "<h2>Payment status is being verified</h2>"
-        f"<p>Transaction: {html.escape(str(transaction_id))}</p>"
+        f"<p>Transaction: {transaction_id}</p>"
         "<p>You may return to Telegram. Activation happens only after secure gateway verification.</p>"
         "</body></html>"
     )
@@ -204,7 +204,7 @@ def cashfree_checkout(transaction_id):
 <!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>
 <script src='https://sdk.cashfree.com/js/v3/cashfree.js'></script></head>
 <body style='font-family:sans-serif;text-align:center;padding:30px'>
-<h2>Cashfree Secure Checkout</h2><p>Transaction: {html.escape(str(transaction_id))}</p>
+<h2>Cashfree Secure Checkout</h2><p>Transaction: {transaction_id}</p>
 <button id='pay' style='padding:14px 24px;font-size:18px'>Pay Now</button>
 <script>
 const cashfree = Cashfree({{mode: {json.dumps(mode)}}});
@@ -224,15 +224,12 @@ def paytm_checkout(transaction_id):
         "paytm_host",
         "https://securestage.paytmpayments.com",
     )
-    mid = html.escape(str(tx.get("paytm_mid", "")), quote=True)
-    token = html.escape(str(tx["txn_token"]), quote=True)
-    try:
-        amount = f"{max(0.0, float(tx.get('amount', 0) or 0)):.2f}"
-    except (TypeError, ValueError):
-        return "Invalid payment amount", 400
+    mid = tx.get("paytm_mid", "")
+    token = tx["txn_token"]
+    amount = f"{float(tx.get('amount', 0)):.2f}"
     action = (
         f"{host}/theia/api/v1/showPaymentPage"
-        f"?mid={mid}&orderId={html.escape(str(transaction_id), quote=True)}"
+        f"?mid={mid}&orderId={transaction_id}"
     )
 
     return f"""
