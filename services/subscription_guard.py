@@ -1,3 +1,4 @@
+from config import ADMIN_IDS
 import logging
 from datetime import datetime, timezone
 
@@ -85,6 +86,9 @@ async def subscription_guard_chat_member(update: Update, context: ContextTypes.D
     user = event.new_chat_member.user
     if user.is_bot:
         return
+    if int(user.id) in {int(value) for value in ADMIN_IDS}:
+        await log_guard_event(owner_id, event.chat.id, user.id, "platform_owner_skipped", "Platform owner bypass")
+        return
     actor = event.from_user
     if settings.get("whitelist_admin_added", True) and actor and actor.id != user.id and await _is_admin(context.bot, event.chat.id, actor.id):
         await add_whitelist(owner_id, event.chat.id, user.id, actor.id)
@@ -141,6 +145,9 @@ async def subscription_guard_new_members(update: Update, context: ContextTypes.D
     for user in message.new_chat_members:
         if user.is_bot:
             continue
+        if int(user.id) in {int(value) for value in ADMIN_IDS}:
+            await log_guard_event(owner_id, chat.id, user.id, "platform_owner_skipped", "Platform owner bypass")
+            continue
         if settings.get("whitelist_admin_added", True) and actor_is_admin and actor.id != user.id:
             await add_whitelist(owner_id, chat.id, user.id, actor.id)
             await log_guard_event(owner_id, chat.id, user.id, "whitelisted", "Added by chat admin/owner")
@@ -180,6 +187,8 @@ async def revoke_user_invites(bot, owner_id: int, user_id: int) -> int:
 async def enforce_user_access(bot, owner_id: int, user_id: int, reason: str) -> dict:
     """Remove a user from every connected chat and revoke issued links."""
     report = {"removed": 0, "remove_failed": 0, "invites_revoked": 0}
+    if int(user_id) in {int(value) for value in ADMIN_IDS}:
+        return report
     report["invites_revoked"] = await revoke_user_invites(bot, owner_id, user_id)
     for channel in await get_channels(owner_id):
         chat_id = int(channel["chat_id"])
