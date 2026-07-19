@@ -71,10 +71,7 @@ async def expire_stale_pending_payments(
 
     query = {
         "status": "pending",
-        "$or": [
-            {"created_at": {"$lt": cutoff}},
-            {"created_at": {"$exists": False}, "updated_at": {"$lt": cutoff}},
-        ],
+        "created_at": {"$lt": cutoff},
     }
     if user_id is not None:
         query["user_id"] = int(user_id)
@@ -109,20 +106,6 @@ async def create_payment(
     than creating duplicate admin approval requests.
     """
     await ensure_payment_indexes()
-
-    plan = str(plan or "").strip()
-    if not plan:
-        raise ValueError("Payment plan is required.")
-    try:
-        amount = float(amount)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Payment amount is invalid.") from exc
-    if amount < 0:
-        raise ValueError("Payment amount cannot be negative.")
-    if duration_minutes is not None and int(duration_minutes) <= 0:
-        raise ValueError("Payment duration must be positive.")
-    utr = str(utr).strip()[:100] if utr is not None else None
-
     await expire_stale_pending_payments(user_id)
 
     now = datetime.now(timezone.utc)
@@ -280,6 +263,8 @@ async def decide_payment_by_id(
                 "fulfillment_status": "pending",
                 "fulfillment_attempts": 0,
                 "fulfilled_channel_ids": [],
+                "user_notification_status": "pending",
+                "user_notification_attempts": 0,
             }
         )
     else:
@@ -541,6 +526,97 @@ async def fail_payment_fulfillment(
         },
     )
     return result.modified_count == 1
+
+
+async def claim_payment_user_notification(payment_id):
+    """Claim the approval notification exactly once, with safe retry."""
+    try:
+        object_id = to_object_id(payment_id)
+    except ValueError:
+        return None
+
+    now = datetime.now(timezone.utc)
+    stale_before = now - timedelta(minutes=5)
+    return await payments_collection().find_one_and_update(
+        {
+            "_id": object_id,
+            "status": "approved",
+            "fulfillment_status": "completed",
+            "$or": [
+                {"user_notification_status": {"$exists": False}},
+                {"user_notification_status": {"$in": ["pending", "failed"]}},
+                {
+                    "user_notification_status": "processing",
+                    "user_notification_claimed_at": {"$lt": stale_before},
+                },
+            ],
+        },
+        {
+            "$set": {
+                "user_notification_status": "processing",
+                "user_notification_claimed_at": now,
+                "updated_at": now,
+            },
+            "$inc": {"user_notification_attempts": 1},
+            "$unset": {"user_notification_error": ""},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+async def complete_payment_user_notification(payment_id) -> bool:
+    try:
+        object_id = to_object_id(payment_id)
+    except ValueError:
+        return False
+
+    now = datetime.now(timezone.utc)
+    result = await payments_collection().update_one(
+        {
+            "_id": object_id,
+            "status": "approved",
+            "fulfillment_status": "completed",
+            "user_notification_status": "processing",
+        },
+        {
+            "$set": {
+                "user_notification_status": "sent",
+                "user_notified_at": now,
+                "updated_at": now,
+            },
+            "$unset": {
+                "user_notification_claimed_at": "",
+                "user_notification_error": "",
+            },
+        },
+    )
+    return result.matched_count == 1
+
+
+async def fail_payment_user_notification(payment_id, error: str) -> bool:
+    try:
+        object_id = to_object_id(payment_id)
+    except ValueError:
+        return False
+
+    now = datetime.now(timezone.utc)
+    result = await payments_collection().update_one(
+        {
+            "_id": object_id,
+            "status": "approved",
+            "fulfillment_status": "completed",
+            "user_notification_status": "processing",
+        },
+        {
+            "$set": {
+                "user_notification_status": "failed",
+                "user_notification_error": str(error)[:1000],
+                "updated_at": now,
+            },
+            "$unset": {"user_notification_claimed_at": ""},
+        },
+    )
+    return result.matched_count == 1
 
 
 async def recover_orphaned_payments(
