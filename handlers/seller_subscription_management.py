@@ -1,3 +1,4 @@
+import logging
 import re
 from datetime import datetime, timezone
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -8,6 +9,8 @@ from database.admins import is_admin
 from database.sellers import get_seller, sellers_collection
 from database.platform_features import reserve_payment_fingerprint, release_payment_fingerprint, audit
 from handlers.official_links import build_official_links_keyboard
+logger = logging.getLogger(__name__)
+
 from database.seller_subscriptions import (
     assign_plan_with_history, extend_plan_with_history, create_plan_request, create_seller_payment,
     current_plan_text, decide_seller_payment, delete_paid_plan, get_config,
