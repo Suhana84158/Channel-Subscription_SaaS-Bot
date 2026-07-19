@@ -522,7 +522,17 @@ async def fulfill_transaction(tx: dict) -> None:
         try:
             from services.bot_manager import bot_manager
             delivery = await bot_manager.deliver_subscription_access(
-                seller_id, tx["payer_user_id"]
+                seller_id,
+                tx["payer_user_id"],
+                success_details={
+                    "plan_name": plan.get("name", "Subscription"),
+                    "amount": tx.get("amount", 0),
+                    "gateway": tx.get("gateway", ""),
+                    "transaction_id": tx.get("transaction_id", ""),
+                    "payment_date": tx.get("paid_at") or tx.get("updated_at") or tx.get("created_at"),
+                    "expiry_date": expiry,
+                    "duration": plan.get("duration_text") or f"{plan.get('duration_minutes', 0)} minutes",
+                },
             )
             await audit(
                 "child_gateway_access_delivery",

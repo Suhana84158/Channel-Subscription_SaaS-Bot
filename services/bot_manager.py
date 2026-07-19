@@ -3324,8 +3324,13 @@ class SellerBotManager:
             logger.exception("Unexpected group connect error owner=%s", owner)
             await message.reply_text(f"❌ Group connect failed: {exc}")
 
-    async def deliver_subscription_access(self, owner_id:int, user_id:int):
-        """Send fresh invite links only for chats the user has not joined yet."""
+    async def deliver_subscription_access(self, owner_id:int, user_id:int, success_details:dict|None=None):
+        """Send fresh invite links only for chats the user has not joined yet.
+
+        When ``success_details`` is supplied by an automatic gateway payment,
+        the access message also includes the user and subscription receipt
+        details. Manual/admin delivery keeps the existing compact message.
+        """
         running=self.get_running(int(owner_id))
         if not running:
             record=await get_bot_by_data_owner_id(int(owner_id))
@@ -3373,13 +3378,50 @@ class SellerBotManager:
 
         if links:
             try:
-                await bot.send_message(
-                    chat_id=int(user_id),
-                    text=(
+                if success_details:
+                    try:
+                        chat = await bot.get_chat(int(user_id))
+                        full_name = getattr(chat, "full_name", None) or "Unknown"
+                        username = getattr(chat, "username", None)
+                    except TelegramError:
+                        full_name = str(success_details.get("full_name") or "Unknown")
+                        username = success_details.get("username")
+
+                    username_text = f"@{username}" if username else "Not Set"
+
+                    def _format_dt(value):
+                        if not value:
+                            return "-"
+                        if hasattr(value, "strftime"):
+                            return value.strftime("%d %b %Y, %I:%M %p UTC")
+                        return str(value)
+
+                    text = (
+                        "✅ Payment verified automatically\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"👤 Name: {full_name}\n"
+                        f"🆔 Username: {username_text}\n"
+                        f"📦 Plan Name: {success_details.get('plan_name') or 'Subscription'}\n"
+                        f"💰 Amount: ₹{float(success_details.get('amount') or 0):g}\n"
+                        f"💳 Gateway: {str(success_details.get('gateway') or '').title() or '-'}\n"
+                        f"🧾 Transaction ID: {success_details.get('transaction_id') or '-'}\n"
+                        f"📅 Payment Date: {_format_dt(success_details.get('payment_date'))}\n"
+                        f"⏳ Expiry Date: {_format_dt(success_details.get('expiry_date'))}\n"
+                        f"⌛ Duration: {success_details.get('duration') or '-'}\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        "🔗 Join using your private invite link(s):\n\n"
+                        + "\n\n".join(links)
+                    )
+                else:
+                    text = (
                         "✅ Your subscription has been updated.\n\n"
                         "Use the fresh invite link(s) below to join the channel/group(s) you have not joined yet:\n\n"
                         + "\n\n".join(links)
-                    ),
+                    )
+
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=text,
                     disable_web_page_preview=True,
                 )
             except TelegramError as exc:
