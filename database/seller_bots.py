@@ -5,7 +5,6 @@ from pymongo.errors import DuplicateKeyError
 from utils.crypto import decrypt_secret, encrypt_secret
 
 COLLECTION = "seller_bots"
-CREATION_LOCKS = "seller_bot_creation_locks"
 
 
 class BotOwnershipError(RuntimeError):
@@ -14,10 +13,6 @@ class BotOwnershipError(RuntimeError):
 
 def seller_bots_collection():
     return get_database()[COLLECTION]
-
-
-def seller_bot_creation_locks_collection():
-    return get_database()[CREATION_LOCKS]
 
 
 async def initialize_seller_bot_indexes():
@@ -34,10 +29,9 @@ async def initialize_seller_bot_indexes():
     await col.create_index("bot_id", unique=True)
     await col.create_index("bot_username_normalized", unique=True)
     await col.create_index("active")
+    await col.create_index("runtime_status")
+    await col.create_index("next_recovery_at")
     await col.create_index([("owner_id", 1), ("created_at", 1)])
-    locks = seller_bot_creation_locks_collection()
-    await locks.create_index("owner_id", unique=True)
-    await locks.create_index("expires_at", expireAfterSeconds=0)
 
     # Preserve the existing first bot's old owner-scoped data.
     cursor = col.find({"data_owner_id": {"$exists": False}})
@@ -46,35 +40,6 @@ async def initialize_seller_bot_indexes():
             {"_id": record["_id"]},
             {"$set": {"data_owner_id": int(record["owner_id"])}}
         )
-
-
-async def claim_bot_creation(owner_id: int, lease_seconds: int = 120):
-    """Acquire a short owner-scoped lease for clone-bot create/replace flow."""
-    owner_id = int(owner_id)
-    now = datetime.now(timezone.utc)
-    expires_at = now + timedelta(seconds=max(30, int(lease_seconds)))
-    try:
-        return await seller_bot_creation_locks_collection().find_one_and_update(
-            {
-                "owner_id": owner_id,
-                "$or": [
-                    {"expires_at": {"$exists": False}},
-                    {"expires_at": {"$lte": now}},
-                ],
-            },
-            {
-                "$set": {"owner_id": owner_id, "claimed_at": now, "expires_at": expires_at},
-                "$inc": {"claim_count": 1},
-            },
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
-        )
-    except DuplicateKeyError:
-        return None
-
-
-async def release_bot_creation(owner_id: int):
-    return await seller_bot_creation_locks_collection().delete_one({"owner_id": int(owner_id)})
 
 
 async def get_bot(owner_id: int):
@@ -154,9 +119,17 @@ async def save_bot(owner_id: int, bot_id: int, bot_name: str, bot_username: str,
                     "bot_token_encrypted": encrypt_secret(bot_token),
                     "active": True,
                     "status": "registered",
+                    "runtime_status": "registered",
+                    "runtime_error": None,
+                    "invalid_token_at": None,
+                    "next_recovery_at": None,
+                    "consecutive_recovery_failures": 0,
                     "updated_at": now,
                 },
-                "$unset": {"bot_token": ""},
+                "$unset": {
+                    "bot_token": "",
+                    "recovery_claimed_at": "",
+                },
                 "$setOnInsert": {"created_at": now},
             },
             upsert=True,
@@ -190,7 +163,35 @@ async def get_all_active_bots():
     return await seller_bots_collection().find({
         "active": True,
         "bot_token_encrypted": {"$exists": True, "$ne": None},
+        "runtime_status": {"$nin": ["invalid_token", "token_missing"]},
     }).to_list(length=None)
+
+
+async def mark_invalid_token(bot_id: int, error=None):
+    """Disable automatic retries until the seller submits a valid token."""
+    now = datetime.now(timezone.utc)
+    await seller_bots_collection().update_one(
+        {"bot_id": int(bot_id)},
+        {
+            "$set": {
+                "active": False,
+                "status": "invalid_token",
+                "runtime_status": "invalid_token",
+                "runtime_error": str(error or "Telegram rejected the bot token")[:500],
+                "invalid_token_at": now,
+                "next_recovery_at": None,
+                "updated_at": now,
+            },
+            "$unset": {"recovery_claimed_at": ""},
+        },
+    )
+
+
+async def count_invalid_token_bots(owner_id: int | None = None):
+    query = {"runtime_status": "invalid_token"}
+    if owner_id is not None:
+        query["owner_id"] = int(owner_id)
+    return await seller_bots_collection().count_documents(query)
 
 
 async def set_bot_active(bot_id: int, active: bool):
@@ -228,6 +229,7 @@ async def claim_runtime_recovery(bot_id: int, cooldown_seconds: int = 300):
         {
             "bot_id": bot_id,
             "active": True,
+            "runtime_status": {"$nin": ["invalid_token", "token_missing", "plan_limit_paused"]},
             "$or": [
                 {"recovery_claimed_at": {"$exists": False}},
                 {"recovery_claimed_at": None},
