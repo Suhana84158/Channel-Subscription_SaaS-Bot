@@ -40,7 +40,8 @@ from database.sellers import get_or_create_seller, get_seller
 from utils.timezone_ui import timezone_guide, timezone_keyboard, timezone_from_key, normalize_timezone
 from config import ADMIN_IDS
 from database.users import get_user as get_platform_user
-from database.payment_gateways import SUPPORTED_GATEWAYS, get_gateway_config
+from database.payment_gateways import SUPPORTED_GATEWAYS, get_gateway_config, create_gateway_transaction
+from services.payment_gateways import create_checkout, GatewayError
 
 
 logger = logging.getLogger(__name__)
@@ -829,49 +830,58 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         context.user_data["seller_payment_plan"] = plan_id
         context.user_data["seller_request_type"] = request_type
-        text = (
-            "💳 Seller Plan Payment\n\n"
-            f"Plan: {plan.get('name')}\nAmount: ₹{plan.get('price',0):g}\n"
-            f"UPI Name: {cfg.get('payment_upi_name') or 'Not Set'}\n"
-            f"UPI ID: {cfg.get('payment_upi_id') or 'Not Set'}\n\n"
-            "Pay and upload your payment screenshot."
-        )
         gateway_cfg = await get_gateway_config("owner", 0, decrypt=True)
         gateways = gateway_cfg.get("gateways") or {}
-        enabled_gateways = [
-            gateway for gateway in SUPPORTED_GATEWAYS
-            if bool((gateways.get(gateway) or {}).get("enabled"))
-        ]
-        default_gateway = str(gateway_cfg.get("default_gateway") or "manual")
+        enabled_gateways = [g for g in SUPPORTED_GATEWAYS if bool((gateways.get(g) or {}).get("enabled"))]
+        default_gateway = str(gateway_cfg.get("default_gateway") or "")
         if default_gateway in enabled_gateways:
             enabled_gateways.remove(default_gateway)
             enabled_gateways.insert(0, default_gateway)
-
-        rows = [
-            [InlineKeyboardButton(
-                f"💳 Pay with {gateway.title()}",
-                callback_data=f"pgsp_{gateway}_{request_type}_{plan_id}",
-            )]
-            for gateway in enabled_gateways
-        ]
         manual_enabled = bool(gateway_cfg.get("manual_enabled", True))
-        if manual_enabled:
-            rows.append([
-                InlineKeyboardButton(
-                    "📤 Upload Payment Screenshot",
-                    callback_data=f"seller_manual_{request_type}_{plan_id}",
+
+        rows = []
+        text = ""
+        if enabled_gateways:
+            gateway = enabled_gateways[0]
+            tx = await create_gateway_transaction(
+                scope="owner", owner_id=0, payer_user_id=owner_id,
+                gateway=gateway, amount=float(plan.get("price", 0)), currency="INR",
+                purpose="seller_plan", reference_id=plan_id,
+                metadata={"plan_id": plan_id, "request_type": request_type, "description": f"Seller {plan.get('name')} plan"},
+            )
+            try:
+                checkout = await create_checkout(tx)
+                text = (
+                    f"💳 {gateway.title()} Payment\n\n"
+                    f"Plan: {plan.get('name')}\nAmount: ₹{plan.get('price',0):g}\n"
+                    f"Transaction: {tx['transaction_id']}\n\n"
+                    "Payment successful hone ke baad plan automatically activate hoga."
                 )
-            ])
+                rows.append([InlineKeyboardButton("💳 Pay Now", url=checkout.get("checkout_url"))])
+            except GatewayError as exc:
+                text = f"❌ Gateway error: {exc}"
+
+        if manual_enabled:
+            manual_text = (
+                f"Plan: {plan.get('name')}\nAmount: ₹{plan.get('price',0):g}\n"
+                f"UPI Name: {cfg.get('payment_upi_name') or 'Not Set'}\n"
+                f"UPI ID: {cfg.get('payment_upi_id') or 'Not Set'}\n\n"
+                "Pay and upload your payment screenshot."
+            )
+            text = f"{text}\n\n{manual_text}" if text else f"💳 Payment\n\n{manual_text}"
+            rows.append([InlineKeyboardButton("📤 Upload Payment Screenshot", callback_data=f"seller_manual_{request_type}_{plan_id}")])
+
+        if not enabled_gateways and not manual_enabled:
+            text = "⚠️ No payment method is currently available. Please contact support."
         rows.append([InlineKeyboardButton("⬅ Back", callback_data="seller_upgrade_plan")])
         kb = InlineKeyboardMarkup(rows)
 
-        if not enabled_gateways and not manual_enabled:
-            text += "\n\n⚠️ No payment method is currently available. Please contact support."
-
-        # Show the UPI QR only while manual payment is enabled. With manual
-        # payment disabled, sellers should see automatic gateway buttons directly.
         if cfg.get("payment_qr_file_id") and manual_enabled:
-            await q.message.reply_photo(cfg["payment_qr_file_id"], caption=text, reply_markup=kb)
+            try:
+                await q.message.delete()
+            except TelegramError:
+                pass
+            await context.bot.send_photo(q.message.chat_id, cfg["payment_qr_file_id"], caption=text, reply_markup=kb)
         else:
             await q.edit_message_text(text, reply_markup=kb)
         return
