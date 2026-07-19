@@ -24,7 +24,7 @@ from services.payment_gateways import create_checkout, test_gateway_connection, 
 from database.seller_bots import (
     claim_runtime_recovery, finish_runtime_recovery, get_all_active_bots, get_bot,
     get_bot_by_bot_id, get_bot_by_data_owner_id, get_decrypted_bot_token,
-    recovery_allowed, set_runtime_status,
+    mark_invalid_token, recovery_allowed, set_runtime_status,
 )
 from database.mongo import get_database
 from database.seller_referrals import seller_referral_stats
@@ -3511,14 +3511,6 @@ class SellerBotManager:
 
             bot_id = int(record["bot_id"])
             seller_account_id = int(record["owner_id"])
-            access = await seller_access_state(seller_account_id)
-            if not access.get("allowed"):
-                await set_runtime_status(
-                    bot_id,
-                    f"subscription_{access.get('reason', 'blocked')}",
-                    access.get("message") or "Seller subscription does not allow runtime startup",
-                )
-                return False
             allowed, quota = await bot_runtime_allowed(seller_account_id, bot_id)
             if not allowed:
                 limit = quota.get("limit", 0)
@@ -3584,6 +3576,22 @@ class SellerBotManager:
                     data_owner_id,
                 )
                 return True
+            except InvalidToken as exc:
+                logger.warning(
+                    "Clone bot token rejected; automatic retries disabled bot_id=%s owner_id=%s",
+                    bot_id,
+                    seller_account_id,
+                )
+                try:
+                    await mark_invalid_token(bot_id, exc)
+                except Exception:
+                    logger.exception(
+                        "Could not save invalid-token status bot_id=%s",
+                        bot_id,
+                    )
+                if app:
+                    await self._safe_shutdown(app)
+                return False
             except Exception as exc:
                 logger.exception("Seller bot start failed bot_id=%s", bot_id)
                 try:
@@ -3666,7 +3674,15 @@ class SellerBotManager:
         bot_id = int(bot_id)
         last_error = ""
         record = await get_bot_by_bot_id(bot_id)
-        if not record or not await recovery_allowed(record):
+        if not record:
+            return False
+        if str(record.get("runtime_status") or "").lower() in {
+            "invalid_token",
+            "token_missing",
+            "plan_limit_paused",
+        }:
+            return False
+        if not await recovery_allowed(record):
             return False
         claim = await claim_runtime_recovery(bot_id, cooldown_seconds=300)
         if not claim:
