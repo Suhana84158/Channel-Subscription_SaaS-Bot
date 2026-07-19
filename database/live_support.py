@@ -311,27 +311,39 @@ async def claim_support_delivery(
     if existing and existing.get("status") == "completed":
         return None
 
-    return await c(DELIVERIES).find_one_and_update(
-        {
-            **key,
-            "$or": [
-                {"status": {"$in": ["pending", "failed"]}},
-                {"status": "processing", "claimed_at": {"$lt": stale_before}},
-                {"status": {"$exists": False}},
-            ],
+    query = {
+        **key,
+        "$or": [
+            {"status": {"$in": ["pending", "failed"]}},
+            {"status": "processing", "claimed_at": {"$lt": stale_before}},
+            {"status": {"$exists": False}},
+        ],
+    }
+    update = {
+        "$set": {
+            "status": "processing",
+            "claimed_at": now,
+            "updated_at": now,
         },
-        {
-            "$set": {
-                "status": "processing",
-                "claimed_at": now,
-                "updated_at": now,
-            },
-            "$setOnInsert": {"created_at": now},
-            "$inc": {"attempts": 1},
-        },
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
+        "$setOnInsert": {"created_at": now},
+        "$inc": {"attempts": 1},
+    }
+
+    # Two workers can both observe a missing receipt. The unique index allows
+    # only one insert; the loser must return None instead of crashing support.
+    try:
+        return await c(DELIVERIES).find_one_and_update(
+            query,
+            update,
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except Exception as exc:
+        from pymongo.errors import DuplicateKeyError
+
+        if not isinstance(exc, DuplicateKeyError):
+            raise
+        return None
 
 
 async def complete_support_delivery(receipt_id, **details):
