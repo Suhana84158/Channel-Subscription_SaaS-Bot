@@ -99,9 +99,12 @@ async def save_gateway_config(
     for key, value in values.items():
         if isinstance(value, str):
             value = value.strip()
-        if key == "mode" and value not in VALID_MODES:
-            raise ValueError("Mode must be test or live")
+        if key == "mode":
+            # Automatic gateways always operate in live mode.
+            value = "live"
         item[key] = value
+
+    item["mode"] = "live"
 
     if item.get("enabled") and not gateway_is_ready(gateway, item):
         missing = ", ".join(gateway_missing_fields(gateway, item))
