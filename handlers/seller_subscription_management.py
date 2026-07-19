@@ -11,6 +11,8 @@ from database.platform_features import reserve_payment_fingerprint, release_paym
 from handlers.official_links import build_official_links_keyboard
 logger = logging.getLogger(__name__)
 
+from database.payment_gateways import get_gateway_config, set_gateway_preferences
+
 from database.seller_subscriptions import (
     assign_plan_with_history, extend_plan_with_history, create_plan_request, create_seller_payment,
     current_plan_text, decide_seller_payment, delete_paid_plan, get_config,
@@ -70,14 +72,24 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if a=="sub_mgmt_plans":
         await q.edit_message_text("📋 Plan Manage\n\nFree and paid plan limits are dynamic. Paid plans always keep SaaS branding.", reply_markup=back()); return
     if a=="sub_mgmt_payment":
+        gateway_cfg=await get_gateway_config("owner",0,decrypt=True)
+        gateways=gateway_cfg.get("gateways") or {}
+        rz=gateways.get("razorpay") or {}
+        cf=gateways.get("cashfree") or {}
+        manual_enabled=bool(gateway_cfg.get("manual_enabled",True))
         qr_status="Added ✅" if cfg.get("payment_qr_file_id") else "Not Added ❌"
         await q.edit_message_text(
             f"💳 Owner Payment Settings\n\n"
+            f"{'✅' if rz.get('enabled') else '❌'} Razorpay: {'Enabled' if rz.get('enabled') else 'Disabled'} | Credentials: {'Added' if rz.get('key_id') and rz.get('key_secret') else 'Not added'}\n"
+            f"{'✅' if cf.get('enabled') else '❌'} Cashfree: {'Enabled' if cf.get('enabled') else 'Disabled'} | Credentials: {'Added' if cf.get('client_id') and cf.get('client_secret') else 'Not added'}\n"
+            f"{'✅' if manual_enabled else '❌'} Manual Payment: {'Enabled' if manual_enabled else 'Disabled'}\n"
+            f"Mode: LIVE\n\n"
             f"UPI ID: {cfg.get('payment_upi_id') or '-'}\n"
             f"UPI Name: {cfg.get('payment_upi_name') or '-'}\n"
             f"QR Code: {qr_status}",
             reply_markup=kb([
                 [InlineKeyboardButton("🌐 Automatic Payment Gateways", callback_data="pgcfg_owner_home")],
+                [InlineKeyboardButton(f"{'✅' if manual_enabled else '❌'} Manual Payment — {'ON' if manual_enabled else 'OFF'}", callback_data="sub_mgmt_manual_toggle")],
                 [InlineKeyboardButton("🏦 Set UPI ID", callback_data="sub_mgmt_payment_upi_id")],
                 [InlineKeyboardButton("👤 Set UPI Name", callback_data="sub_mgmt_payment_upi_name")],
                 [InlineKeyboardButton("🖼 Upload / Change QR", callback_data="sub_mgmt_payment_qr")],
@@ -86,6 +98,11 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("⬅ Back", callback_data="sub_mgmt_home")],
             ]),
         ); return
+    if a=="sub_mgmt_manual_toggle":
+        gateway_cfg=await get_gateway_config("owner",0,decrypt=True)
+        await set_gateway_preferences("owner",0,manual_enabled=not gateway_cfg.get("manual_enabled",True))
+        q.data="sub_mgmt_payment"
+        return await callback(update,context)
     if a=="sub_mgmt_payment_upi_id":
         context.user_data.clear(); context.user_data["sub_wait"]="payment_upi_id"
         await q.edit_message_text("🏦 Send Owner UPI ID", reply_markup=back("sub_mgmt_payment")); return

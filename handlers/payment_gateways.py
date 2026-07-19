@@ -26,14 +26,54 @@ def _scope_owner(update: Update, scope: str) -> int:
     return 0 if scope == "owner" else int(update.effective_user.id)
 
 
-def _home_keyboard(scope: str):
+def _status_icon(value: bool) -> str:
+    return "✅" if value else "❌"
+
+
+def _masked(value: str | None) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return "Not added"
+    if len(value) <= 8:
+        return "Added"
+    return f"Added (…{value[-4:]})"
+
+
+def _payment_header(scope: str, cfg: dict) -> str:
+    gateways = cfg.get("gateways") or {}
+    rz = gateways.get("razorpay") or {}
+    cf = gateways.get("cashfree") or {}
+    return (
+        f"💳 {'Owner' if scope == 'owner' else 'Seller'} Payment Settings\n\n"
+        f"{_status_icon(bool(rz.get('enabled')))} Razorpay: {'Enabled' if rz.get('enabled') else 'Disabled'}\n"
+        f"   Key ID: {_masked(rz.get('key_id'))}\n"
+        f"   Key Secret: {'Added' if rz.get('key_secret') else 'Not added'}\n"
+        f"{_status_icon(bool(cf.get('enabled')))} Cashfree: {'Enabled' if cf.get('enabled') else 'Disabled'}\n"
+        f"   Client ID: {_masked(cf.get('client_id'))}\n"
+        f"   Client Secret: {'Added' if cf.get('client_secret') else 'Not added'}\n"
+        f"{_status_icon(bool(cfg.get('manual_enabled', True)))} Manual Payment: "
+        f"{'Enabled' if cfg.get('manual_enabled', True) else 'Disabled'}\n\n"
+        "Automatic gateways always use LIVE mode."
+    )
+
+
+def _home_keyboard(scope: str, cfg: dict):
+    gateways = cfg.get("gateways") or {}
     rows = []
     for name, title in (("razorpay", "Razorpay"), ("cashfree", "Cashfree")):
-        rows.append([InlineKeyboardButton(f"💳 {title}", callback_data=f"pgcfg_{scope}_{name}")])
+        enabled = bool((gateways.get(name) or {}).get("enabled"))
+        rows.append([InlineKeyboardButton(
+            f"{'✅' if enabled else '❌'} {title}",
+            callback_data=f"pgcfg_{scope}_{name}",
+        )])
+    manual_enabled = bool(cfg.get("manual_enabled", True))
     rows += [
-        [InlineKeyboardButton("⚙ Default Gateway", callback_data=f"pgcfg_{scope}_default")],
+        [InlineKeyboardButton(
+            f"{'✅' if manual_enabled else '❌'} Manual Payment — {'ON' if manual_enabled else 'OFF'}",
+            callback_data=f"pgcfg_{scope}_manualtoggle",
+        )],
         [InlineKeyboardButton("📜 Gateway History", callback_data=f"pgcfg_{scope}_history")],
-        [InlineKeyboardButton("⬅ Back", callback_data="sub_mgmt_home" if scope == "owner" else "main_seller_dashboard")],
+        [InlineKeyboardButton("⬅ Back", callback_data="sub_mgmt_payment" if scope == "owner" else "main_seller_dashboard")],
     ]
     return _kb(rows)
 
@@ -41,12 +81,30 @@ def _home_keyboard(scope: str):
 def _gateway_keyboard(scope: str, gateway: str, enabled: bool):
     return _kb([
         [InlineKeyboardButton("⛔ Disable" if enabled else "✅ Enable", callback_data=f"pgcfg_{scope}_{gateway}_toggle")],
-        [InlineKeyboardButton("🔑 Set Credentials", callback_data=f"pgcfg_{scope}_{gateway}_credentials")],
+        [InlineKeyboardButton("🔑 Set / Replace Credentials", callback_data=f"pgcfg_{scope}_{gateway}_credentials")],
         [InlineKeyboardButton("✅ Test Connection", callback_data=f"pgcfg_{scope}_{gateway}_test")],
-        [InlineKeyboardButton("🧪 Test Mode", callback_data=f"pgcfg_{scope}_{gateway}_mode_test"), InlineKeyboardButton("🚀 Live Mode", callback_data=f"pgcfg_{scope}_{gateway}_mode_live")],
         [InlineKeyboardButton("⬅ Back", callback_data=f"pgcfg_{scope}_home")],
     ])
 
+
+def _gateway_header(scope: str, gateway: str, gcfg: dict) -> str:
+    if gateway == "razorpay":
+        credential_lines = (
+            f"Key ID: {_masked(gcfg.get('key_id'))}\n"
+            f"Key Secret: {'Added' if gcfg.get('key_secret') else 'Not added'}\n"
+            f"Webhook Secret: {'Added' if gcfg.get('webhook_secret') else 'Not added'}"
+        )
+    else:
+        credential_lines = (
+            f"Client ID: {_masked(gcfg.get('client_id'))}\n"
+            f"Client Secret: {'Added' if gcfg.get('client_secret') else 'Not added'}"
+        )
+    return (
+        f"💳 {gateway.title()} — {'Owner' if scope == 'owner' else 'Seller'}\n\n"
+        f"Status: {'Enabled ✅' if gcfg.get('enabled') else 'Disabled ❌'}\n"
+        "Mode: LIVE 🚀\n"
+        f"{credential_lines}"
+    )
 
 def _credential_help(gateway: str) -> str:
     return {
@@ -72,28 +130,23 @@ async def gateway_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = await get_gateway_config(scope, owner_id, decrypt=True)
 
     if action == "home":
-        enabled = [g for g in SUPPORTED_GATEWAYS if (cfg.get("gateways") or {}).get(g, {}).get("enabled")]
         await q.edit_message_text(
-            f"💳 {'Owner' if scope == 'owner' else 'Seller'} Payment Gateways\n\n"
-            f"Default: {cfg.get('default_gateway', 'manual').title()}\n"
-            f"Manual payment: {'Enabled' if cfg.get('manual_enabled', True) else 'Disabled'}\n"
-            f"Enabled: {', '.join(x.title() for x in enabled) or 'None'}",
-            reply_markup=_home_keyboard(scope),
+            _payment_header(scope, cfg),
+            reply_markup=_home_keyboard(scope, cfg),
         )
         return
 
+    # Old callback kept for compatibility; the Default/Manual page has been removed.
     if action == "default":
-        rows = [[InlineKeyboardButton("Manual Screenshot", callback_data=f"pgcfg_{scope}_setdefault_manual")]]
-        for gateway in SUPPORTED_GATEWAYS:
-            rows.append([InlineKeyboardButton(gateway.title(), callback_data=f"pgcfg_{scope}_setdefault_{gateway}")])
-        rows.append([InlineKeyboardButton("🔄 Manual On/Off", callback_data=f"pgcfg_{scope}_manualtoggle")])
-        rows.append([InlineKeyboardButton("⬅ Back", callback_data=f"pgcfg_{scope}_home")])
-        await q.edit_message_text("⚙ Choose default payment method", reply_markup=_kb(rows))
+        await q.edit_message_text(
+            _payment_header(scope, cfg),
+            reply_markup=_home_keyboard(scope, cfg),
+        )
         return
 
     if action == "manualtoggle":
-        await set_gateway_preferences(scope, owner_id, manual_enabled=not cfg.get("manual_enabled", True))
-        await q.edit_message_text("✅ Manual payment setting updated.", reply_markup=_home_keyboard(scope))
+        cfg = await set_gateway_preferences(scope, owner_id, manual_enabled=not cfg.get("manual_enabled", True))
+        await q.edit_message_text(_payment_header(scope, cfg), reply_markup=_home_keyboard(scope, cfg))
         return
 
     if action.startswith("setdefault_"):
@@ -120,14 +173,8 @@ async def gateway_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     suffix = action[len(gateway):].lstrip("_")
 
     if not suffix:
-        masked = []
-        for key, value in gcfg.items():
-            if key in {"key_secret", "webhook_secret", "client_secret", "webhook_password", "merchant_key"}:
-                masked.append(f"{key}: {'Set' if value else 'Not set'}")
-            elif key not in {"enabled"}:
-                masked.append(f"{key}: {value}")
         await q.edit_message_text(
-            f"💳 {gateway.title()}\n\nStatus: {'Enabled' if gcfg.get('enabled') else 'Disabled'}\nMode: {gcfg.get('mode','test').title()}\n" + ("\n".join(masked) if masked else "Credentials not configured"),
+            _gateway_header(scope, gateway, gcfg),
             reply_markup=_gateway_keyboard(scope, gateway, bool(gcfg.get("enabled"))),
         )
         return
@@ -138,14 +185,15 @@ async def gateway_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             missing = ", ".join(gateway_missing_fields(gateway, gcfg))
             await q.answer(f"Set credentials first: {missing}", show_alert=True)
             return
-        await save_gateway_config(scope, owner_id, gateway, {"enabled": enable})
-        await q.edit_message_text("✅ Gateway status updated.", reply_markup=_home_keyboard(scope))
+        cfg = await save_gateway_config(scope, owner_id, gateway, {"enabled": enable, "mode": "live"})
+        gcfg = (cfg.get("gateways") or {}).get(gateway) or {}
+        await q.edit_message_text(_gateway_header(scope, gateway, gcfg), reply_markup=_gateway_keyboard(scope, gateway, enable))
         return
 
     if suffix.startswith("mode_"):
-        mode = suffix.replace("mode_", "")
-        await save_gateway_config(scope, owner_id, gateway, {"mode": mode})
-        await q.edit_message_text(f"✅ {gateway.title()} mode set to {mode.title()}.", reply_markup=_home_keyboard(scope))
+        cfg = await save_gateway_config(scope, owner_id, gateway, {"mode": "live"})
+        gcfg = (cfg.get("gateways") or {}).get(gateway) or {}
+        await q.edit_message_text(_gateway_header(scope, gateway, gcfg), reply_markup=_gateway_keyboard(scope, gateway, bool(gcfg.get("enabled"))))
         return
 
     if suffix == "test":
@@ -153,7 +201,7 @@ async def gateway_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = await test_gateway_connection(scope, owner_id, gateway)
             await q.edit_message_text(
                 f"✅ {gateway.title()} connection successful.\n\n"
-                f"Mode: {result.get('mode', 'test').title()}\n"
+                "Mode: LIVE\n"
                 f"Account/API access verified.",
                 reply_markup=_gateway_keyboard(scope, gateway, bool(gcfg.get("enabled"))),
             )
@@ -185,16 +233,17 @@ async def gateway_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             payload = {"client_id": values[0], "client_secret": values[1]}
         else:
             raise ValueError("Invalid format")
-        await save_gateway_config(state["scope"], state["owner_id"], gateway, payload)
+        cfg = await save_gateway_config(state["scope"], state["owner_id"], gateway, {**payload, "mode": "live"})
         context.user_data.pop("pgcfg_wait", None)
         try:
             await update.effective_message.delete()
         except Exception:
             pass
+        gcfg = (cfg.get("gateways") or {}).get(gateway) or {}
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="✅ Gateway credentials saved securely. For safety, the credentials message was removed where Telegram allowed it.",
-            reply_markup=_home_keyboard(state["scope"]),
+            text=_gateway_header(state["scope"], gateway, gcfg),
+            reply_markup=_gateway_keyboard(state["scope"], gateway, bool(gcfg.get("enabled"))),
         )
     except Exception as exc:
         await update.effective_message.reply_text(f"❌ Could not save: {exc}\n\n{_credential_help(gateway)}")
