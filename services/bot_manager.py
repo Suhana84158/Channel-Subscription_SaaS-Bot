@@ -1801,13 +1801,8 @@ class SellerBotManager:
                 f"Status: {'Enabled ✅' if g.get('enabled') else 'Disabled ❌'}\n"
                 f"Mode: LIVE 🚀\n{credentials}",
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⛔ Disable" if g.get('enabled') else "✅ Enable",callback_data=f"a_pg_toggle_{gateway}")]]
-                    + ([[InlineKeyboardButton("🆔 Set App ID",callback_data="a_pg_field_cashfree_client_id")],
-                        [InlineKeyboardButton("🔐 Set Secret Key",callback_data="a_pg_field_cashfree_client_secret")]] if gateway=="cashfree" else
-                       [[InlineKeyboardButton("🆔 Set Key ID",callback_data="a_pg_field_razorpay_key_id")],
-                        [InlineKeyboardButton("🔐 Set Key Secret",callback_data="a_pg_field_razorpay_key_secret")],
-                        [InlineKeyboardButton("🪝 Set Webhook Secret",callback_data="a_pg_field_razorpay_webhook_secret")]])
-                    + [[InlineKeyboardButton("📋 Enter All Credentials Together",callback_data=f"a_pg_creds_{gateway}")],
+                    [[InlineKeyboardButton("⛔ Disable" if g.get('enabled') else "✅ Enable",callback_data=f"a_pg_toggle_{gateway}")],
+                     [InlineKeyboardButton("🔐 Set / Replace Credentials",callback_data=f"a_pg_creds_{gateway}")],
                        [InlineKeyboardButton("✅ Test Connection",callback_data=f"a_pg_testconn_{gateway}")],
                        [InlineKeyboardButton("⬅ Back",callback_data="a_pg_home")]]
                 ),
@@ -1820,9 +1815,8 @@ class SellerBotManager:
             await save_gateway_config("seller",owner,gateway,{"enabled":enable,"mode":"live"})
             cfg=await get_gateway_config("seller",owner,decrypt=True); g=(cfg.get("gateways") or {}).get(gateway,{})
             credentials=((f"Key ID: {'Added' if g.get('key_id') else 'Not added'}\nKey Secret: {'Added' if g.get('key_secret') else 'Not added'}\nWebhook Secret: {'Added' if g.get('webhook_secret') else 'Not added'}") if gateway=="razorpay" else (f"Client ID: {'Added' if g.get('client_id') else 'Not added'}\nClient Secret: {'Added' if g.get('client_secret') else 'Not added'}"))
-            buttons=[[InlineKeyboardButton("⛔ Disable" if g.get('enabled') else "✅ Enable",callback_data=f"a_pg_toggle_{gateway}")]]
-            buttons += ([[InlineKeyboardButton("🆔 Set App ID",callback_data="a_pg_field_cashfree_client_id")],[InlineKeyboardButton("🔐 Set Secret Key",callback_data="a_pg_field_cashfree_client_secret")]] if gateway=="cashfree" else [[InlineKeyboardButton("🆔 Set Key ID",callback_data="a_pg_field_razorpay_key_id")],[InlineKeyboardButton("🔐 Set Key Secret",callback_data="a_pg_field_razorpay_key_secret")],[InlineKeyboardButton("🪝 Set Webhook Secret",callback_data="a_pg_field_razorpay_webhook_secret")]])
-            buttons += [[InlineKeyboardButton("📋 Enter All Credentials Together",callback_data=f"a_pg_creds_{gateway}")],[InlineKeyboardButton("✅ Test Connection",callback_data=f"a_pg_testconn_{gateway}")],[InlineKeyboardButton("⬅ Back",callback_data="a_pg_home")]]
+            buttons=[[InlineKeyboardButton("⛔ Disable" if g.get('enabled') else "✅ Enable",callback_data=f"a_pg_toggle_{gateway}")],
+                     [InlineKeyboardButton("🔐 Set / Replace Credentials",callback_data=f"a_pg_creds_{gateway}")],[InlineKeyboardButton("✅ Test Connection",callback_data=f"a_pg_testconn_{gateway}")],[InlineKeyboardButton("⬅ Back",callback_data="a_pg_home")]]
             await q.edit_message_text(f"💳 {gateway.title()}\n\nStatus: {'Enabled ✅' if g.get('enabled') else 'Disabled ❌'}\nMode: LIVE 🚀\n{credentials}",reply_markup=InlineKeyboardMarkup(buttons)); return
         if a.startswith("a_pg_testconn_"):
             gateway=a.replace("a_pg_testconn_","")
@@ -1852,8 +1846,19 @@ class SellerBotManager:
         if a=="a_pg_default":
             q.data="a_pg_home"; return await self.callback(update,context)
         if a=="a_pg_manualtoggle":
-            cfg=await get_gateway_config("seller",owner,decrypt=True); await set_gateway_preferences("seller",owner,manual_enabled=not cfg.get("manual_enabled",True))
-            q.data="a_payment"; return await self.callback(update,context)
+            cfg=await get_gateway_config("seller",owner,decrypt=True)
+            current=bool(cfg.get("manual_enabled",True))
+            await set_gateway_preferences("seller",owner,manual_enabled=not current)
+            s=await get_seller_settings(owner)
+            cfg=await get_gateway_config("seller",owner,decrypt=True)
+            gateways=cfg.get("gateways") or {}; rz=gateways.get("razorpay") or {}; cf=gateways.get("cashfree") or {}; manual=bool(cfg.get("manual_enabled",True))
+            text=(f"💳 Payment Settings\n\n"
+                  f"{'✅' if rz.get('enabled') else '❌'} Razorpay: {'Enabled' if rz.get('enabled') else 'Disabled'} | Credentials: {'Added' if rz.get('key_id') and rz.get('key_secret') else 'Not added'}\n"
+                  f"{'✅' if cf.get('enabled') else '❌'} Cashfree: {'Enabled' if cf.get('enabled') else 'Disabled'} | Credentials: {'Added' if cf.get('client_id') and cf.get('client_secret') else 'Not added'}\n"
+                  f"{'✅' if manual else '❌'} Manual Payment: {'Enabled' if manual else 'Disabled'}\n"
+                  f"Mode: LIVE\n\n"
+                  f"UPI Name: {s.get('upi_name') or 'Not Set'}\nUPI ID: {s.get('upi_id') or 'Not Set'}\nQR: {'Added' if s.get('upi_qr_file_id') else 'Not Added'}")
+            await q.edit_message_text(text,reply_markup=self.payment_menu(cfg)); return
         if a.startswith("a_pg_setdefault_"):
             q.data="a_pg_home"; return await self.callback(update,context)
         if a=="a_pg_history":
