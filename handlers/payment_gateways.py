@@ -7,6 +7,8 @@ from database.admins import is_admin
 from database.payment_gateways import (
     SUPPORTED_GATEWAYS,
     create_gateway_transaction,
+    gateway_is_ready,
+    gateway_missing_fields,
     gateway_history,
     get_gateway_config,
     save_gateway_config,
@@ -26,7 +28,7 @@ def _scope_owner(update: Update, scope: str) -> int:
 
 def _home_keyboard(scope: str):
     rows = []
-    for name, title in (("razorpay", "Razorpay"), ("cashfree", "Cashfree"), ("phonepe", "PhonePe PG"), ("paytm", "Paytm PG")):
+    for name, title in (("razorpay", "Razorpay"), ("cashfree", "Cashfree")):
         rows.append([InlineKeyboardButton(f"💳 {title}", callback_data=f"pgcfg_{scope}_{name}")])
     rows += [
         [InlineKeyboardButton("⚙ Default Gateway", callback_data=f"pgcfg_{scope}_default")],
@@ -48,10 +50,8 @@ def _gateway_keyboard(scope: str, gateway: str, enabled: bool):
 
 def _credential_help(gateway: str) -> str:
     return {
-        "razorpay": "Send:\nKEY_ID | KEY_SECRET | WEBHOOK_SECRET",
-        "cashfree": "Send:\nCLIENT_ID | CLIENT_SECRET",
-        "phonepe": "Send:\nCLIENT_ID | CLIENT_VERSION | CLIENT_SECRET | WEBHOOK_USERNAME | WEBHOOK_PASSWORD",
-        "paytm": "Send:\nMID | MERCHANT_KEY | WEBSITE_NAME",
+        "razorpay": "Send in one message:\nKEY_ID | KEY_SECRET | WEBHOOK_SECRET",
+        "cashfree": "Send in one message:\nAPP_ID | SECRET_KEY",
     }[gateway]
 
 
@@ -133,7 +133,12 @@ async def gateway_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if suffix == "toggle":
-        await save_gateway_config(scope, owner_id, gateway, {"enabled": not bool(gcfg.get("enabled"))})
+        enable = not bool(gcfg.get("enabled"))
+        if enable and not gateway_is_ready(gateway, gcfg):
+            missing = ", ".join(gateway_missing_fields(gateway, gcfg))
+            await q.answer(f"Set credentials first: {missing}", show_alert=True)
+            return
+        await save_gateway_config(scope, owner_id, gateway, {"enabled": enable})
         await q.edit_message_text("✅ Gateway status updated.", reply_markup=_home_keyboard(scope))
         return
 
@@ -178,15 +183,19 @@ async def gateway_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             payload = {"key_id": values[0], "key_secret": values[1], "webhook_secret": values[2]}
         elif gateway == "cashfree" and len(values) == 2:
             payload = {"client_id": values[0], "client_secret": values[1]}
-        elif gateway == "phonepe" and len(values) == 5:
-            payload = {"client_id": values[0], "client_version": values[1], "client_secret": values[2], "webhook_username": values[3], "webhook_password": values[4]}
-        elif gateway == "paytm" and len(values) == 3:
-            payload = {"mid": values[0], "merchant_key": values[1], "website_name": values[2]}
         else:
             raise ValueError("Invalid format")
         await save_gateway_config(state["scope"], state["owner_id"], gateway, payload)
         context.user_data.pop("pgcfg_wait", None)
-        await update.effective_message.reply_text("✅ Gateway credentials saved securely.", reply_markup=_home_keyboard(state["scope"]))
+        try:
+            await update.effective_message.delete()
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="✅ Gateway credentials saved securely. For safety, the credentials message was removed where Telegram allowed it.",
+            reply_markup=_home_keyboard(state["scope"]),
+        )
     except Exception as exc:
         await update.effective_message.reply_text(f"❌ Could not save: {exc}\n\n{_credential_help(gateway)}")
 
