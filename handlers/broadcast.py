@@ -18,7 +18,9 @@ from database.platform_features import (
     broadcast_cancel_requested,
     create_broadcast_run,
     finalize_broadcast_run,
+    finish_broadcast_delivery,
     request_broadcast_cancel,
+    reserve_broadcast_delivery,
     update_broadcast_progress,
 )
 
@@ -244,7 +246,23 @@ async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     stats["processed"] += 1
                     continue
 
+                reserved = await reserve_broadcast_delivery(
+                    broadcast_id,
+                    chat_id,
+                )
+                if not reserved:
+                    # Another overlapping execution already claimed this user.
+                    # Count it as processed without sending a duplicate message.
+                    stats["skipped"] += 1
+                    stats["processed"] += 1
+                    continue
+
                 result = await _send_with_retry(context.bot, chat_id, msg)
+                await finish_broadcast_delivery(
+                    broadcast_id,
+                    chat_id,
+                    result,
+                )
                 stats[result] += 1
                 stats["processed"] += 1
 
