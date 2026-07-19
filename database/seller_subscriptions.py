@@ -203,7 +203,7 @@ async def plan_limit_warning(owner_id: int):
     return (
         f"⚠️ {name} Plan Limit Reached\n\n"
         f"Your {name} plan supports:\n\n"
-        f"• {_limit_text(plan.get('bot_limit', 1))} Child Bot"
+        f"• {_limit_text(plan.get('bot_limit', 1))} Clone Bot"
         f"{'s' if int(plan.get('bot_limit', 1) or 0) != 1 else ''}\n"
         f"• {_limit_text(plan.get('active_subscriber_limit', 25))} Active Subscribers\n"
         f"• {_limit_text(plan.get('channel_limit', 1))} Channel/Group"
@@ -214,9 +214,9 @@ async def plan_limit_warning(owner_id: int):
 
 
 async def seller_usage(owner_id: int):
-    from database.seller_bots import get_bot
+    from database.seller_bots import count_owner_bots
     from database.seller_data import active_subscriptions, get_channels, get_plans
-    bot_count = 1 if await get_bot(owner_id) else 0
+    bot_count = await count_owner_bots(owner_id)
     return {
         "bot_count": bot_count,
         "active_subscriber_count": len(await active_subscriptions(owner_id)),
@@ -243,7 +243,7 @@ async def current_plan_text(owner_id: int):
         "📊 Current Seller Plan\n\n"
         f"Plan: {plan.get('name', 'Free')}\n\n"
         "Usage\n\n"
-        f"{row('🤖 Child Bots', usage['bot_count'], 'bot_limit')}\n"
+        f"{row('🤖 Clone Bots', usage['bot_count'], 'bot_limit')}\n"
         f"{row('👥 Active Subscribers', usage['active_subscriber_count'], 'active_subscriber_limit')}\n"
         f"{row('📢 Channels/Groups', usage['channel_count'], 'channel_limit')}\n"
         f"{row('📦 Subscription Plans', usage['plan_count'], 'plan_limit')}\n\n"
@@ -475,7 +475,7 @@ async def usage_warning(owner_id: int, threshold=0.8):
     plan, _ = await effective_plan(owner_id)
     usage = await seller_usage(owner_id)
     checks = [
-        ("Child Bots", usage["bot_count"], plan.get("bot_limit", 1)),
+        ("Clone Bots", usage["bot_count"], plan.get("bot_limit", 1)),
         ("Active Subscribers", usage["active_subscriber_count"], plan.get("active_subscriber_limit", 25)),
         ("Channels/Groups", usage["channel_count"], plan.get("channel_limit", 1)),
         ("Subscription Plans", usage["plan_count"], plan.get("plan_limit", 2)),
@@ -488,6 +488,50 @@ async def usage_warning(owner_id: int, threshold=0.8):
             warnings.append(f"• {label}: {used:,} / {limit:,} ({int(used/limit*100)}%)")
     if not warnings: return None
     return "⚠️ Plan Usage Warning\n\n" + "\n".join(warnings) + "\n\nUpgrade before reaching the limit."
+
+async def bot_runtime_allowed(owner_id: int, bot_id: int):
+    """Return whether this clone bot is inside the seller plan's runtime quota.
+
+    Bots are ranked by creation time, then bot_id, so the decision is stable
+    across restarts. A negative limit means unlimited.
+    """
+    from database.seller_bots import get_bots
+
+    owner_id = int(owner_id)
+    bot_id = int(bot_id)
+    plan, _ = await effective_plan(owner_id)
+    try:
+        limit = int(plan.get("bot_limit", 1))
+    except (TypeError, ValueError):
+        limit = 1
+
+    if limit < 0:
+        return True, {"limit": limit, "position": 1, "plan": plan}
+    if limit == 0:
+        return False, {"limit": 0, "position": None, "plan": plan}
+
+    records = await get_bots(owner_id)
+    records = sorted(
+        records,
+        key=lambda item: (item.get("created_at") or datetime.min.replace(tzinfo=timezone.utc), int(item.get("bot_id", 0))),
+    )
+    for position, record in enumerate(records, start=1):
+        if int(record.get("bot_id", 0)) == bot_id:
+            return position <= limit, {"limit": limit, "position": position, "plan": plan}
+
+    return False, {"limit": limit, "position": None, "plan": plan}
+
+
+def validate_plan_limits(*values: int):
+    """Validate owner-configured limits. -1 means unlimited; lower values are invalid."""
+    parsed = []
+    for value in values:
+        number = int(value)
+        if number < -1:
+            raise ValueError("Limits must be -1 (Unlimited), 0, or a positive number")
+        parsed.append(number)
+    return parsed
+
 
 async def expiring_assignments(days_ahead: int = 8):
     now = datetime.now(timezone.utc)
