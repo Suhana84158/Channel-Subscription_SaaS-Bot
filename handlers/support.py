@@ -1,6 +1,8 @@
+import html
 import logging
 
 from telegram import ForceReply, Update
+from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError
 from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
@@ -22,7 +24,7 @@ from database.live_support import (
 logger = logging.getLogger(__name__)
 
 WAIT_SUPPORT = 1
-SUPPORT_REPLY_MAP = {}
+SUPPORT_REPLY_MAP: dict[tuple[int, int], int] = {}
 MAIN_SUPPORT_OWNER_ID = 0
 
 
@@ -38,12 +40,27 @@ async def _admin_ids() -> set[int]:
     return ids
 
 
+def _user_label(update: Update) -> str:
+    user = update.effective_user
+    if not user:
+        return "Unknown user"
+    name = html.escape(user.full_name or user.first_name or "Unknown")
+    username = f"@{html.escape(user.username)}" if user.username else "None"
+    return (
+        "📞 <b>NEW SUPPORT REQUEST</b>\n\n"
+        f"👤 User: {name}\n"
+        f"🆔 User ID: <code>{user.id}</code>\n"
+        f"📛 Username: {username}\n\n"
+        "Reply to this message to answer the user."
+    )
+
+
 async def support_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
-        "📞 *Support*\n\nPlease send your problem.\n\nAdmin will reply soon.",
-        parse_mode="Markdown",
+        "📞 <b>Support</b>\n\nSend your problem, photo, video, document or voice message.\n\nAdmin will reply soon.",
+        parse_mode="HTML",
     )
     return WAIT_SUPPORT
 
@@ -51,56 +68,70 @@ async def support_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_support_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
-    if not user or not message:
+    chat = update.effective_chat
+    if not user or not message or not chat:
         return ConversationHandler.END
 
     receipt = await claim_support_delivery(
         MAIN_SUPPORT_OWNER_ID,
         "user_to_admin",
-        update.effective_chat.id,
+        chat.id,
         message.message_id,
     )
     if not receipt:
         await message.reply_text("✅ Your support request was already sent.")
         return ConversationHandler.END
 
-    body = message.text or message.caption or "[Media message]"
-    text = (
-        "📞 NEW SUPPORT REQUEST\n\n"
-        f"👤 User: {user.first_name}\n"
-        f"🆔 User ID: {user.id}\n"
-        f"📛 Username: @{user.username if user.username else 'None'}\n\n"
-        f"💬 Message:\n{body}"
-    )
-
     sent = 0
+    failed_admins: list[int] = []
     try:
         for admin_id in await _admin_ids():
             try:
-                admin_msg = await context.bot.send_message(
+                header = await context.bot.send_message(
                     chat_id=admin_id,
-                    text=text,
+                    text=_user_label(update),
+                    parse_mode="HTML",
                     reply_markup=ForceReply(selective=True),
                 )
-                # Preserve photos, documents, video, voice and other Telegram media.
-                if not message.text:
-                    await context.bot.copy_message(
-                        chat_id=admin_id,
-                        from_chat_id=message.chat_id,
-                        message_id=message.message_id,
-                    )
-                key = (int(admin_id), int(admin_msg.message_id))
+
+                # Keep the mapping on the header because admins reply to it.
+                key = (int(admin_id), int(header.message_id))
                 SUPPORT_REPLY_MAP[key] = int(user.id)
                 await save_private_message_link(
                     owner_id=MAIN_SUPPORT_OWNER_ID,
                     admin_chat_id=admin_id,
-                    admin_message_id=admin_msg.message_id,
+                    admin_message_id=header.message_id,
                     user_id=user.id,
                 )
+
+                # Copy preserves supported Telegram media without downloading it.
+                await context.bot.copy_message(
+                    chat_id=admin_id,
+                    from_chat_id=chat.id,
+                    message_id=message.message_id,
+                    reply_to_message_id=header.message_id,
+                )
                 sent += 1
+            except (Forbidden, BadRequest) as exc:
+                failed_admins.append(int(admin_id))
+                logger.warning(
+                    "Support delivery rejected admin_id=%s user_id=%s error=%s",
+                    admin_id,
+                    user.id,
+                    exc,
+                )
+            except (NetworkError, TelegramError) as exc:
+                failed_admins.append(int(admin_id))
+                logger.warning(
+                    "Support delivery failed admin_id=%s user_id=%s error=%s",
+                    admin_id,
+                    user.id,
+                    exc,
+                )
             except Exception:
+                failed_admins.append(int(admin_id))
                 logger.exception(
-                    "Failed to forward support request admin_id=%s user_id=%s",
+                    "Unexpected support delivery error admin_id=%s user_id=%s",
                     admin_id,
                     user.id,
                 )
@@ -109,7 +140,10 @@ async def receive_support_message(update: Update, context: ContextTypes.DEFAULT_
             raise RuntimeError("No support admin received the request")
 
         await complete_support_delivery(
-            receipt["_id"], user_id=user.id, delivered_admin_count=sent
+            receipt["_id"],
+            user_id=user.id,
+            delivered_admin_count=sent,
+            failed_admin_ids=failed_admins,
         )
         await message.reply_text("✅ Your support request has been sent.")
     except Exception as exc:
@@ -121,14 +155,15 @@ async def receive_support_message(update: Update, context: ContextTypes.DEFAULT_
 
 async def admin_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
-    if not message or not message.reply_to_message:
+    chat = update.effective_chat
+    if not message or not chat or not message.reply_to_message:
         return
 
     admin_id = update.effective_user.id if update.effective_user else 0
     if admin_id not in await _admin_ids():
         return
 
-    admin_chat_id = int(update.effective_chat.id)
+    admin_chat_id = int(chat.id)
     replied_id = int(message.reply_to_message.message_id)
     cache_key = (admin_chat_id, replied_id)
     user_id = SUPPORT_REPLY_MAP.get(cache_key)
@@ -161,22 +196,40 @@ async def admin_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     try:
-        if message.text:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="📞 Admin Reply\n\n" + message.text,
-            )
-        else:
-            await context.bot.send_message(chat_id=user_id, text="📞 Admin Reply")
-            await context.bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=message.chat_id,
-                message_id=message.message_id,
-            )
-        await complete_support_delivery(receipt["_id"], user_id=user_id, admin_id=admin_id)
+        label = await context.bot.send_message(
+            chat_id=user_id,
+            text="📞 <b>Admin Reply</b>",
+            parse_mode="HTML",
+        )
+        await context.bot.copy_message(
+            chat_id=user_id,
+            from_chat_id=admin_chat_id,
+            message_id=message.message_id,
+            reply_to_message_id=label.message_id,
+        )
+        await complete_support_delivery(
+            receipt["_id"], user_id=user_id, admin_id=admin_id
+        )
         await message.reply_text("✅ Reply sent to user.")
+    except Forbidden as exc:
+        logger.warning("User blocked bot user_id=%s error=%s", user_id, exc)
+        await fail_support_delivery(receipt["_id"], f"user_forbidden: {exc}")
+        await message.reply_text("❌ User has blocked the bot or cannot receive messages.")
+    except (BadRequest, NetworkError, TelegramError) as exc:
+        logger.warning(
+            "Failed to deliver support reply admin_id=%s user_id=%s error=%s",
+            admin_id,
+            user_id,
+            exc,
+        )
+        await fail_support_delivery(receipt["_id"], str(exc))
+        await message.reply_text("❌ Failed to send reply. Please try again.")
     except Exception as exc:
-        logger.exception("Failed to deliver support reply admin_id=%s user_id=%s", admin_id, user_id)
+        logger.exception(
+            "Unexpected support reply error admin_id=%s user_id=%s",
+            admin_id,
+            user_id,
+        )
         await fail_support_delivery(receipt["_id"], str(exc))
         await message.reply_text("❌ Failed to send reply. Please try again.")
 
@@ -190,6 +243,7 @@ def support_callback():
             ]
         },
         fallbacks=[],
+        allow_reentry=True,
     )
 
 
