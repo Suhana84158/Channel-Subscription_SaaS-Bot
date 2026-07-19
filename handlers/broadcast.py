@@ -5,7 +5,7 @@ from telegram import Update
 from telegram.ext import CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
 from database.admins import is_admin
-from database.broadcast import create_run, get_run, request_cancel
+from database.broadcast import create_run, get_latest_run_for_owner, get_run, request_cancel
 from database.users import users_collection
 from services.broadcast_service import start_broadcast_task
 
@@ -53,6 +53,10 @@ async def cancel_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     broadcast_id = _active.get(user.id)
     if not broadcast_id:
+        latest = await get_latest_run_for_owner(user.id)
+        if latest and latest.get("status") in {"pending", "processing"}:
+            broadcast_id = latest["broadcast_id"]
+    if not broadcast_id:
         await message.reply_text("ℹ️ No active broadcast found.")
         return ConversationHandler.END
     changed = await request_cancel(broadcast_id, user.id)
@@ -65,6 +69,9 @@ async def broadcast_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not message or not await is_admin(user.id):
         return
     broadcast_id = _active.get(user.id)
+    if not broadcast_id:
+        latest = await get_latest_run_for_owner(user.id)
+        broadcast_id = latest.get("broadcast_id") if latest else None
     if not broadcast_id:
         await message.reply_text("ℹ️ No recent broadcast found.")
         return

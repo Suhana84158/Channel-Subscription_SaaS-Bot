@@ -21,7 +21,7 @@ async def statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         text = await build_platform_statistics_text()
-        await message.reply_text(text=text, parse_mode="Markdown")
+        await message.reply_text(text=text, parse_mode="HTML")
     except Exception:
         logger.exception("Failed to build platform statistics")
         await message.reply_text("❌ Statistics load nahi ho payi. Please try again.")

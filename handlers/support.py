@@ -64,7 +64,7 @@ async def receive_support_message(update: Update, context: ContextTypes.DEFAULT_
         await message.reply_text("✅ Your support request was already sent.")
         return ConversationHandler.END
 
-    body = message.text or message.caption or "[Unsupported/empty message]"
+    body = message.text or message.caption or "[Media message]"
     text = (
         "📞 NEW SUPPORT REQUEST\n\n"
         f"👤 User: {user.first_name}\n"
@@ -82,6 +82,13 @@ async def receive_support_message(update: Update, context: ContextTypes.DEFAULT_
                     text=text,
                     reply_markup=ForceReply(selective=True),
                 )
+                # Preserve photos, documents, video, voice and other Telegram media.
+                if not message.text:
+                    await context.bot.copy_message(
+                        chat_id=admin_id,
+                        from_chat_id=message.chat_id,
+                        message_id=message.message_id,
+                    )
                 key = (int(admin_id), int(admin_msg.message_id))
                 SUPPORT_REPLY_MAP[key] = int(user.id)
                 await save_private_message_link(
@@ -154,12 +161,18 @@ async def admin_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     try:
-        body = message.text or message.caption or ""
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="📞 *Admin Reply*\n\n" + body,
-            parse_mode="Markdown",
-        )
+        if message.text:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="📞 Admin Reply\n\n" + message.text,
+            )
+        else:
+            await context.bot.send_message(chat_id=user_id, text="📞 Admin Reply")
+            await context.bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+            )
         await complete_support_delivery(receipt["_id"], user_id=user_id, admin_id=admin_id)
         await message.reply_text("✅ Reply sent to user.")
     except Exception as exc:
@@ -173,7 +186,7 @@ def support_callback():
         entry_points=[CallbackQueryHandler(support_handler, pattern="^support$")],
         states={
             WAIT_SUPPORT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_support_message)
+                MessageHandler(filters.ALL & ~filters.COMMAND, receive_support_message)
             ]
         },
         fallbacks=[],
@@ -181,4 +194,4 @@ def support_callback():
 
 
 def support_reply_handler():
-    return MessageHandler(filters.TEXT & filters.REPLY, admin_reply_handler)
+    return MessageHandler(filters.REPLY & ~filters.COMMAND, admin_reply_handler)

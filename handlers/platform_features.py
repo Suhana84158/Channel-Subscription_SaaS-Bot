@@ -21,6 +21,7 @@ from database.performance import database_ping_ms, initialize_performance_indexe
 from utils.performance import performance_runtime
 
 _PROCESS_STARTED_AT = datetime.now(timezone.utc)
+_BACKUP_RESTORE_LOCK_KEY = "backup_restore_in_progress"
 
 
 def back() -> InlineKeyboardMarkup:
@@ -444,7 +445,12 @@ async def owner_backup_document(update: Update, context: ContextTypes.DEFAULT_TY
         await message.reply_text("❌ Backup is larger than the 20 MB safety limit.")
         return
 
+    if context.user_data.get(_BACKUP_RESTORE_LOCK_KEY):
+        await message.reply_text("⏳ A backup restore is already running.")
+        return
+
     context.user_data.pop("awaiting_backup_restore", None)
+    context.user_data[_BACKUP_RESTORE_LOCK_KEY] = True
     status = await message.reply_text("⏳ Verifying and restoring backup…")
     try:
         telegram_file = await context.bot.get_file(message.document.file_id)
@@ -455,6 +461,8 @@ async def owner_backup_document(update: Update, context: ContextTypes.DEFAULT_TY
         await audit("backup_restore_failed", actor_id=user.id, details={"error": str(exc)[:300], "filename": filename})
         await status.edit_text(f"❌ Restore rejected: {exc}")
         return
+    finally:
+        context.user_data.pop(_BACKUP_RESTORE_LOCK_KEY, None)
 
     await audit("backup_restored", actor_id=user.id, details={**result, "filename": filename})
     await status.edit_text(
