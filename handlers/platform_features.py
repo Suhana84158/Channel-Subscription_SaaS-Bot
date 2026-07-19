@@ -21,7 +21,6 @@ from database.performance import database_ping_ms, initialize_performance_indexe
 from utils.performance import performance_runtime
 
 _PROCESS_STARTED_AT = datetime.now(timezone.utc)
-_BACKUP_RESTORE_LOCK_KEY = "backup_restore_in_progress"
 
 
 def back() -> InlineKeyboardMarkup:
@@ -240,7 +239,7 @@ async def _health_snapshot(context: ContextTypes.DEFAULT_TYPE) -> tuple[str, lis
             "running_clone_bots": running_count,
         },
     )
-    history = await get_health_summary(24)
+    history = await get_health_summary(24, source="http_health")
     availability = history.get("availability_percent")
     availability_text = f"{availability:.2f}%" if availability is not None else "Collecting data"
 
@@ -445,31 +444,25 @@ async def owner_backup_document(update: Update, context: ContextTypes.DEFAULT_TY
         await message.reply_text("❌ Backup is larger than the 20 MB safety limit.")
         return
 
-    if context.user_data.get(_BACKUP_RESTORE_LOCK_KEY):
-        await message.reply_text("⏳ A backup restore is already running.")
-        return
-
     context.user_data.pop("awaiting_backup_restore", None)
-    context.user_data[_BACKUP_RESTORE_LOCK_KEY] = True
     status = await message.reply_text("⏳ Verifying and restoring backup…")
     try:
         telegram_file = await context.bot.get_file(message.document.file_id)
         buffer = io.BytesIO()
         await telegram_file.download_to_memory(out=buffer)
-        result = await restore_backup(get_database(), buffer.getvalue())
+        result = await restore_backup(get_database(), buffer.getvalue(), actor_id=user.id)
     except Exception as exc:
         await audit("backup_restore_failed", actor_id=user.id, details={"error": str(exc)[:300], "filename": filename})
         await status.edit_text(f"❌ Restore rejected: {exc}")
         return
-    finally:
-        context.user_data.pop(_BACKUP_RESTORE_LOCK_KEY, None)
 
     await audit("backup_restored", actor_id=user.id, details={**result, "filename": filename})
     await status.edit_text(
         "✅ Backup restored safely.\n"
-        f"• Restored/upserted: {result['restored']}\n"
-        f"• Skipped (missing identity): {result['skipped']}\n"
-        "• Existing records were not deleted"
+        f"• Newly inserted: {result['inserted']}\n"
+        f"• Existing records preserved: {result['existing']}\n"
+        f"• Skipped invalid/duplicate: {result['skipped']}\n"
+        "• Existing live records were not overwritten or deleted"
     )
 
 def handlers():
