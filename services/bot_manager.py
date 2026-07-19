@@ -992,31 +992,60 @@ class SellerBotManager:
             context.user_data["selected_child_plan"]=plan
             s=await get_seller_settings(owner)
 
-            text=(
-                "💳 Payment\n\n"
-                f"Plan: {plan['name']}\n"
-                f"Amount: {s.get('currency','INR')} {plan['price']:g}\n"
-                f"Duration: {plan['duration_text']}\n\n"
-                f"UPI Name: {s.get('upi_name') or 'Not Set'}\n"
-                f"UPI ID: {s.get('upi_id') or 'Not Set'}"
-            )
-
             gateway_cfg=await get_gateway_config("seller", owner, decrypt=True)
+            gateways=gateway_cfg.get("gateways") or {}
+            enabled=[g for g in SUPPORTED_GATEWAYS if (gateways.get(g) or {}).get("enabled")]
+            default_gateway=str(gateway_cfg.get("default_gateway") or "")
+            if default_gateway in enabled:
+                enabled.remove(default_gateway)
+                enabled.insert(0,default_gateway)
+            manual_enabled=bool(gateway_cfg.get("manual_enabled",True))
             rows=[]
-            for gateway in SUPPORTED_GATEWAYS:
-                if (gateway_cfg.get("gateways") or {}).get(gateway,{}).get("enabled"):
-                    rows.append([InlineKeyboardButton(f"💳 Pay with {gateway.title()}",callback_data=f"c_pg_{gateway}_{plan['plan_id']}")])
-            if gateway_cfg.get("manual_enabled",True):
+            text=""
+
+            if enabled:
+                gateway=enabled[0]
+                tx=await create_gateway_transaction(
+                    scope="seller", owner_id=owner, payer_user_id=q.from_user.id,
+                    gateway=gateway, amount=float(plan["price"]), currency="INR",
+                    purpose="child_subscription", reference_id=plan["plan_id"],
+                    metadata={"plan_id":plan["plan_id"],"plan_name":plan["name"],"description":f"{plan['name']} subscription"},
+                )
+                try:
+                    checkout=await create_checkout(tx)
+                    text=(
+                        f"💳 {gateway.title()} Payment\n\n"
+                        f"Plan: {plan['name']}\nAmount: ₹{plan['price']:g}\n"
+                        f"Transaction: {tx['transaction_id']}\n\n"
+                        "Payment successful hone ke baad plan automatically activate hoga."
+                    )
+                    rows.append([InlineKeyboardButton("💳 Pay Now",url=checkout.get("checkout_url"))])
+                except GatewayError as exc:
+                    text=f"❌ Gateway error: {exc}"
+
+            if manual_enabled:
+                manual_text=(
+                    f"Plan: {plan['name']}\n"
+                    f"Amount: {s.get('currency','INR')} {plan['price']:g}\n"
+                    f"Duration: {plan['duration_text']}\n\n"
+                    f"UPI Name: {s.get('upi_name') or 'Not Set'}\n"
+                    f"UPI ID: {s.get('upi_id') or 'Not Set'}\n\n"
+                    "Pay and upload your payment screenshot."
+                )
+                text=f"{text}\n\n{manual_text}" if text else f"💳 Payment\n\n{manual_text}"
                 rows.append([InlineKeyboardButton("📤 Upload Payment Screenshot",callback_data="c_upload")])
+
+            if not enabled and not manual_enabled:
+                text="⚠️ No payment method is currently available. Please contact support."
             rows.append([InlineKeyboardButton("⬅ Back",callback_data="c_buy")])
             kb=InlineKeyboardMarkup(rows)
 
-            if s.get("upi_qr_file_id") and gateway_cfg.get("manual_enabled",True):
-                await q.message.reply_photo(
-                    s["upi_qr_file_id"],
-                    caption=text,
-                    reply_markup=kb,
-                )
+            if s.get("upi_qr_file_id") and manual_enabled:
+                try:
+                    await q.message.delete()
+                except TelegramError:
+                    pass
+                await context.bot.send_photo(q.message.chat_id,s["upi_qr_file_id"],caption=text,reply_markup=kb)
             else:
                 await self.safe_query_message(q,text,kb)
             return
