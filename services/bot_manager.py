@@ -74,6 +74,16 @@ WELCOME_RUNTIME_VERSION="2026-07-13-main-role-dashboard-fix-13"
 MAIN_BOT_USERNAME=os.getenv("MAIN_BOT_USERNAME","Local_supplier3_bot").lstrip("@")
 
 
+class _MessageQueryAdapter:
+    """Adapt a normal Message to the small CallbackQuery interface used by detail views."""
+
+    def __init__(self, message):
+        self.message = message
+
+    async def edit_message_text(self, text, reply_markup=None, **kwargs):
+        return await self.message.reply_text(text, reply_markup=reply_markup, **kwargs)
+
+
 def _format_auto_delete(seconds: int) -> str:
     seconds = max(0, int(seconds or 0))
     if seconds == 0:
@@ -1282,11 +1292,16 @@ class SellerBotManager:
                     return "Unlimited" if value<0 else f"{value:,}"
                 except Exception:
                     return str(value)
-            text=(
+            username_text = (
+                f"@{q.from_user.username}"
+                if q.from_user.username
+                else "Not set"
+            )
+            text = (
                 "👤 Seller Profile\n\n"
                 f"🆔 Seller ID: {owner}\n"
                 f"👤 Name: {q.from_user.full_name or 'Unknown'}\n"
-                f"📝 Username: @{q.from_user.username}" if q.from_user.username else f"📝 Username: Not set"
+                f"📝 Username: {username_text}"
             )
             text += (
                 "\n\n💎 Plan Details\n"
@@ -2892,14 +2907,8 @@ class SellerBotManager:
 
                 context.user_data.clear()
 
-                class FakeQuery:
-                    def __init__(self,message):
-                        self.message=message
-                    async def edit_message_text(self,text,reply_markup=None,**kwargs):
-                        return await self.message.reply_text(text,reply_markup=reply_markup)
-
                 await self.show_user_details(
-                    FakeQuery(update.effective_message),
+                    _MessageQueryAdapter(update.effective_message),
                     owner,
                     int(user["user_id"]),
                 )
@@ -2918,14 +2927,8 @@ class SellerBotManager:
                 except Exception:
                     pass
 
-                class FakeQuery:
-                    def __init__(self,message):
-                        self.message=message
-                    async def edit_message_text(self,text,reply_markup=None,**kwargs):
-                        return await self.message.reply_text(text,reply_markup=reply_markup)
-
                 await self.show_user_details(
-                    FakeQuery(update.effective_message),
+                    _MessageQueryAdapter(update.effective_message),
                     owner,
                     user_id,
                 )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import hmac
 import io
 import json
 from datetime import datetime, timezone
@@ -159,7 +160,7 @@ def parse_backup(raw: bytes) -> tuple[dict[str, list[dict[str, Any]]], dict[str,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    if not hashlib.compare_digest(
+    if not hmac.compare_digest(
         hashlib.sha256(canonical).hexdigest(), str(manifest.get("sha256", ""))
     ):
         raise ValueError("Backup checksum verification failed")
