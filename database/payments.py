@@ -49,6 +49,10 @@ async def ensure_payment_indexes():
             [("user_id", ASCENDING), ("created_at", ASCENDING)],
             name="payment_user_created_at",
         )
+        await collection.create_index(
+            [("status", ASCENDING), ("fulfillment_status", ASCENDING), ("updated_at", ASCENDING)],
+            name="payment_fulfillment_recovery",
+        )
 
         _indexes_ready = True
 
@@ -520,3 +524,99 @@ async def fail_payment_fulfillment(
         },
     )
     return result.modified_count == 1
+
+
+async def recover_orphaned_payments(
+    *,
+    pending_ttl_minutes: int = PENDING_PAYMENT_TTL_MINUTES,
+    fulfillment_stale_minutes: int = FULFILLMENT_STALE_MINUTES,
+) -> dict[str, int]:
+    """Repair payment records left incomplete by a crash or redeploy.
+
+    This operation is idempotent and does not fulfill subscriptions itself.
+    It only makes incomplete records safe for the normal approval/retry flow.
+    """
+    await ensure_payment_indexes()
+
+    now = datetime.now(timezone.utc)
+    stale_before = now - timedelta(
+        minutes=max(1, int(fulfillment_stale_minutes))
+    )
+
+    expired_pending = await expire_stale_pending_payments(
+        ttl_minutes=max(1, int(pending_ttl_minutes))
+    )
+
+    stale_processing = await payments_collection().update_many(
+        {
+            "status": "approved",
+            "fulfillment_status": "processing",
+            "$or": [
+                {"fulfillment_claimed_at": {"$lt": stale_before}},
+                {"fulfillment_claimed_at": {"$exists": False}},
+            ],
+        },
+        {
+            "$set": {
+                "fulfillment_status": "failed",
+                "fulfillment_error": (
+                    "Recovered stale payment fulfillment after restart."
+                ),
+                "fulfillment_failed_at": now,
+                "updated_at": now,
+            },
+            "$unset": {"fulfillment_claimed_at": ""},
+        },
+    )
+
+    legacy_approved = await payments_collection().update_many(
+        {
+            "status": "approved",
+            "fulfillment_status": {"$exists": False},
+        },
+        {
+            "$set": {
+                "fulfillment_status": "pending",
+                "fulfillment_attempts": 0,
+                "fulfilled_channel_ids": [],
+                "updated_at": now,
+            }
+        },
+    )
+
+    orphan_pending_keys = await payments_collection().update_many(
+        {
+            "status": {"$ne": "pending"},
+            "pending_key": {"$exists": True},
+        },
+        {
+            "$unset": {"pending_key": ""},
+            "$set": {"updated_at": now},
+        },
+    )
+
+    invalid_pending_keys = await payments_collection().update_many(
+        {
+            "status": "pending",
+            "$or": [
+                {"user_id": {"$exists": False}},
+                {"plan": {"$exists": False}},
+            ],
+        },
+        {
+            "$set": {
+                "status": "expired",
+                "remarks": "Invalid pending payment record recovered.",
+                "updated_at": now,
+            },
+            "$unset": {"pending_key": ""},
+        },
+    )
+
+    return {
+        "expired_pending": int(expired_pending),
+        "stale_processing": int(stale_processing.modified_count),
+        "legacy_approved": int(legacy_approved.modified_count),
+        "orphan_pending_keys": int(orphan_pending_keys.modified_count),
+        "invalid_pending": int(invalid_pending_keys.modified_count),
+    }
