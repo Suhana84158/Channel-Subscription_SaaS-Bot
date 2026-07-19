@@ -21,7 +21,11 @@ from database.payment_gateways import (
     save_gateway_config, set_gateway_preferences, gateway_history,
 )
 from services.payment_gateways import create_checkout, test_gateway_connection, GatewayError
-from database.seller_bots import get_all_active_bots, get_bot, get_bot_by_bot_id, get_bot_by_data_owner_id, get_decrypted_bot_token, set_runtime_status
+from database.seller_bots import (
+    claim_runtime_recovery, finish_runtime_recovery, get_all_active_bots, get_bot,
+    get_bot_by_bot_id, get_bot_by_data_owner_id, get_decrypted_bot_token,
+    recovery_allowed, set_runtime_status,
+)
 from database.mongo import get_database
 from database.seller_referrals import seller_referral_stats
 from database.live_support import (
@@ -3653,6 +3657,12 @@ class SellerBotManager:
         """Recover one clone bot with bounded retries and recovery metrics."""
         bot_id = int(bot_id)
         last_error = ""
+        record = await get_bot_by_bot_id(bot_id)
+        if not record or not await recovery_allowed(record):
+            return False
+        claim = await claim_runtime_recovery(bot_id, cooldown_seconds=300)
+        if not claim:
+            return False
 
         for attempt in range(1, max_attempts + 1):
             self._recovery_attempts[bot_id] = attempt
@@ -3677,6 +3687,7 @@ class SellerBotManager:
                         attempt,
                         now.isoformat(),
                     )
+                    await finish_runtime_recovery(bot_id, True)
                     return True
                 last_error = "restart_bot returned False"
             except asyncio.CancelledError:
@@ -3697,7 +3708,11 @@ class SellerBotManager:
 
         self._recovery_attempts[bot_id] = 0
         try:
-            await set_runtime_status(bot_id, "recovery_failed", last_error[:500])
+            failures = int((claim or {}).get("consecutive_recovery_failures", 0)) + 1
+            retry_after = min(3600, 300 * (2 ** min(failures - 1, 3)))
+            await finish_runtime_recovery(
+                bot_id, False, last_error[:500], retry_after_seconds=retry_after
+            )
         except Exception:
             logger.exception(
                 "Could not save recovery failure status bot_id=%s",
