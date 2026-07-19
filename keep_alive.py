@@ -51,6 +51,7 @@ async def _runtime_health():
         ping_database,
     )
     from scheduler import scheduler_health
+    from database.health_monitoring import record_health_snapshot
     from services.bot_manager import bot_manager
 
     mongo_ok = await ping_database(timeout=4, log_failure=False)
@@ -92,19 +93,31 @@ async def _runtime_health():
 
     scheduler = scheduler_health()
 
-    healthy = bool(
+    raw_healthy = bool(
         mongo_ok
         and scheduler.get("running")
         and _runtime_loop is not None
     )
+    monitor = await record_health_snapshot(
+        source="http_health",
+        raw_healthy=raw_healthy,
+        details={
+            "database_ok": bool(mongo_ok),
+            "scheduler_running": bool(scheduler.get("running")),
+            "runtime_ready": _runtime_loop is not None,
+            "clone_offline": int(clone_bots.get("offline", 0) or 0),
+            "clone_unhealthy": int(clone_bots.get("unhealthy", 0) or 0),
+        },
+    )
 
     return {
-        "status": "healthy" if healthy else "degraded",
+        "status": monitor["status"],
         "service": "Telegram Subscription SaaS Bot",
         "version": SERVICE_VERSION,
         "runtime_ready": _runtime_loop is not None,
         "uptime_seconds": int(time.monotonic() - _started_monotonic),
         "started_at_unix": int(_started_at_unix),
+        "health_monitor": monitor,
         "database": database,
         "scheduler": scheduler,
         "clone_bots": clone_bots,
