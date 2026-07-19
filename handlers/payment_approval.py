@@ -16,6 +16,9 @@ from database.payments import (
     mark_payment_subscription_fulfilled,
     complete_payment_fulfillment,
     fail_payment_fulfillment,
+    claim_payment_user_notification,
+    complete_payment_user_notification,
+    fail_payment_user_notification,
 )
 from services.subscription_service import fulfill_payment_subscription
 from services.channel_service import grant_channel_access
@@ -37,6 +40,40 @@ async def safe_edit(query, text: str, reply_markup=None):
             pass
 
 
+async def _send_approval_notification(
+    payment,
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    payment_id = str(payment["_id"])
+    claimed = await claim_payment_user_notification(payment_id)
+    if not claimed:
+        current = await get_payment(payment_id)
+        return not current or current.get("user_notification_status") == "sent"
+
+    user_id = int(claimed["user_id"])
+    plan_name = claimed.get("plan", "Premium")
+    expiry = claimed.get("subscription_expiry")
+    expiry_text = format_ist(expiry) if expiry else "Active"
+    action = claimed.get("subscription_action", "activated")
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🎉 Payment Approved!\n\n"
+                f"Plan: {plan_name}\n"
+                f"Subscription {action}.\n"
+                f"Expiry: {expiry_text}"
+            ),
+        )
+        await complete_payment_user_notification(payment_id)
+        return True
+    except Exception as exc:
+        await fail_payment_user_notification(payment_id, str(exc))
+        return False
+
+
 async def fulfill_approved_payment(
     payment,
     *,
@@ -52,9 +89,14 @@ async def fulfill_approved_payment(
     if not claimed:
         current = await get_payment(payment_id)
         if current and current.get("fulfillment_status") == "completed":
+            notified = await _send_approval_notification(
+                current,
+                context=context,
+            )
             return {
                 "completed": True,
                 "already_completed": True,
+                "notification_sent": notified,
                 "payment": current,
             }
         return {
@@ -65,12 +107,8 @@ async def fulfill_approved_payment(
 
     user_id = int(claimed["user_id"])
     plan_name = claimed.get("plan", "Premium")
-    duration_minutes = claimed.get("duration_minutes") or 43200
-    plan_days = (
-        duration_minutes // 1440
-        if duration_minutes % 1440 == 0
-        else 0
-    )
+    duration_minutes = int(claimed.get("duration_minutes") or 43200)
+    plan_days = duration_minutes // 1440 if duration_minutes % 1440 == 0 else 0
 
     try:
         fulfillment = await fulfill_payment_subscription(
@@ -83,51 +121,40 @@ async def fulfill_approved_payment(
         expiry = fulfillment["expiry"]
         action = fulfillment["action"]
 
-        await mark_payment_subscription_fulfilled(
+        saved = await mark_payment_subscription_fulfilled(
             payment_id,
             expiry=expiry,
             action=action,
         )
+        if not saved:
+            raise RuntimeError("Subscription fulfillment result could not be saved.")
 
         access_result = await grant_channel_access(
             user_id,
             payment_id=payment_id,
-            already_delivered_chat_ids=claimed.get(
-                "fulfilled_channel_ids",
-                [],
-            ),
+            already_delivered_chat_ids=claimed.get("fulfilled_channel_ids", []),
         )
-
         if access_result["failed"]:
             raise RuntimeError(
                 "Channel delivery failed: "
-                + ", ".join(
-                    str(item["chat_id"])
-                    for item in access_result["failed"]
-                )
+                + ", ".join(str(item["chat_id"]) for item in access_result["failed"])
             )
-
-        expiry_ist = format_ist(expiry)
-
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                "🎉 Payment Approved!\\n\\n"
-                f"Plan: {plan_name}\\n"
-                f"Subscription {action}.\\n"
-                f"Expiry: {expiry_ist}"
-            ),
-        )
 
         completed = await complete_payment_fulfillment(payment_id)
         if not completed:
-            raise RuntimeError(
-                "Payment fulfillment completion could not be saved."
-            )
+            raise RuntimeError("Payment fulfillment completion could not be saved.")
+
+        current = await get_payment(payment_id)
+        notified = await _send_approval_notification(
+            current or claimed,
+            context=context,
+        )
+        expiry_ist = format_ist(expiry)
 
         return {
             "completed": True,
             "already_completed": False,
+            "notification_sent": notified,
             "user_id": user_id,
             "plan_name": plan_name,
             "expiry": expiry,
@@ -319,10 +346,10 @@ async def approve_payment_by_id(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
         if result.get("already_completed"):
-            await safe_edit(
-                query,
-                "✅ Payment was already approved and delivered.",
-            )
+            text = "✅ Payment was already approved and delivered."
+            if not result.get("notification_sent", True):
+                text += "\n\n⚠️ User notification could not be sent."
+            await safe_edit(query, text)
             return
 
         if result.get("already_processing"):
@@ -332,13 +359,15 @@ async def approve_payment_by_id(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-        await safe_edit(
-            query,
-            "✅ Payment Approved\\n\\n"
-            f"User: {result['user_id']}\\n"
-            f"Plan: {result['plan_name']}\\n"
-            f"Expiry: {result['expiry_ist']}",
+        success_text = (
+            "✅ Payment Approved\n\n"
+            f"User: {result['user_id']}\n"
+            f"Plan: {result['plan_name']}\n"
+            f"Expiry: {result['expiry_ist']}"
         )
+        if not result.get("notification_sent", True):
+            success_text += "\n\n⚠️ User notification could not be sent."
+        await safe_edit(query, success_text)
 
     except Exception as exc:
         retry_keyboard = InlineKeyboardMarkup([
@@ -451,10 +480,10 @@ async def approve_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if result.get("already_completed"):
-            await safe_edit(
-                query,
-                "✅ Payment was already approved and delivered.",
-            )
+            text = "✅ Payment was already approved and delivered."
+            if not result.get("notification_sent", True):
+                text += "\n\n⚠️ User notification could not be sent."
+            await safe_edit(query, text)
             return
 
         if result.get("already_processing"):
@@ -464,13 +493,15 @@ async def approve_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        await safe_edit(
-            query,
-            "✅ Payment Approved\\n\\n"
-            f"User: {result['user_id']}\\n"
-            f"Plan: {result['plan_name']}\\n"
-            f"Expiry: {result['expiry_ist']}",
+        success_text = (
+            "✅ Payment Approved\n\n"
+            f"User: {result['user_id']}\n"
+            f"Plan: {result['plan_name']}\n"
+            f"Expiry: {result['expiry_ist']}"
         )
+        if not result.get("notification_sent", True):
+            success_text += "\n\n⚠️ User notification could not be sent."
+        await safe_edit(query, success_text)
 
     except Exception as exc:
         await safe_edit(
