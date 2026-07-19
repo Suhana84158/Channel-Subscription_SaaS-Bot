@@ -1,5 +1,6 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from database.mongo import get_database
+from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from utils.crypto import decrypt_secret, encrypt_secret
 
@@ -179,6 +180,64 @@ async def set_runtime_status(bot_id: int, status: str, error=None):
             "updated_at": datetime.now(timezone.utc),
         }},
     )
+
+
+async def claim_runtime_recovery(bot_id: int, cooldown_seconds: int = 300):
+    """Atomically claim one recovery attempt and prevent restart storms."""
+    bot_id = int(bot_id)
+    now = datetime.now(timezone.utc)
+    stale_before = now - timedelta(seconds=max(30, int(cooldown_seconds)))
+    return await seller_bots_collection().find_one_and_update(
+        {
+            "bot_id": bot_id,
+            "active": True,
+            "$or": [
+                {"recovery_claimed_at": {"$exists": False}},
+                {"recovery_claimed_at": None},
+                {"recovery_claimed_at": {"$lte": stale_before}},
+            ],
+        },
+        {
+            "$set": {
+                "recovery_claimed_at": now,
+                "runtime_status": "recovering",
+                "updated_at": now,
+            },
+            "$inc": {"recovery_claim_count": 1},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+async def finish_runtime_recovery(bot_id: int, success: bool, error=None, retry_after_seconds: int = 300):
+    """Persist recovery result and release the active recovery claim."""
+    now = datetime.now(timezone.utc)
+    update = {
+        "$set": {
+            "runtime_status": "running" if success else "recovery_failed",
+            "runtime_error": None if success else str(error or "Recovery failed")[:500],
+            "last_recovery_at": now,
+            "next_recovery_at": None if success else now + timedelta(seconds=max(60, int(retry_after_seconds))),
+            "updated_at": now,
+        },
+        "$unset": {"recovery_claimed_at": ""},
+    }
+    if success:
+        update["$set"]["consecutive_recovery_failures"] = 0
+    else:
+        update["$inc"] = {"consecutive_recovery_failures": 1}
+    await seller_bots_collection().update_one({"bot_id": int(bot_id)}, update)
+
+
+async def recovery_allowed(record: dict, now=None) -> bool:
+    """Return False while a failed bot is inside its persisted cooldown."""
+    now = now or datetime.now(timezone.utc)
+    next_at = record.get("next_recovery_at") if record else None
+    if next_at is None:
+        return True
+    if getattr(next_at, "tzinfo", None) is None:
+        next_at = next_at.replace(tzinfo=timezone.utc)
+    return next_at <= now
 
 
 async def delete_bot(owner_id: int, bot_id: int | None = None):
