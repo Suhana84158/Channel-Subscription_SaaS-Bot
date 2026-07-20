@@ -432,7 +432,13 @@ async def _seller_owner_details(owner_id: int):
         is_running = bool(bot.get("active")) and runtime.lower() == "running"
         if is_running: running_count += 1
         else: paused_count += 1
-        token = await get_decrypted_bot_token(int(bot["bot_id"])) or "Token unavailable"
+        token = await get_decrypted_bot_token(int(bot["bot_id"])) or ""
+        if token:
+            token_masked = f"{token[:8]}****{token[-4:]}" if len(token) > 14 else "****"
+            token_status = "Valid / Stored"
+        else:
+            token_masked = "Unavailable"
+            token_status = "Missing"
         connected_channels = await get_seller_channels(scope)
         channel_lines = []
         for channel_index, channel in enumerate(connected_channels, 1):
@@ -446,7 +452,8 @@ async def _seller_owner_details(owner_id: int):
             f"🤖 <b>{index}. @{escape(str(bot.get('bot_username') or '-'))}</b> — "
             f"{'🟢 Running' if is_running else '⏸ Stopped'}\n"
             f"   Bot ID: <code>{int(bot.get('bot_id') or 0)}</code>\n"
-            f"   API Token: <code>{escape(token)}</code>\n"
+            f"   API Token: <code>{escape(token_masked)}</code>\n"
+            f"   Token Status: {escape(token_status)}\n"
             f"   👥 Users: {users} | 💎 Active: {active} | 💰 Revenue: ₹{revenue:g}\n"
             f"   📢 Connected Channels/Groups:\n"
             + ("\n".join(channel_lines) if channel_lines else "   None")
@@ -470,23 +477,56 @@ async def _seller_owner_details(owner_id: int):
         value = int(plan.get(key, default) or 0)
         return "Unlimited" if value < 0 else str(value)
 
-    name = escape(str(seller.get("first_name") or "-"))
-    username = escape(f"@{seller.get('username')}" if seller.get("username") else "-")
+    joined = seller.get("created_at")
+    if joined and joined.tzinfo is None:
+        joined = joined.replace(tzinfo=timezone.utc)
+    last_active = seller.get("updated_at") or joined
+    if last_active and last_active.tzinfo is None:
+        last_active = last_active.replace(tzinfo=timezone.utc)
+
+    latest_payment = await db["seller_subscription_payments"].find_one(
+        {"seller_id": int(owner_id), "status": {"$in": ["approved", "paid", "success"]}},
+        sort=[("processed_at", -1), ("created_at", -1)],
+    )
+    if not latest_payment:
+        latest_payment = await db["seller_payments"].find_one(
+            {"owner_id": int(owner_id), "status": {"$in": ["approved", "paid", "success"]}},
+            sort=[("processed_at", -1), ("created_at", -1)],
+        )
+    payment_method = str((latest_payment or {}).get("gateway") or (latest_payment or {}).get("payment_method") or "-")
+    transaction_id = str((latest_payment or {}).get("transaction_id") or (latest_payment or {}).get("gateway_payment_id") or "-")
+    staff_count = await db["seller_staff"].count_documents({"owner_id": int(owner_id), "status": "active"})
+
+    raw_name = str(seller.get("first_name") or "-")
+    name = escape(raw_name)
+    raw_username = str(seller.get("username") or "").lstrip("@")
+    username = escape(f"@{raw_username}" if raw_username else "-")
+    mention = f'<a href="tg://user?id={int(owner_id)}">{name}</a>'
     suspended = bool(seller.get("suspended"))
     text = (
         "🏪 <b>Seller Details</b>\n\n"
-        f"🆔 Seller ID: {owner_id}\n👤 Name: {name}\n📝 Username: {username}\n"
-        f"✅ Approved: {'Yes' if seller.get('approved') else 'No'}\n🚫 Suspended: {'Yes' if suspended else 'No'}\n\n"
+        "👤 <b>Seller Profile</b>\n"
+        f"🆔 Seller ID: <code>{owner_id}</code>\n"
+        f"👤 Name: {name}\n"
+        f"📝 Username: {username}\n"
+        f"🔗 Mention: {mention}\n"
+        f"📅 Joined: {joined.astimezone(ist).strftime('%d-%m-%Y %I:%M %p IST') if joined else '-'}\n"
+        f"🕘 Last Active: {last_active.astimezone(ist).strftime('%d-%m-%Y %I:%M %p IST') if last_active else '-'}\n"
+        f"✅ Approved: {'Yes' if seller.get('approved') else 'No'}\n"
+        f"🚫 Suspended: {'Yes' if suspended else 'No'}\n\n"
         "💎 Plan Details\n"
         f"📦 Plan: {escape(str(plan.get('name','Free')))}\n📌 Status: {plan_status}\n"
         f"📅 Activated: {activated.astimezone(ist).strftime('%d-%m-%Y') if activated else '-'}\n"
         f"⏳ Expiry: {expiry.astimezone(ist).strftime('%d-%m-%Y %I:%M %p') if expiry else 'No expiry'}\n"
-        f"⌛ Remaining: {remaining}\n\n"
+        f"⌛ Remaining: {remaining}\n"
+        f"💳 Last Payment Method: {escape(payment_method)}\n"
+        f"🧾 Last Transaction ID: <code>{escape(transaction_id)}</code>\n\n"
         "📊 Usage & Limitations — All Clone Bots\n"
         f"🤖 Clone Bots: {len(bots)} / {limit_value('bot_limit',1)}\n"
         f"👥 Active Subscribers: {active_count} / {limit_value('active_subscriber_limit',25)}\n"
         f"📢 Channels / Groups: {channel_count} / {limit_value('channel_limit',1)}\n"
-        f"📦 Subscription Plans: {plan_count} / {limit_value('plan_limit',2)}\n\n"
+        f"📦 Subscription Plans: {plan_count} / {limit_value('plan_limit',2)}\n"
+        f"👮 Admins / Staff: {staff_count} / {limit_value('admin_limit',1)}\n\n"
         "📈 Seller Statistics — Combined\n"
         f"🤖 Running Bots: {running_count} | Stopped: {paused_count}\n"
         f"👥 Total Users: {total_users_count}\n💳 Pending Payments: {pending_count}\n"
@@ -501,6 +541,9 @@ async def _seller_owner_details(owner_id: int):
         [InlineKeyboardButton("✅ Unsuspend Seller" if suspended else "🚫 Suspend Seller",
             callback_data=f"main_seller_unsuspend_{owner_id}" if suspended else f"main_seller_suspend_{owner_id}")],
         [InlineKeyboardButton("💬 Message Seller", callback_data=f"main_owner_message_seller_{owner_id}")],
+        [InlineKeyboardButton("💎 Change / Extend Plan", callback_data=f"sub_mgmt_extend_{owner_id}")],
+        [InlineKeyboardButton("📜 Subscription History", callback_data="sub_mgmt_history")],
+        [InlineKeyboardButton("💰 Seller Revenue", callback_data="sub_mgmt_revenue")],
     ]
     if first_bot:
         keyboard.append([InlineKeyboardButton("⏸ Pause First Clone Bot" if first_bot.get("active") else "▶ Resume First Clone Bot",
