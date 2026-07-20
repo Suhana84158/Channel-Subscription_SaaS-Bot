@@ -21,7 +21,7 @@ from database.payment_gateways import (
     mark_transaction_fulfilled,
     mark_transaction_fulfillment_retry,
     reserve_webhook_event,
-    mark_gateway_webhook_received,
+    mark_valid_webhook_received,
     update_gateway_transaction,
 )
 from database.seller_data import activate_subscription, get_plan, create_automatic_payment, get_subscription
@@ -314,6 +314,7 @@ async def verify_and_process_webhook(gateway: str, scope: str, owner_id: int, he
         expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
         if not secret or not hmac.compare_digest(expected, headers.get("x-razorpay-signature", "")):
             return False, "invalid signature"
+        await mark_valid_webhook_received(scope, owner_id, "razorpay")
         event = payload.get("event", "")
         entity = (((payload.get("payload") or {}).get("payment") or {}).get("entity") or {})
         order = (((payload.get("payload") or {}).get("payment_link") or {}).get("entity") or {})
@@ -323,9 +324,6 @@ async def verify_and_process_webhook(gateway: str, scope: str, owner_id: int, he
         if not payment_id and order.get("payments"):
             payment_id = order.get("payments", [{}])[-1].get("payment_id", "")
         event_key = payload.get("account_id", "") + ":" + event + ":" + str(entity.get("id") or order.get("id"))
-        # A correctly signed delivery proves that URL + secret are working,
-        # even when Razorpay sends a dashboard test event without a transaction.
-        await mark_gateway_webhook_received(scope, owner_id, gateway, event)
     elif gateway == "cashfree":
         timestamp = headers.get("x-webhook-timestamp", "")
         signature = headers.get("x-webhook-signature", "")
