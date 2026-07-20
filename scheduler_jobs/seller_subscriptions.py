@@ -137,3 +137,23 @@ async def run_seller_subscription_reminders(bot):
                 "Seller plan usage warning failed seller_id=%s",
                 owner_id,
             )
+
+async def run_scheduled_plan_activations(bot):
+    """Activate queued seller plans whose current plan has expired."""
+    from database.seller_subscriptions import activate_due_scheduled_plan_purchases
+
+    rows = await activate_due_scheduled_plan_purchases(100)
+    for purchase in rows:
+        seller_id = int(purchase["owner_id"])
+        text = (
+            "✅ Scheduled Plan Activated Successfully\n\n"
+            f"Plan: {purchase.get('plan_name')}\n"
+            f"Activated On: {purchase.get('activated_at').strftime('%d %b %Y, %I:%M %p UTC') if purchase.get('activated_at') else '-'}\n"
+            f"New Expiry: {purchase.get('expiry_date').strftime('%d %b %Y, %I:%M %p UTC') if purchase.get('expiry_date') else '-'}\n"
+            "Status: Active"
+        )
+        try:
+            await bot.send_message(seller_id, text)
+        except Exception:
+            logger.exception("Scheduled seller plan activation notice failed seller_id=%s", seller_id)
+        await _send_admin_copies(bot, seller_id, text)
