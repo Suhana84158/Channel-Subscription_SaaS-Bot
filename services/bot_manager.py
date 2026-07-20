@@ -21,6 +21,8 @@ from database.payment_gateways import (
     save_gateway_config, set_gateway_preferences, gateway_history,
 )
 from services.payment_gateways import create_checkout, test_gateway_connection, GatewayError
+from config import PUBLIC_BASE_URL
+from database.settings import get_setting_value
 from database.seller_bots import (
     claim_runtime_recovery, finish_runtime_recovery, get_all_active_bots, get_bot,
     get_bot_by_bot_id, get_bot_by_data_owner_id, get_decrypted_bot_token,
@@ -289,12 +291,57 @@ class SellerBotManager:
     @staticmethod
     def payment_menu():
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🌐 Automatic Gateways",callback_data="a_pg_home")],
+            [InlineKeyboardButton("🌐 Automatic Payment Gateways",callback_data="a_pg_home")],
             [InlineKeyboardButton("🏦 Set UPI ID",callback_data="a_set_upi_id")],
             [InlineKeyboardButton("👤 Set UPI Name",callback_data="a_set_upi_name")],
-            [InlineKeyboardButton("🖼 Upload QR",callback_data="a_set_qr")],
+            [InlineKeyboardButton("🖼 Upload / Change QR",callback_data="a_set_qr")],
             [InlineKeyboardButton("⬅ Back",callback_data="a_home")],
         ])
+
+    @staticmethod
+    def _masked_gateway_value(value):
+        value=str(value or "").strip()
+        if not value:
+            return "Not added"
+        return "Added" if len(value) < 8 else f"Added (...{value[-4:]})"
+
+    async def seller_payment_text(self, owner):
+        settings=await get_seller_settings(owner)
+        cfg=await get_gateway_config("seller",owner,decrypt=True)
+        gateways=cfg.get("gateways") or {}
+        rz=gateways.get("razorpay") or {}
+        cf=gateways.get("cashfree") or {}
+        return (
+            "💳 Seller Payment Settings\n\n"
+            f"{'✅' if rz.get('enabled') else '❌'} Razorpay: {'Enabled' if rz.get('enabled') else 'Disabled'}\n"
+            f"Key ID: {self._masked_gateway_value(rz.get('key_id'))}\n"
+            f"Key Secret: {'Added' if rz.get('key_secret') else 'Not added'}\n"
+            f"Webhook Secret: {'Added' if rz.get('webhook_secret') else 'Not added'}\n\n"
+            f"{'✅' if cf.get('enabled') else '❌'} Cashfree: {'Enabled' if cf.get('enabled') else 'Disabled'}\n"
+            f"Client ID: {self._masked_gateway_value(cf.get('client_id'))}\n"
+            f"Client Secret: {'Added' if cf.get('client_secret') else 'Not added'}\n\n"
+            "Automatic gateways always use LIVE mode.\n\n"
+            f"UPI ID: {settings.get('upi_id') or 'Not Set'}\n"
+            f"UPI Name: {settings.get('upi_name') or 'Not Set'}\n"
+            f"QR Code: {'Added ✅' if settings.get('upi_qr_file_id') else 'Not Added'}"
+        )
+
+    @staticmethod
+    def seller_gateway_home_menu(cfg):
+        gateways=cfg.get("gateways") or {}
+        rz=gateways.get("razorpay") or {}
+        cf=gateways.get("cashfree") or {}
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"{'✅' if rz.get('enabled') else '❌'} Razorpay",callback_data="a_pg_view_razorpay")],
+            [InlineKeyboardButton(f"{'✅' if cf.get('enabled') else '❌'} Cashfree",callback_data="a_pg_view_cashfree")],
+            [InlineKeyboardButton("📜 Gateway History",callback_data="a_pg_history")],
+            [InlineKeyboardButton("⬅ Back",callback_data="a_payment")],
+        ])
+
+    @staticmethod
+    def razorpay_webhook_url(owner):
+        base=(PUBLIC_BASE_URL or "").rstrip("/")
+        return f"{base}/webhooks/razorpay/seller/{int(owner)}" if base else "PUBLIC_BASE_URL is not configured"
     @staticmethod
     def live_support_menu(settings):
         enabled=bool(settings.get("enabled"))
@@ -770,11 +817,8 @@ class SellerBotManager:
             context.user_data.clear()
             target = context.args[0] if context.args else "admin_panel"
             if target == "admin_payment":
-                settings = await get_seller_settings(owner)
                 await update.effective_message.reply_text(
-                    f"💳 Payment Settings\n\nUPI Name: {settings.get('upi_name') or 'Not Set'}\n"
-                    f"UPI ID: {settings.get('upi_id') or 'Not Set'}\n"
-                    f"QR: {'Added' if settings.get('upi_qr_file_id') else 'Not Added'}",
+                    await self.seller_payment_text(owner),
                     reply_markup=self.payment_menu(),
                 )
             elif target == "admin_settings":
@@ -1811,50 +1855,134 @@ class SellerBotManager:
             return
         if a=="a_pg_home":
             cfg=await get_gateway_config("seller",owner,decrypt=True)
-            rows=[]; lines=["🌐 Automatic Payment Gateways","",f"Default: {cfg.get('default_gateway','manual').title()}",f"Manual: {'ON' if cfg.get('manual_enabled',True) else 'OFF'}",""]
-            for gateway in SUPPORTED_GATEWAYS:
-                g=(cfg.get("gateways") or {}).get(gateway,{})
-                lines.append(f"{'✅' if g.get('enabled') else '❌'} {gateway.title()} ({g.get('mode','test')})")
-                rows.append([InlineKeyboardButton(gateway.title(),callback_data=f"a_pg_view_{gateway}")])
-            rows += [[InlineKeyboardButton("⚙ Default / Manual",callback_data="a_pg_default")],[InlineKeyboardButton("📜 History",callback_data="a_pg_history")],[InlineKeyboardButton("⬅ Back",callback_data="a_payment")]]
-            await q.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(rows)); return
+            gateways=cfg.get("gateways") or {}
+            rz=gateways.get("razorpay") or {}
+            cf=gateways.get("cashfree") or {}
+            text=(
+                "🌐 Automatic Payment Gateways\n\n"
+                f"{'✅' if rz.get('enabled') else '❌'} Razorpay: {'Enabled' if rz.get('enabled') else 'Disabled'}\n"
+                f"Key ID: {self._masked_gateway_value(rz.get('key_id'))}\n"
+                f"Key Secret: {'Added' if rz.get('key_secret') else 'Not added'}\n\n"
+                f"{'✅' if cf.get('enabled') else '❌'} Cashfree: {'Enabled' if cf.get('enabled') else 'Disabled'}\n"
+                f"Client ID: {self._masked_gateway_value(cf.get('client_id'))}\n"
+                f"Client Secret: {'Added' if cf.get('client_secret') else 'Not added'}\n\n"
+                "Automatic gateways always use LIVE mode."
+            )
+            await q.edit_message_text(text,reply_markup=self.seller_gateway_home_menu(cfg)); return
         if a.startswith("a_pg_view_"):
-            gateway=a.replace("a_pg_view_",""); cfg=await get_gateway_config("seller",owner,decrypt=True); g=(cfg.get("gateways") or {}).get(gateway,{})
-            await q.edit_message_text(
-                f"💳 {gateway.title()}\n\n"
-                f"Status: {'Enabled' if g.get('enabled') else 'Disabled'}\n"
-                f"Mode: {g.get('mode','test').title()}\n"
-                f"Credentials: {'Set' if len(g)>2 else 'Not set'}",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Enable/Disable",callback_data=f"a_pg_toggle_{gateway}")],
-                    [InlineKeyboardButton("🔑 Set Credentials",callback_data=f"a_pg_creds_{gateway}")],
-                    [InlineKeyboardButton("✅ Test Connection",callback_data=f"a_pg_testconn_{gateway}")],
-                    [InlineKeyboardButton("🧪 Test Mode",callback_data=f"a_pg_mode_test_{gateway}"),InlineKeyboardButton("🚀 Live Mode",callback_data=f"a_pg_mode_live_{gateway}")],
+            gateway=a.replace("a_pg_view_","")
+            cfg=await get_gateway_config("seller",owner,decrypt=True)
+            g=(cfg.get("gateways") or {}).get(gateway,{})
+            if gateway=="razorpay":
+                text=(
+                    "💳 Razorpay — Seller\n\n"
+                    f"Status: {'Enabled ✅' if g.get('enabled') else 'Disabled ❌'}\n"
+                    "Mode: LIVE 🚀\n"
+                    f"Key ID: {self._masked_gateway_value(g.get('key_id'))}\n"
+                    f"Key Secret: {'Added' if g.get('key_secret') else 'Not added'}\n"
+                    f"Webhook URL: {'Generated ✅' if PUBLIC_BASE_URL else 'Not configured ❌'}\n"
+                    f"Webhook Secret: {'Added ✅' if g.get('webhook_secret') else 'Not added ❌'}"
+                )
+                kb=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⛔ Disable" if g.get('enabled') else "✅ Enable",callback_data="a_pg_toggle_razorpay")],
+                    [InlineKeyboardButton("🔑 Set / Replace Credentials",callback_data="a_pg_rz_credentials")],
+                    [InlineKeyboardButton("🔗 Webhook Setup",callback_data="a_pg_rz_webhook")],
+                    [InlineKeyboardButton("🧪 Test Connection",callback_data="a_pg_testconn_razorpay")],
                     [InlineKeyboardButton("⬅ Back",callback_data="a_pg_home")],
-                ]),
-            ); return
+                ])
+            else:
+                text=(
+                    "💳 Cashfree — Seller\n\n"
+                    f"Status: {'Enabled ✅' if g.get('enabled') else 'Disabled ❌'}\n"
+                    "Mode: LIVE 🚀\n"
+                    f"Client ID: {self._masked_gateway_value(g.get('client_id'))}\n"
+                    f"Client Secret: {'Added' if g.get('client_secret') else 'Not added'}"
+                )
+                kb=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⛔ Disable" if g.get('enabled') else "✅ Enable",callback_data="a_pg_toggle_cashfree")],
+                    [InlineKeyboardButton("🔐 Set / Replace Credentials",callback_data="a_pg_creds_cashfree")],
+                    [InlineKeyboardButton("🧪 Test Connection",callback_data="a_pg_testconn_cashfree")],
+                    [InlineKeyboardButton("⬅ Back",callback_data="a_pg_home")],
+                ])
+            await q.edit_message_text(text,reply_markup=kb); return
+        if a=="a_pg_rz_credentials":
+            await q.edit_message_text("🔑 Razorpay Credentials\n\nChoose what you want to set or replace.",reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔑 Set Key ID",callback_data="a_pg_rz_key_id")],
+                [InlineKeyboardButton("🔒 Set Key Secret",callback_data="a_pg_rz_key_secret")],
+                [InlineKeyboardButton("⬅ Back",callback_data="a_pg_view_razorpay")],
+            ])); return
+        if a in {"a_pg_rz_key_id","a_pg_rz_key_secret","a_pg_rz_webhook_secret"}:
+            field={"a_pg_rz_key_id":"key_id","a_pg_rz_key_secret":"key_secret","a_pg_rz_webhook_secret":"webhook_secret"}[a]
+            context.user_data.clear()
+            context.user_data["wait_pg_field"]={"gateway":"razorpay","field":field}
+            label={"key_id":"Razorpay Key ID","key_secret":"Razorpay Key Secret","webhook_secret":"Razorpay Webhook Secret"}[field]
+            await q.edit_message_text(f"Send your {label} now.\n\nYour message will be deleted after saving.",reply_markup=self.back("a_pg_view_razorpay" if field!="webhook_secret" else "a_pg_rz_webhook")); return
+        if a=="a_pg_rz_webhook":
+            cfg=await get_gateway_config("seller",owner,decrypt=True)
+            g=(cfg.get("gateways") or {}).get("razorpay",{})
+            url=self.razorpay_webhook_url(owner)
+            await q.edit_message_text(
+                "🔗 Razorpay Webhook Setup\n\n"
+                "Your unique webhook URL has been generated automatically.\n\n"
+                f"Webhook URL:\n`{url}`\n\n"
+                "Required Events:\n• payment.captured\n• order.paid\n• payment_link.paid\n\n"
+                f"Webhook Secret: {'Saved ✅' if g.get('webhook_secret') else 'Not saved ❌'}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 Copy Webhook URL",callback_data="a_pg_rz_copy_url")],
+                    [InlineKeyboardButton("🔐 Set Webhook Secret",callback_data="a_pg_rz_webhook_secret")],
+                    [InlineKeyboardButton("🧪 Test Webhook",callback_data="a_pg_rz_test_webhook")],
+                    [InlineKeyboardButton("📖 Setup Guide",callback_data="a_pg_rz_guide")],
+                    [InlineKeyboardButton("⬅ Back",callback_data="a_pg_view_razorpay")],
+                ])); return
+        if a=="a_pg_rz_copy_url":
+            url=self.razorpay_webhook_url(owner)
+            await q.edit_message_text(f"📋 Your Razorpay Webhook URL\n\nLong-press the URL below and copy it:\n\n`{url}`",parse_mode="Markdown",reply_markup=self.back("a_pg_rz_webhook")); return
+        if a=="a_pg_rz_test_webhook":
+            await q.edit_message_text(
+                "🧪 Razorpay Webhook Test\n\nOpen Razorpay Dashboard → Webhooks and use Send Test Webhook.\nSelect one configured event.\n\nIf Razorpay shows HTTP 200, the webhook URL and secret are working.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Check Connection",callback_data="a_pg_testconn_razorpay")],
+                    [InlineKeyboardButton("📖 Setup Guide",callback_data="a_pg_rz_guide")],
+                    [InlineKeyboardButton("⬅ Back",callback_data="a_pg_rz_webhook")],
+                ])); return
+        if a=="a_pg_rz_guide":
+            support=(await get_setting_value("support_username", "")) or ""
+            rows=[[InlineKeyboardButton("📋 Copy Webhook URL",callback_data="a_pg_rz_copy_url")],[InlineKeyboardButton("🔐 Set Webhook Secret",callback_data="a_pg_rz_webhook_secret")]]
+            if support.strip():
+                username=support.strip().replace("https://t.me/","").lstrip("@")
+                rows.append([InlineKeyboardButton("💬 Contact Support",url=f"https://t.me/{username}")])
+            rows.append([InlineKeyboardButton("⬅ Back",callback_data="a_pg_rz_webhook")])
+            await q.edit_message_text(
+                "📖 Razorpay Webhook Setup Guide\n\n1. Login to Razorpay Dashboard.\n2. Open Settings → Webhooks.\n3. Tap Add New Webhook.\n4. Paste the URL generated by this bot.\n5. Create a strong Webhook Secret.\n6. Select payment.captured, order.paid and payment_link.paid.\n7. Save the webhook.\n8. Return here and tap Set Webhook Secret.\n9. Paste the same secret.\n10. Tap Test Connection.",
+                reply_markup=InlineKeyboardMarkup(rows)); return
         if a.startswith("a_pg_toggle_"):
-            gateway=a.replace("a_pg_toggle_",""); cfg=await get_gateway_config("seller",owner,decrypt=True); g=(cfg.get("gateways") or {}).get(gateway,{})
-            await save_gateway_config("seller",owner,gateway,{"enabled":not bool(g.get("enabled"))}); await q.edit_message_text("✅ Gateway status updated",reply_markup=self.payment_menu()); return
+            gateway=a.replace("a_pg_toggle_","")
+            cfg=await get_gateway_config("seller",owner,decrypt=True)
+            g=(cfg.get("gateways") or {}).get(gateway,{})
+            try:
+                await save_gateway_config("seller",owner,gateway,{"enabled":not bool(g.get("enabled"))})
+                await q.edit_message_text("✅ Gateway status updated.",reply_markup=self.back(f"a_pg_view_{gateway}"))
+            except Exception as exc:
+                await q.answer(str(exc)[:180],show_alert=True)
+            return
         if a.startswith("a_pg_testconn_"):
             gateway=a.replace("a_pg_testconn_","")
             try:
-                result=await test_gateway_connection("seller",owner,gateway)
-                await q.edit_message_text(
-                    f"✅ {gateway.title()} connection successful.\n\nMode: {result.get('mode','test').title()}\nAPI access verified.",
-                    reply_markup=self.back(f"a_pg_view_{gateway}"),
-                )
+                await test_gateway_connection("seller",owner,gateway)
+                extra=""
+                if gateway=="razorpay":
+                    cfg=await get_gateway_config("seller",owner,decrypt=True)
+                    g=(cfg.get("gateways") or {}).get("razorpay",{})
+                    extra=(f"\nWebhook URL: {'Generated ✅' if PUBLIC_BASE_URL else 'Missing ❌'}" f"\nWebhook Secret: {'Saved ✅' if g.get('webhook_secret') else 'Missing ❌'}")
+                await q.edit_message_text(f"✅ {gateway.title()} connection successful.\n\nMode: LIVE\nAPI access verified.{extra}",reply_markup=self.back(f"a_pg_view_{gateway}"))
             except GatewayError as exc:
-                await q.edit_message_text(
-                    f"❌ {gateway.title()} connection failed.\n\n{exc}",
-                    reply_markup=self.back(f"a_pg_view_{gateway}"),
-                )
+                await q.edit_message_text(f"❌ {gateway.title()} connection failed.\n\n{exc}",reply_markup=self.back(f"a_pg_view_{gateway}"))
             return
-        if a.startswith("a_pg_mode_test_") or a.startswith("a_pg_mode_live_"):
-            mode="test" if a.startswith("a_pg_mode_test_") else "live"; gateway=a.rsplit("_",1)[-1]
-            await save_gateway_config("seller",owner,gateway,{"mode":mode}); await q.edit_message_text(f"✅ {gateway.title()} mode: {mode}",reply_markup=self.payment_menu()); return
         if a.startswith("a_pg_creds_"):
-            gateway=a.replace("a_pg_creds_",""); context.user_data.clear(); context.user_data["wait_pg_credentials"]=gateway
+            gateway=a.replace("a_pg_creds_","")
+            context.user_data.clear()
+            context.user_data["wait_pg_credentials"]=gateway
             help_text={"razorpay":"KEY_ID | KEY_SECRET | WEBHOOK_SECRET","cashfree":"CLIENT_ID | CLIENT_SECRET","phonepe":"CLIENT_ID | CLIENT_VERSION | CLIENT_SECRET | WEBHOOK_USERNAME | WEBHOOK_PASSWORD","paytm":"MID | MERCHANT_KEY | WEBSITE_NAME"}[gateway]
             await q.edit_message_text(f"Send credentials:\n{help_text}",reply_markup=self.back("a_pg_home")); return
         if a=="a_pg_default":
@@ -2001,7 +2129,7 @@ class SellerBotManager:
             return
 
         if a=="a_payment":
-            s=await get_seller_settings(owner); await q.edit_message_text(f"💳 Payment Settings\n\nUPI Name: {s.get('upi_name') or 'Not Set'}\nUPI ID: {s.get('upi_id') or 'Not Set'}\nQR: {'Added' if s.get('upi_qr_file_id') else 'Not Added'}",reply_markup=self.payment_menu()); return
+            await q.edit_message_text(await self.seller_payment_text(owner),reply_markup=self.payment_menu()); return
         state={"a_set_upi_id":("wait_upi_id","Send UPI ID","a_payment"),"a_set_upi_name":("wait_upi_name","Send UPI Name","a_payment"),"a_set_bot_name":("wait_bot_name","Send Bot Name","a_settings"),"a_set_support":("wait_support","Send Support Username","a_settings"),"a_set_currency":("wait_currency","Send Currency","a_settings"),"a_set_timezone":("wait_timezone","__TIMEZONE_PICKER__","a_settings"),"a_set_reminder":("wait_reminder","Send Reminder Days","a_settings"),"a_set_referral_days":("wait_referral_days","Send free reward days per successful referral","a_settings")}
         if a in state:
             key,msg,back=state[a]
@@ -2844,6 +2972,23 @@ class SellerBotManager:
         owner=self.owner(context); text=update.effective_message.text.strip()
         staff = await self.staff_record(update, context)
         if staff:
+            field_state=context.user_data.get("wait_pg_field")
+            if field_state:
+                value=text.strip()
+                if not value:
+                    await update.effective_message.reply_text("❌ Value cannot be empty.")
+                    return
+                try:
+                    await save_gateway_config("seller",owner,field_state["gateway"],{field_state["field"]:value})
+                    context.user_data.clear()
+                    try:
+                        await update.effective_message.delete()
+                    except Exception:
+                        pass
+                    await context.bot.send_message(update.effective_chat.id,"✅ Saved securely.",reply_markup=self.back("a_pg_view_razorpay"))
+                except Exception as exc:
+                    await update.effective_message.reply_text(f"❌ {exc}")
+                return
             gateway=context.user_data.get("wait_pg_credentials")
             if gateway:
                 values=[x.strip() for x in text.split("|")]
