@@ -60,7 +60,7 @@ def seller_welcome_keyboard(has_bot: bool):
     rows = [
         [InlineKeyboardButton("🤖 Manage My Clone Bots", callback_data="seller_bots_list")],
         [InlineKeyboardButton("➕ Create New Clone Bot", callback_data="seller_connect")],
-        [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
+        [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan_home")],
         [InlineKeyboardButton("📊 View Current Plan", callback_data="seller_current_plan")],
         [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
         [InlineKeyboardButton("🌐 Official Links", callback_data="official_links_open")],

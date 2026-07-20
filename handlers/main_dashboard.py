@@ -76,7 +76,7 @@ def seller_dashboard_keyboard(record=None):
             ],
             [InlineKeyboardButton("🔄 Replace Token", callback_data="seller_replace")],
             [InlineKeyboardButton("🗑 Remove Bot", callback_data="seller_remove")],
-            [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
+            [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan_home")],
             [InlineKeyboardButton("📊 View Current Plan", callback_data="seller_current_plan")],
             [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
         ])
@@ -86,7 +86,7 @@ def seller_dashboard_keyboard(record=None):
             InlineKeyboardButton("➕ Create / Connect Clone Bot", callback_data="seller_connect")
         ])
         rows.extend([
-            [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
+            [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan_home")],
             [InlineKeyboardButton("📊 View Current Plan", callback_data="seller_current_plan")],
             [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
         ])
@@ -898,7 +898,7 @@ async def main_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             text,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💎 Buy / Change Plan",callback_data="seller_upgrade_plan")],
+                [InlineKeyboardButton("💎 Buy / Change Plan",callback_data="seller_upgrade_plan_profile")],
                 [InlineKeyboardButton("⬅ Seller Dashboard",callback_data="main_seller_dashboard")],
             ]),
         )

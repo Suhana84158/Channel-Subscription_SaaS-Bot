@@ -72,7 +72,7 @@ async def send_seller_upgrade_plan(message, owner_id: int) -> None:
         ])
     if not plans:
         lines.append("No paid seller plans are available right now.")
-    rows.append([InlineKeyboardButton("⬅ Back", callback_data="main_seller_profile")])
+    rows.append([InlineKeyboardButton("⬅ Back", callback_data="main_home")])
     await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -303,7 +303,7 @@ def selected_back(bot_id: int):
 
 def selected_profile_markup(bot_id: int):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💎 Buy / Change Plan", callback_data="seller_upgrade_plan")],
+        [InlineKeyboardButton("💎 Buy / Change Plan", callback_data=f"seller_upgrade_plan_selected_{int(bot_id)}")],
         [InlineKeyboardButton("📜 Plan History", callback_data="seller_plan_history")],
         [InlineKeyboardButton("⬅ Back", callback_data=f"seller_select_{int(bot_id)}")],
     ])
@@ -823,7 +823,7 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(await current_plan_text(owner_id), reply_markup=seller_plan_page_keyboard())
         return
 
-    if action == "seller_upgrade_plan":
+    if action.startswith("seller_upgrade_plan"):
         cfg = await get_config()
         plans = [p for p in cfg.get("paid_plans", []) if p.get("active", True)]
         rows = []
@@ -833,7 +833,17 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"• {p.get('name','Plan')} — ₹{p.get('price',0):g} / {p.get('duration_days',30)} days")
             typ = "upgrade" if float(p.get("price", 0)) >= float(current.get("price", 0)) else "downgrade"
             rows.append([InlineKeyboardButton(f"Select {p.get('name')}", callback_data=f"seller_buy_{typ}_{p.get('plan_id')}")])
-        rows.append([InlineKeyboardButton("⬅ Back", callback_data="main_seller_profile")])
+        if action == "seller_upgrade_plan_profile":
+            back_target = "main_seller_profile"
+        elif action.startswith("seller_upgrade_plan_selected_"):
+            try:
+                selected_bot_id = int(action.rsplit("_", 1)[1])
+                back_target = f"seller_selected_profile_{selected_bot_id}"
+            except (TypeError, ValueError):
+                back_target = "seller_bots_list"
+        else:
+            back_target = "main_home"
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data=back_target)])
         markup = InlineKeyboardMarkup(rows)
         text = "\n".join(lines)
         # A seller payment screen may be a photo (QR code). Telegram cannot use
