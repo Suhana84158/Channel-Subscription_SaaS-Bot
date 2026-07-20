@@ -1353,7 +1353,6 @@ class SellerBotManager:
                     "💎 Buy / Change Plan",
                     url=f"https://t.me/{main_bot_username}?start=sellerplan",
                 )],
-                [InlineKeyboardButton("📜 Plan History",callback_data="a_seller_plan_history")],
                 [InlineKeyboardButton("⬅ Seller Admin Panel",callback_data="a_home")],
             ])
             await q.edit_message_text(text,reply_markup=kb)
