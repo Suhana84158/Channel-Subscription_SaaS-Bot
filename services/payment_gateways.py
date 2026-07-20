@@ -24,7 +24,7 @@ from database.payment_gateways import (
     update_gateway_transaction,
 )
 from database.seller_data import activate_subscription, get_plan, create_automatic_payment, get_subscription
-from database.seller_subscriptions import assign_plan_with_history, get_paid_plan
+from database.seller_subscriptions import get_paid_plan, process_verified_plan_purchase
 from database.platform_features import create_invoice, audit
 
 
@@ -454,13 +454,14 @@ async def fulfill_transaction(tx: dict) -> None:
         plan = await get_paid_plan(plan_id)
         if not plan:
             raise GatewayError("Seller plan no longer exists")
-        assignment = await assign_plan_with_history(
+        purchase = await process_verified_plan_purchase(
             tx["payer_user_id"],
             plan_id,
             int(plan.get("duration_days", 30)),
-            f"gateway:{tx['gateway']}",
-            tx["amount"],
-            0,
+            source=f"gateway:{tx['gateway']}",
+            amount=tx["amount"],
+            payment_reference=tx["transaction_id"],
+            approved_by=0,
         )
         payment_record = {
             "payment_id": tx.get("gateway_payment_id") or tx["transaction_id"],
@@ -480,11 +481,30 @@ async def fulfill_transaction(tx: dict) -> None:
                 "invoice_no": invoice.get("invoice_no"),
             },
         )
+        try:
+            from keep_alive import send_runtime_message
+            if purchase.get("status") == "decision_required":
+                from handlers.seller import plan_change_text, plan_change_keyboard
+                await send_runtime_message(
+                    tx["payer_user_id"],
+                    plan_change_text(purchase),
+                    reply_markup=plan_change_keyboard(purchase["payment_id"]),
+                )
+            elif purchase.get("decision") == "same_plan_extended":
+                await send_runtime_message(
+                    tx["payer_user_id"],
+                    f"✅ Plan Extended Successfully\n\nPlan: {plan.get('name', plan_id)}\nDuration Added: {int(plan.get('duration_days', 30))} Days\nYour remaining validity has been preserved.",
+                )
+        except Exception:
+            pass
+
         await mark_transaction_fulfilled(
             tx["transaction_id"],
             {
                 "plan_id": plan_id,
-                "expiry_date": assignment.get("expiry_date"),
+                "expiry_date": purchase.get("expiry_date"),
+                "purchase_status": purchase.get("status"),
+                "payment_id": purchase.get("payment_id"),
                 "invoice_no": invoice.get("invoice_no"),
             },
         )
