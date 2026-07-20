@@ -322,6 +322,8 @@ async def initialize_seller_subscription_extra_indexes():
         name="unique_pending_seller_plan_payment",
     )
     await _payments().create_index([("status", 1), ("created_at", -1)])
+    await _payments().create_index("verified_reference", unique=True, sparse=True)
+    await _payments().create_index([("status", 1), ("activation_date", 1)])
     await _history().create_index([("owner_id", 1), ("created_at", -1)])
     await _requests().create_index([("owner_id", 1), ("status", 1)])
 
@@ -680,3 +682,234 @@ async def mark_reminder_sent(owner_id: int, key: str):
             "$set": {"reminder_sent_at": datetime.now(timezone.utc)},
         },
     )
+
+# ---------------------------------------------------------------------------
+# Verified seller-plan purchase decision workflow
+# ---------------------------------------------------------------------------
+
+async def process_verified_plan_purchase(
+    owner_id: int,
+    plan_id: str,
+    days: int,
+    *,
+    source: str,
+    amount: float = 0,
+    payment_reference: str = "",
+    approved_by: int | None = None,
+):
+    """Apply same-plan renewals immediately or create a decision-required purchase.
+
+    This function is idempotent for a non-empty ``payment_reference``.
+    """
+    owner_id = int(owner_id)
+    days = int(days)
+    if days <= 0:
+        raise ValueError("Plan duration must be greater than zero")
+    plan = await get_paid_plan(plan_id)
+    if not plan:
+        raise ValueError("Paid plan not found")
+
+    now = datetime.now(timezone.utc)
+    reference = str(payment_reference or "").strip()
+    if reference:
+        existing = await _payments().find_one({"verified_reference": reference})
+        if existing:
+            return existing
+
+    assignment = await get_assignment(owner_id) or {}
+    current_plan_id = str(assignment.get("plan_id") or "free")
+    expiry = assignment.get("expiry_date")
+    if expiry and expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+
+    # Same plan: preserve remaining validity and extend automatically.
+    if current_plan_id == plan_id and (not expiry or expiry > now):
+        updated = await extend_plan_with_history(
+            owner_id, plan_id, days, source=source, approved_by=approved_by
+        )
+        doc = {
+            "payment_id": reference or __import__("secrets").token_hex(8),
+            "owner_id": owner_id,
+            "plan_id": plan_id,
+            "plan_name": plan.get("name", plan_id),
+            "amount": float(amount or 0),
+            "duration_days": days,
+            "source": source,
+            "status": "activated",
+            "decision": "same_plan_extended",
+            "expiry_date": updated.get("expiry_date"),
+            "created_at": now,
+            "updated_at": now,
+        }
+        if reference:
+            doc["verified_reference"] = reference
+        await _payments().insert_one(doc)
+        return doc
+
+    # Different plan: payment is verified but activation awaits seller choice.
+    doc = {
+        "payment_id": reference or __import__("secrets").token_hex(8),
+        "owner_id": owner_id,
+        "plan_id": plan_id,
+        "plan_name": plan.get("name", plan_id),
+        "amount": float(amount or 0),
+        "duration_days": days,
+        "source": source,
+        "status": "decision_required",
+        "decision": None,
+        "current_plan_id": current_plan_id,
+        "current_expiry": expiry,
+        "approved_by": approved_by,
+        "created_at": now,
+        "updated_at": now,
+    }
+    if reference:
+        doc["verified_reference"] = reference
+    try:
+        await _payments().insert_one(doc)
+    except DuplicateKeyError:
+        if reference:
+            return await _payments().find_one({"verified_reference": reference})
+        raise
+    await record_history(
+        owner_id,
+        "plan_change_decision_required",
+        previous_plan=current_plan_id,
+        new_plan=plan_id,
+        days=days,
+        source=source,
+        amount=float(amount or 0),
+        payment_reference=reference,
+    )
+    return doc
+
+
+async def get_verified_plan_purchase(payment_id: str):
+    return await _payments().find_one({"payment_id": str(payment_id)})
+
+
+async def choose_verified_plan_purchase(payment_id: str, owner_id: int, decision: str):
+    """Atomically apply one seller choice. Duplicate clicks are harmless."""
+    decision = str(decision)
+    if decision not in {"replace_now", "after_expiry", "keep_pending"}:
+        raise ValueError("Invalid plan decision")
+    now = datetime.now(timezone.utc)
+    eligible = {"status": "decision_required", "decision": None}
+    if decision == "replace_now":
+        eligible = {"status": {"$in": ["decision_required", "pending", "scheduled"]}}
+    purchase = await _payments().find_one_and_update(
+        {
+            "payment_id": str(payment_id),
+            "owner_id": int(owner_id),
+            **eligible,
+        },
+        {"$set": {"status": "processing", "decision": decision, "updated_at": now}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not purchase:
+        return await get_verified_plan_purchase(payment_id), False
+
+    plan_id = purchase["plan_id"]
+    days = int(purchase["duration_days"])
+    try:
+        if decision == "replace_now":
+            assignment = await assign_plan_with_history(
+                owner_id,
+                plan_id,
+                days,
+                source=f"{purchase.get('source', 'payment')}:replace_now",
+                amount=float(purchase.get("amount", 0)),
+                approved_by=purchase.get("approved_by"),
+            )
+            final_status = "activated"
+            activation_date = now
+            expiry_date = assignment.get("expiry_date")
+        elif decision == "after_expiry":
+            current = await get_assignment(owner_id) or {}
+            activation_date = current.get("expiry_date") or now
+            if activation_date.tzinfo is None:
+                activation_date = activation_date.replace(tzinfo=timezone.utc)
+            if activation_date <= now:
+                activation_date = now
+            expiry_date = activation_date + timedelta(days=days)
+            final_status = "scheduled"
+        else:
+            activation_date = None
+            expiry_date = None
+            final_status = "pending"
+
+        await _payments().update_one(
+            {"payment_id": str(payment_id), "status": "processing"},
+            {"$set": {
+                "status": final_status,
+                "activation_date": activation_date,
+                "expiry_date": expiry_date,
+                "decided_at": now,
+                "updated_at": now,
+            }},
+        )
+        await record_history(
+            owner_id,
+            f"plan_purchase_{decision}",
+            previous_plan=purchase.get("current_plan_id"),
+            new_plan=plan_id,
+            days=days,
+            amount=float(purchase.get("amount", 0)),
+            payment_reference=purchase.get("verified_reference"),
+            activation_date=activation_date,
+            expiry_date=expiry_date,
+        )
+    except Exception:
+        await _payments().update_one(
+            {"payment_id": str(payment_id), "status": "processing"},
+            {"$set": {"status": "decision_required", "decision": None, "updated_at": now}},
+        )
+        raise
+    return await get_verified_plan_purchase(payment_id), True
+
+
+async def pending_plan_purchase(owner_id: int):
+    return await _payments().find_one(
+        {"owner_id": int(owner_id), "status": {"$in": ["decision_required", "pending", "scheduled"]}},
+        sort=[("created_at", -1)],
+    )
+
+
+async def activate_due_scheduled_plan_purchases(limit: int = 100):
+    now = datetime.now(timezone.utc)
+    rows = await _payments().find({
+        "status": "scheduled",
+        "activation_date": {"$lte": now},
+    }).sort("activation_date", 1).limit(limit).to_list(length=limit)
+    activated = []
+    for row in rows:
+        claimed = await _payments().find_one_and_update(
+            {"payment_id": row["payment_id"], "status": "scheduled", "activation_date": {"$lte": now}},
+            {"$set": {"status": "processing_activation", "updated_at": now}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not claimed:
+            continue
+        try:
+            assignment = await assign_plan_with_history(
+                claimed["owner_id"], claimed["plan_id"], int(claimed["duration_days"]),
+                source=f"{claimed.get('source', 'payment')}:scheduled_activation",
+                amount=float(claimed.get("amount", 0)), approved_by=claimed.get("approved_by"),
+            )
+            await _payments().update_one(
+                {"payment_id": claimed["payment_id"], "status": "processing_activation"},
+                {"$set": {"status": "activated", "activated_at": now,
+                          "expiry_date": assignment.get("expiry_date"), "updated_at": now}},
+            )
+            await record_history(
+                claimed["owner_id"], "scheduled_plan_activated",
+                new_plan=claimed["plan_id"], days=claimed["duration_days"],
+                expiry_date=assignment.get("expiry_date"),
+            )
+            activated.append(await get_verified_plan_purchase(claimed["payment_id"]))
+        except Exception as exc:
+            await _payments().update_one(
+                {"payment_id": claimed["payment_id"], "status": "processing_activation"},
+                {"$set": {"status": "scheduled", "activation_error": str(exc), "updated_at": now}},
+            )
+    return activated
