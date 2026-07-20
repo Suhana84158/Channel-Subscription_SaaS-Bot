@@ -537,13 +537,28 @@ class SellerBotManager:
                 raise
 
     @staticmethod
-    def format_dt(value):
+    def format_dt(value, timezone_name="Asia/Kolkata", fmt="%d-%m-%Y %I:%M:%S %p %Z"):
         if not value:
             return "-"
         try:
-            return value.astimezone(timezone.utc).strftime("%d-%m-%Y %I:%M:%S %p UTC")
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            try:
+                zone = ZoneInfo(timezone_name or "Asia/Kolkata")
+            except (ZoneInfoNotFoundError, ValueError, TypeError):
+                zone = ZoneInfo("Asia/Kolkata")
+            return value.astimezone(zone).strftime(fmt)
         except Exception:
             return str(value)
+
+    async def seller_timezone(self, owner_id:int) -> str:
+        settings = await get_seller_settings(int(owner_id)) or {}
+        timezone_name = str(settings.get("timezone") or "Asia/Kolkata")
+        try:
+            ZoneInfo(timezone_name)
+            return timezone_name
+        except (ZoneInfoNotFoundError, ValueError):
+            return "Asia/Kolkata"
 
     async def user_details_text(self,owner,user_id):
         user=await get_user(owner,int(user_id))
@@ -552,6 +567,7 @@ class SellerBotManager:
         if not user:
             return None,None,None
 
+        timezone_name = await self.seller_timezone(owner)
         username=f"@{user.get('username')}" if user.get("username") else "Not set"
         name=" ".join(
             value for value in [user.get("first_name"),user.get("last_name")]
@@ -573,9 +589,9 @@ class SellerBotManager:
             f"📝 Username: {username}\n"
             f"🚫 Banned: {'Yes' if user.get('banned') else 'No'}\n"
             f"📋 Reason: {user.get('ban_reason') or '-'}\n"
-            f"📅 Joined: {self.format_dt(user.get('joined_at'))}\n\n"
+            f"📅 Joined: {self.format_dt(user.get('joined_at'), timezone_name)}\n\n"
             f"💎 Plan: {(sub or {}).get('plan') or 'No Plan'}\n"
-            f"📅 Expiry: {self.format_dt((sub or {}).get('expiry_date'))}\n"
+            f"📅 Expiry: {self.format_dt((sub or {}).get('expiry_date'), timezone_name)}\n"
             f"📌 Status: {'Active' if active else 'No Subscription'}"
         )
         return text,user,sub
@@ -1105,6 +1121,7 @@ class SellerBotManager:
 
         if action=="c_profile":
             try:
+                timezone_name = await self.seller_timezone(owner)
                 user_record=await get_user(owner,q.from_user.id) or {}
                 sub=await get_subscription(owner,q.from_user.id)
                 me=await context.bot.get_me()
@@ -1118,7 +1135,7 @@ class SellerBotManager:
 
                 joined=aware_utc(user_record.get("joined_at"))
                 joined_text=(
-                    joined.strftime("%d %b %Y, %I:%M %p UTC")
+                    self.format_dt(joined, timezone_name, "%d %b %Y, %I:%M %p %Z")
                     if joined else "Unknown"
                 )
 
@@ -1185,11 +1202,11 @@ class SellerBotManager:
                         or sub.get("created_at")
                     )
                     start_text=(
-                        start.strftime("%d %b %Y, %I:%M %p UTC")
+                        self.format_dt(start, timezone_name, "%d %b %Y, %I:%M %p %Z")
                         if start else "Unknown"
                     )
-                    expiry_text=expiry.strftime(
-                        "%d %b %Y, %I:%M %p UTC"
+                    expiry_text=self.format_dt(
+                        expiry, timezone_name, "%d %b %Y, %I:%M %p %Z"
                     )
 
                     amount=sub.get("amount")
@@ -1318,6 +1335,7 @@ class SellerBotManager:
             )
             return
         if a=="a_seller_profile":
+            timezone_name = await self.seller_timezone(owner)
             plan,assignment=await effective_plan(owner)
             usage=await stats(owner)
             bot_record=await get_bot_by_data_owner_id(owner) or {}
@@ -1356,7 +1374,7 @@ class SellerBotManager:
                 "\n\n💎 Plan Details\n"
                 f"Plan: {plan.get('name','Free')}\n"
                 f"Status: {status}\n"
-                f"Expiry: {self.format_dt(expiry)}\n"
+                f"Expiry: {self.format_dt(expiry, timezone_name)}\n"
                 f"Remaining: {remaining_text}\n\n"
                 "📊 Usage & Limits\n"
                 f"🤖 Clone Bots: {1 if bot_record else 0} / {lim(plan.get('bot_limit',1))}\n"
@@ -2514,7 +2532,7 @@ class SellerBotManager:
             return "-"
         if value.tzinfo is None:
             value=value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc).strftime("%d %b %Y, %I:%M %p UTC")
+        return SellerBotManager.format_dt(value)
 
     async def support_user_details_text(self,owner,user):
         record=await get_user(owner,user.id) or {}
@@ -3387,6 +3405,7 @@ class SellerBotManager:
             return {"sent": 0, "failed": 0, "error": "Clone bot is not running"}
 
         bot = running.application.bot
+        timezone_name = await self.seller_timezone(owner_id)
         seller_account_id = int(
             running.application.bot_data.get("seller_account_id", owner_id)
         )
@@ -3400,11 +3419,7 @@ class SellerBotManager:
             username = details.get("username")
 
         def _format_dt(value):
-            if not value:
-                return "-"
-            if hasattr(value, "strftime"):
-                return value.strftime("%d %b %Y, %I:%M %p UTC")
-            return str(value)
+            return self.format_dt(value, timezone_name, "%d %b %Y, %I:%M %p %Z")
 
         safe_name = html.escape(full_name)
         safe_username = html.escape(f"@{username}" if username else "Not Set")
@@ -3481,6 +3496,7 @@ class SellerBotManager:
             return {"sent":0,"already_member":0,"failed":0,"error":"Clone bot is not running"}
 
         bot=running.application.bot
+        timezone_name = await self.seller_timezone(int(owner_id))
         channels=await get_channels(int(owner_id))
         links=[]
         already_member=0
@@ -3531,11 +3547,7 @@ class SellerBotManager:
                     username_text = f"@{username}" if username else "Not Set"
 
                     def _format_dt(value):
-                        if not value:
-                            return "-"
-                        if hasattr(value, "strftime"):
-                            return value.strftime("%d %b %Y, %I:%M %p UTC")
-                        return str(value)
+                        return self.format_dt(value, timezone_name, "%d %b %Y, %I:%M %p %Z")
 
                     text = (
                         "✅ Payment verified automatically\n"
