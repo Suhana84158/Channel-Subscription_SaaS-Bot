@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
+from config import PUBLIC_BASE_URL
 from database.admins import is_admin
+from database.official_links import get_official_links
 from database.payment_gateways import (
     SUPPORTED_GATEWAYS,
     create_gateway_transaction,
@@ -39,6 +43,53 @@ def _masked(value: str | None) -> str:
     return f"Added (…{value[-4:]})"
 
 
+def _webhook_url(scope: str, owner_id: int) -> str:
+    if not PUBLIC_BASE_URL:
+        return "PUBLIC_BASE_URL is not configured"
+    return f"{PUBLIC_BASE_URL}/webhooks/razorpay/{scope}/{int(owner_id)}"
+
+
+def _webhook_setup_text(scope: str, owner_id: int, gcfg: dict) -> str:
+    received = gcfg.get("last_webhook_received_at")
+    received_text = "Received ✅" if received else "Not received yet ⚪"
+    return (
+        "🔗 Razorpay Webhook Setup\n\n"
+        "Your unique webhook URL has been generated automatically.\n\n"
+        f"Webhook URL:\n`{_webhook_url(scope, owner_id)}`\n\n"
+        "Required Events:\n"
+        "• payment.captured\n"
+        "• order.paid\n"
+        "• payment_link.paid\n\n"
+        f"Webhook Secret: {'Added ✅' if gcfg.get('webhook_secret') else 'Not added ❌'}\n"
+        f"Last valid webhook: {received_text}"
+    )
+
+
+def _webhook_keyboard(scope: str):
+    return _kb([
+        [InlineKeyboardButton("🧪 Test Webhook", callback_data=f"pgcfg_{scope}_razorpay_testwebhook")],
+        [InlineKeyboardButton("📖 Setup Guide", callback_data=f"pgcfg_{scope}_razorpay_guide")],
+        [InlineKeyboardButton("⬅ Back", callback_data=f"pgcfg_{scope}_razorpay")],
+    ])
+
+
+def _guide_text() -> str:
+    return (
+        "📖 Razorpay Webhook Setup Guide\n\n"
+        "1. Log in to your Razorpay Dashboard.\n"
+        "2. Open Settings → Webhooks.\n"
+        "3. Tap Add New Webhook.\n"
+        "4. Copy the Webhook URL shown on the Webhook Setup page and paste it in Razorpay.\n"
+        "5. Create a strong Webhook Secret.\n"
+        "6. Select payment.captured, order.paid and payment_link.paid.\n"
+        "7. Save the webhook.\n"
+        "8. Return to the Razorpay page in this bot.\n"
+        "9. Tap Set Webhook Secret and paste the same secret.\n"
+        "10. Open Webhook Setup and tap Test Webhook.\n\n"
+        "Important: Razorpay Key Secret and Webhook Secret are different."
+    )
+
+
 def _payment_header(scope: str, cfg: dict) -> str:
     gateways = cfg.get("gateways") or {}
     rz = gateways.get("razorpay") or {}
@@ -69,9 +120,14 @@ def _home_keyboard(scope: str, cfg: dict):
 def _gateway_keyboard(scope: str, gateway: str, enabled: bool):
     rows = [
         [InlineKeyboardButton("⛔ Disable" if enabled else "✅ Enable", callback_data=f"pgcfg_{scope}_{gateway}_toggle")],
+        [InlineKeyboardButton("🔑 Set / Replace Credentials", callback_data=f"pgcfg_{scope}_{gateway}_credentials")],
     ]
+    if gateway == "razorpay":
+        rows += [
+            [InlineKeyboardButton("🔐 Set Webhook Secret", callback_data=f"pgcfg_{scope}_razorpay_field_webhook_secret")],
+            [InlineKeyboardButton("🔗 Webhook Setup", callback_data=f"pgcfg_{scope}_razorpay_webhook")],
+        ]
     rows += [
-        [InlineKeyboardButton("🔐 Set / Replace Credentials", callback_data=f"pgcfg_{scope}_{gateway}_credentials")],
         [InlineKeyboardButton("✅ Test Connection", callback_data=f"pgcfg_{scope}_{gateway}_test")],
         [InlineKeyboardButton("⬅ Back", callback_data=f"pgcfg_{scope}_home")],
     ]
@@ -83,7 +139,8 @@ def _gateway_header(scope: str, gateway: str, gcfg: dict) -> str:
         credential_lines = (
             f"Key ID: {_masked(gcfg.get('key_id'))}\n"
             f"Key Secret: {'Added' if gcfg.get('key_secret') else 'Not added'}\n"
-            f"Webhook Secret: {'Added' if gcfg.get('webhook_secret') else 'Not added'}"
+            f"Webhook URL: {'Generated ✅' if PUBLIC_BASE_URL else 'Not available ❌'}\n"
+            f"Webhook Secret: {'Added ✅' if gcfg.get('webhook_secret') else 'Not added ❌'}"
         )
     else:
         credential_lines = (
@@ -91,11 +148,11 @@ def _gateway_header(scope: str, gateway: str, gcfg: dict) -> str:
             f"Client Secret: {'Added' if gcfg.get('client_secret') else 'Not added'}"
         )
     return (
-        f"💳 {gateway.title()} — {'Owner' if scope == 'owner' else 'Seller'}\n\n"
+        f"💳 {gateway.title()}\n\n"
         f"Status: {'Enabled ✅' if gcfg.get('enabled') else 'Disabled ❌'}\n"
-        "Mode: LIVE 🚀\n"
         f"{credential_lines}"
     )
+
 
 def _credential_help(gateway: str) -> str:
     return {
@@ -185,6 +242,51 @@ async def gateway_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cfg = await save_gateway_config(scope, owner_id, gateway, {"mode": "live"})
         gcfg = (cfg.get("gateways") or {}).get(gateway) or {}
         await q.edit_message_text(_gateway_header(scope, gateway, gcfg), reply_markup=_gateway_keyboard(scope, gateway, bool(gcfg.get("enabled"))))
+        return
+
+    if gateway == "razorpay" and suffix == "webhook":
+        await q.edit_message_text(
+            _webhook_setup_text(scope, owner_id, gcfg),
+            reply_markup=_webhook_keyboard(scope),
+            parse_mode="Markdown",
+        )
+        return
+
+    if gateway == "razorpay" and suffix == "guide":
+        links = await get_official_links()
+        rows = []
+        support_url = links.get("support")
+        if support_url:
+            rows.append([InlineKeyboardButton("💬 Contact Support", url=support_url)])
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data=f"pgcfg_{scope}_razorpay_webhook")])
+        await q.edit_message_text(_guide_text(), reply_markup=_kb(rows))
+        return
+
+    if gateway == "razorpay" and suffix == "testwebhook":
+        cfg = await get_gateway_config(scope, owner_id, decrypt=True)
+        gcfg = (cfg.get("gateways") or {}).get("razorpay") or {}
+        last_received = gcfg.get("last_webhook_received_at")
+        if last_received:
+            when = last_received.strftime("%Y-%m-%d %H:%M UTC") if isinstance(last_received, datetime) else str(last_received)
+            text = (
+                "✅ Test Webhook Received\n\n"
+                "A valid Razorpay webhook signature was received successfully.\n"
+                f"Last received: {when}"
+            )
+        else:
+            text = (
+                "🧪 Razorpay Webhook Test\n\n"
+                "No valid webhook has been received yet.\n\n"
+                "Send a test webhook from Razorpay Dashboard or complete a test payment, then tap Check Again."
+            )
+        await q.edit_message_text(
+            text,
+            reply_markup=_kb([
+                [InlineKeyboardButton("🔄 Check Again", callback_data=f"pgcfg_{scope}_razorpay_testwebhook")],
+                [InlineKeyboardButton("📖 Setup Guide", callback_data=f"pgcfg_{scope}_razorpay_guide")],
+                [InlineKeyboardButton("⬅ Back", callback_data=f"pgcfg_{scope}_razorpay_webhook")],
+            ]),
+        )
         return
 
     if suffix == "test":
