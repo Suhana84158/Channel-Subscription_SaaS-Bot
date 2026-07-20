@@ -1250,7 +1250,7 @@ async def receive_seller_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def seller_handlers():
     return [
-        CallbackQueryHandler(seller_callback, pattern=r"^seller_(bots_list|select_\d+|connect|replace_\d+|pause_\d+|resume_\d+|remove_\d+|upgrade_plan|current_plan|plan_history|buy_.*|manual_.*|selected_.*|set_.*|channel_.*)$"),
+        CallbackQueryHandler(seller_callback, pattern=r"^seller_(bots_list|select_\d+|connect|replace_\d+|pause_\d+|resume_\d+|remove_\d+|upgrade_plan(?:_home|_profile|_selected_\d+)?|current_plan|plan_history|buy_.*|manual_.*|selected_.*|set_.*|channel_.*)$"),
         MessageHandler(filters.PHOTO, receive_seller_qr),
         MessageHandler(filters.TEXT & ~filters.COMMAND, receive_seller_token),
     ]

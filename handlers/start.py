@@ -5,7 +5,7 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
 from config import ADMIN_IDS
 from database.admins import is_admin
-from database.seller_bots import get_bot
+from database.seller_bots import get_bot, get_bots
 from database.sellers import get_or_create_seller, get_seller
 from database.seller_referrals import register_seller_referral, reward_seller_referral
 from database.users import get_or_create_user
@@ -82,11 +82,22 @@ async def role_welcome(user_id: int):
             owner_welcome_keyboard(),
         )
 
-    seller, bot = await asyncio.gather(
+    seller, bots = await asyncio.gather(
         _bounded(get_seller(user_id), default=None, label="seller lookup"),
-        _bounded(get_bot(user_id), default=None, label="clone bot lookup"),
+        _bounded(get_bots(user_id), default=[], label="clone bots lookup"),
     )
+    bots = bots or []
     seller_name = (seller or {}).get("first_name") or "Seller"
+
+    if bots:
+        connected_lines = [f"🤖 Connected Clone Bots ({len(bots)}):"]
+        for index, bot in enumerate(bots, start=1):
+            username = bot.get("bot_username") or "Unknown"
+            status = "🟢 Active" if bot.get("active") else "⏸ Paused"
+            connected_lines.append(f"{index}. @{username} — {status}")
+        connected_text = "\n".join(connected_lines)
+    else:
+        connected_text = "No clone bot connected yet. Tap the button below to create one."
 
     return (
         "🤖 Build Your Subscription Bot\n\n"
@@ -97,13 +108,8 @@ async def role_welcome(user_id: int):
         "✅ Accept and approve payments\n"
         "✅ Auto-remove expired members\n"
         "✅ Broadcast, referrals and user management\n\n"
-        + (
-            f"Connected Bot: @{bot.get('bot_username')}\n"
-            f"Status: {'🟢 Active' if bot.get('active') else '⏸ Paused'}"
-            if bot
-            else "No clone bot connected yet. Tap the button below to create one."
-        ),
-        seller_welcome_keyboard(bool(bot)),
+        + connected_text,
+        seller_welcome_keyboard(bool(bots)),
     )
 
 
