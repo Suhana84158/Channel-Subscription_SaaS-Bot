@@ -157,6 +157,27 @@ async def set_gateway_preferences(
     return await get_gateway_config(scope, owner_id, decrypt=True)
 
 
+async def mark_valid_webhook_received(scope: str, owner_id: int, gateway: str) -> None:
+    """Record the latest successfully authenticated webhook for setup testing."""
+    await _configs().update_one(
+        {"scope": scope, "owner_id": int(owner_id)},
+        {
+            "$set": {
+                f"gateways.{gateway}.last_webhook_received_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$setOnInsert": {
+                "scope": scope,
+                "owner_id": int(owner_id),
+                "default_gateway": "manual",
+                "manual_enabled": True,
+                "created_at": datetime.now(timezone.utc),
+            },
+        },
+        upsert=True,
+    )
+
+
 async def enabled_gateways(scope: str, owner_id: int = 0) -> list[str]:
     cfg = await get_gateway_config(scope, owner_id, decrypt=True)
     gateways = cfg.get("gateways") or {}
@@ -322,29 +343,6 @@ async def reserve_webhook_event(
         return True
     except DuplicateKeyError:
         return False
-
-
-async def mark_gateway_webhook_received(
-    scope: str, owner_id: int, gateway: str, event_name: str = ""
-) -> None:
-    """Remember that a correctly signed webhook reached this gateway config."""
-    now = datetime.now(timezone.utc)
-    await _configs().update_one(
-        {"scope": scope, "owner_id": int(owner_id)},
-        {
-            "$set": {
-                f"gateways.{gateway}.last_webhook_received_at": now,
-                f"gateways.{gateway}.last_webhook_event": str(event_name or ""),
-                "updated_at": now,
-            },
-            "$setOnInsert": {
-                "scope": scope,
-                "owner_id": int(owner_id),
-                "created_at": now,
-            },
-        },
-        upsert=True,
-    )
 
 
 async def gateway_history(scope: str, owner_id: int, limit: int = 50) -> list[dict]:
