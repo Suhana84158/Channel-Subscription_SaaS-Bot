@@ -25,6 +25,8 @@ from database.seller_subscriptions import (
     get_config,
     plan_limit_warning,
     subscription_history,
+    choose_verified_plan_purchase,
+    pending_plan_purchase,
 )
 from services.bot_manager import bot_manager
 from services.invite_resend_lock import resend_invites_safely
@@ -257,6 +259,7 @@ def limit_keyboard():
 
 def seller_plan_page_keyboard():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Pending Plan", callback_data="seller_pending_plan")],
         [InlineKeyboardButton("💳 Buy / Change Plan", callback_data="seller_upgrade_plan")],
         [InlineKeyboardButton("⬅ Back", callback_data="main_home")],
     ])
@@ -819,6 +822,57 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if action.startswith("seller_plan_decide_"):
+        raw = action.replace("seller_plan_decide_", "", 1)
+        decision = next((d for d in ("replace_now", "after_expiry", "keep_pending") if raw.startswith(d + "_")), None)
+        if not decision:
+            await q.answer("Invalid action", show_alert=True)
+            return
+        payment_id = raw[len(decision) + 1:]
+        purchase, changed = await choose_verified_plan_purchase(payment_id, owner_id, decision)
+        if not purchase:
+            await q.answer("Plan purchase not found", show_alert=True)
+            return
+        if not changed:
+            await q.answer("This plan choice was already processed.", show_alert=True)
+        await q.edit_message_text(_decision_result_text(purchase))
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    "📢 Seller Plan Decision\n\n"
+                    f"Seller ID: {owner_id}\n"
+                    f"Plan: {purchase.get('plan_name')}\n"
+                    f"Selected: {str(purchase.get('decision')).replace('_',' ').title()}\n"
+                    f"Payment ID: {purchase.get('payment_id')}",
+                )
+            except Exception:
+                pass
+        return
+
+    if action == "seller_pending_plan":
+        purchase = await pending_plan_purchase(owner_id)
+        if not purchase:
+            await q.edit_message_text("📦 Pending Plan\n\nNo pending or scheduled plan is available.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="seller_current_plan")]]))
+            return
+        text = (
+            "📦 Pending Plan\n\n"
+            f"Plan: {purchase.get('plan_name')}\n"
+            f"Purchase Date: {_fmt_dt(purchase.get('created_at'))}\n"
+            f"Payment Amount: ₹{float(purchase.get('amount',0)):g}\n"
+            f"Duration: {purchase.get('duration_days')} Days\n"
+            f"Scheduled Activation: {_fmt_dt(purchase.get('activation_date'))}\n"
+            f"Payment Method: {str(purchase.get('source') or 'Payment').replace('gateway:','').title()}\n"
+            f"Transaction ID: {purchase.get('verified_reference') or purchase.get('payment_id')}\n"
+            f"Status: {str(purchase.get('status')).replace('_',' ').title()}"
+        )
+        rows=[]
+        if purchase.get("status") in {"decision_required", "pending", "scheduled"}:
+            rows.append([InlineKeyboardButton("⚡ Activate Now", callback_data=f"seller_plan_decide_replace_now_{purchase['payment_id']}")])
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data="seller_current_plan")])
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
+        return
+
     if action == "seller_current_plan":
         await q.edit_message_text(await current_plan_text(owner_id), reply_markup=seller_plan_page_keyboard())
         return
@@ -1248,9 +1302,81 @@ async def receive_seller_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("✅ UPI QR updated.", reply_markup=payment_settings_markup(bot_id))
 
 
+
+def _fmt_dt(value):
+    if not value:
+        return "Not scheduled"
+    try:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.strftime("%d %b %Y, %I:%M %p UTC")
+    except Exception:
+        return str(value)
+
+
+def plan_change_text(purchase: dict) -> str:
+    return (
+        "🔄 Plan Change Detected\n\n"
+        "🎉 Payment Verified Successfully!\n\n"
+        "Your payment has been verified successfully.\n\n"
+        "The plan you purchased is different from your current active subscription.\n"
+        "Please choose how you would like to activate your new plan.\n\n"
+        "━━━━━━━━━━━━━━\n"
+        f"Current Plan: {str(purchase.get('current_plan_id') or 'Free').replace('_',' ').title()}\n"
+        f"Purchased Plan: {purchase.get('plan_name') or purchase.get('plan_id')}\n"
+        f"Current Plan Expires: {_fmt_dt(purchase.get('current_expiry'))}\n"
+        f"Purchased Duration: {int(purchase.get('duration_days', 0))} Days\n"
+        f"Payment Amount: ₹{float(purchase.get('amount', 0)):g}\n"
+        f"Payment Method: {str(purchase.get('source') or 'Payment').replace('gateway:','').title()}\n"
+        f"Transaction ID: {purchase.get('verified_reference') or purchase.get('payment_id')}\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "Choose one option below:"
+    )
+
+
+def plan_change_keyboard(payment_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ Replace Current Plan Now", callback_data=f"seller_plan_decide_replace_now_{payment_id}")],
+        [InlineKeyboardButton("🕒 Start After Current Plan Expiry", callback_data=f"seller_plan_decide_after_expiry_{payment_id}")],
+        [InlineKeyboardButton("⏳ Keep Pending for Now", callback_data=f"seller_plan_decide_keep_pending_{payment_id}")],
+    ])
+
+
+def _decision_result_text(purchase: dict) -> str:
+    decision = purchase.get("decision")
+    if decision == "replace_now":
+        return (
+            "✅ Plan Replaced Successfully\n\n"
+            "Your previous subscription has been replaced and your new plan is now active.\n\n"
+            f"Current Plan: {purchase.get('plan_name')}\n"
+            f"Activated On: {_fmt_dt(purchase.get('decided_at'))}\n"
+            f"New Expiry: {_fmt_dt(purchase.get('expiry_date'))}\n"
+            "Status: Active"
+        )
+    if decision == "after_expiry":
+        return (
+            "✅ Plan Scheduled Successfully\n\n"
+            "Your current subscription will continue until it expires.\n"
+            "Your purchased plan will activate automatically after the current plan expires.\n"
+            "No remaining validity has been lost.\n\n"
+            f"Next Plan: {purchase.get('plan_name')}\n"
+            f"Scheduled Activation: {_fmt_dt(purchase.get('activation_date'))}\n"
+            f"Next Plan Duration: {purchase.get('duration_days')} Days\n"
+            "Status: Waiting for Activation"
+        )
+    return (
+        "✅ Plan Saved Successfully\n\n"
+        "Your payment is secure and your purchased plan has been saved as pending.\n"
+        "You can activate it later from Seller Profile → Pending Plan.\n\n"
+        f"Pending Plan: {purchase.get('plan_name')}\n"
+        "Payment Status: Verified\n"
+        "Status: Pending Decision"
+    )
+
+
 def seller_handlers():
     return [
-        CallbackQueryHandler(seller_callback, pattern=r"^seller_(bots_list|select_\d+|connect|replace_\d+|pause_\d+|resume_\d+|remove_\d+|upgrade_plan(?:_home|_profile|_selected_\d+)?|current_plan|plan_history|buy_.*|manual_.*|selected_.*|set_.*|channel_.*)$"),
+        CallbackQueryHandler(seller_callback, pattern=r"^seller_(bots_list|select_\d+|connect|replace_\d+|pause_\d+|resume_\d+|remove_\d+|upgrade_plan(?:_home|_profile|_selected_\d+)?|current_plan|pending_plan|plan_decide_.*|plan_history|buy_.*|manual_.*|selected_.*|set_.*|channel_.*)$"),
         MessageHandler(filters.PHOTO, receive_seller_qr),
         MessageHandler(filters.TEXT & ~filters.COMMAND, receive_seller_token),
     ]

@@ -15,6 +15,7 @@ from database.payment_gateways import get_gateway_config, set_gateway_preference
 
 from database.seller_subscriptions import (
     assign_plan_with_history, extend_plan_with_history, create_plan_request, create_seller_payment,
+    process_verified_plan_purchase,
     current_plan_text, decide_seller_payment, delete_paid_plan, get_config,
     get_paid_plan, get_seller_payment, pending_seller_payments, save_paid_plan,
     seller_revenue_summary, set_subscription_suspension, subscription_history,
@@ -181,13 +182,31 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pid=a.split("_",2)[2]; status="approved" if a.startswith("subpay_ok_") else "rejected"
         pay=await decide_seller_payment(pid,status,q.from_user.id)
         if not pay: await q.answer("Already processed",show_alert=True); return
-        if status=="approved": await assign_plan_with_history(pay["owner_id"],pay["plan_id"],pay["duration_days"],"payment",pay["amount"],q.from_user.id)
-        try:
-            await context.bot.send_message(
-                pay["owner_id"],
-                f"{'✅ Approved' if status=='approved' else '❌ Rejected'}\n\nPlan: {pay['plan_name']}\nAmount: ₹{pay['amount']:g}",
-                reply_markup=(await build_official_links_keyboard()) if status=="approved" else None,
+        purchase = None
+        if status=="approved":
+            purchase = await process_verified_plan_purchase(
+                pay["owner_id"], pay["plan_id"], pay["duration_days"],
+                source="manual_payment", amount=pay["amount"],
+                payment_reference=f"manual:{pay["payment_id"]}", approved_by=q.from_user.id,
             )
+        try:
+            if status == "approved" and purchase and purchase.get("status") == "decision_required":
+                from handlers.seller import plan_change_text, plan_change_keyboard
+                await context.bot.send_message(
+                    pay["owner_id"], plan_change_text(purchase),
+                    reply_markup=plan_change_keyboard(purchase["payment_id"]),
+                )
+            elif status == "approved":
+                await context.bot.send_message(
+                    pay["owner_id"],
+                    f"✅ Plan Extended Successfully\n\nPlan: {pay['plan_name']}\nDuration Added: {pay['duration_days']} Days\nYour remaining validity has been preserved.",
+                    reply_markup=await build_official_links_keyboard(),
+                )
+            else:
+                await context.bot.send_message(
+                    pay["owner_id"],
+                    f"❌ Payment Rejected\n\nPlan: {pay['plan_name']}\nAmount: ₹{pay['amount']:g}",
+                )
         except Exception:
             pass
         await q.edit_message_text(f"✅ Payment {status}.",reply_markup=back("sub_mgmt_pending")); return
