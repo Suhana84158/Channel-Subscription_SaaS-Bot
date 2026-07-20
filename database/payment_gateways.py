@@ -324,6 +324,29 @@ async def reserve_webhook_event(
         return False
 
 
+async def mark_gateway_webhook_received(
+    scope: str, owner_id: int, gateway: str, event_name: str = ""
+) -> None:
+    """Remember that a correctly signed webhook reached this gateway config."""
+    now = datetime.now(timezone.utc)
+    await _configs().update_one(
+        {"scope": scope, "owner_id": int(owner_id)},
+        {
+            "$set": {
+                f"gateways.{gateway}.last_webhook_received_at": now,
+                f"gateways.{gateway}.last_webhook_event": str(event_name or ""),
+                "updated_at": now,
+            },
+            "$setOnInsert": {
+                "scope": scope,
+                "owner_id": int(owner_id),
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+
+
 async def gateway_history(scope: str, owner_id: int, limit: int = 50) -> list[dict]:
     return await _transactions().find({"scope": scope, "owner_id": int(owner_id)}).sort("created_at", -1).to_list(length=limit)
 
