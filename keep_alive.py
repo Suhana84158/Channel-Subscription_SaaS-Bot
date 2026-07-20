@@ -481,3 +481,9 @@ def keep_alive():
         daemon=True,
         name="health-server",
     ).start()
+
+async def send_runtime_message(chat_id: int, text: str, **kwargs):
+    """Send through the configured main bot from webhook/service code."""
+    if _main_bot is None:
+        raise RuntimeError("Bot runtime is not ready")
+    return await _main_bot.send_message(chat_id=chat_id, text=text, **kwargs)

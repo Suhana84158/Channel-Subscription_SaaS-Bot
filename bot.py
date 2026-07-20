@@ -50,7 +50,7 @@ from scheduler import (
     shutdown_scheduler,
     start_scheduler,
 )
-from scheduler_jobs.seller_subscriptions import run_seller_subscription_reminders
+from scheduler_jobs.seller_subscriptions import run_seller_subscription_reminders, run_scheduled_plan_activations
 from services.bot_manager import bot_manager
 from services.broadcast_service import resume_broadcasts
 
@@ -197,6 +197,14 @@ async def post_init(application: Application) -> None:
             bot_manager.recover_dead_bots,
             "clone_bot_runtime_watchdog",
             minutes=2,
+        )
+        async def scheduled_plan_activation_job() -> None:
+            await run_scheduled_plan_activations(application.bot)
+
+        add_interval_job(
+            scheduled_plan_activation_job,
+            "seller_scheduled_plan_activation",
+            minutes=1,
         )
     except Exception:
         logger.exception("Scheduler startup failed.")
