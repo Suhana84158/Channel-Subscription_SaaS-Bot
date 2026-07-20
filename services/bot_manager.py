@@ -250,9 +250,25 @@ class SellerBotManager:
     def back(target="a_home"): return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back",callback_data=target)]])
     @staticmethod
     def limit_keyboard(back_target="a_home"):
+        """Buttons shown when a seller reaches a clone-bot plan limit.
+
+        Seller-plan purchases are handled by the main SaaS bot. A URL button is
+        used here because callbacks from a clone bot cannot be processed by the
+        main bot. The current-plan button stays inside the clone bot and opens
+        the existing seller profile/current-plan page.
+        """
+        main_bot_username = os.getenv(
+            "MAIN_BOT_USERNAME", "Subscripti0n_Manage_bot"
+        ).strip().lstrip("@")
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("💎 Upgrade Plan", callback_data="seller_upgrade_plan")],
-            [InlineKeyboardButton("📊 View Current Plan", callback_data="seller_current_plan")],
+            [InlineKeyboardButton(
+                "💳 Buy / Change Plan",
+                url=f"https://t.me/{main_bot_username}?start=sellerplan",
+            )],
+            [InlineKeyboardButton(
+                "📊 View Current Plan",
+                callback_data="seller_current_plan",
+            )],
             [InlineKeyboardButton("❌ Close", callback_data=back_target)],
         ])
 
@@ -947,7 +963,11 @@ class SellerBotManager:
         owner=self.owner(context)
         action=q.data
         if action=="seller_current_plan":
-            await q.edit_message_text(await current_plan_text(owner), reply_markup=self.back("a_home")); return
+            await q.edit_message_text(
+                await current_plan_text(owner),
+                reply_markup=self.limit_keyboard("a_home"),
+            )
+            return
         if action=="seller_upgrade_plan":
             cfg=await get_config()
             plans=[p for p in cfg.get("paid_plans",[]) if p.get("active",True)]
