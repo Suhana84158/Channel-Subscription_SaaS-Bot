@@ -196,6 +196,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_owner_dashboard(message)
             return
 
+        if context.args and context.args[0] == "sellerplan":
+            from handlers.seller import send_seller_upgrade_plan
+            await send_seller_upgrade_plan(message, tg_user.id)
+            return
+
         text, keyboard = await role_welcome(tg_user.id)
         await asyncio.wait_for(
             message.reply_text(text, reply_markup=keyboard),

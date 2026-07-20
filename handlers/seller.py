@@ -47,6 +47,35 @@ from services.payment_gateways import create_checkout, GatewayError
 logger = logging.getLogger(__name__)
 
 
+async def send_seller_upgrade_plan(message, owner_id: int) -> None:
+    """Send the seller plan selector from commands/deep links."""
+    cfg = await get_config()
+    plans = [p for p in cfg.get("paid_plans", []) if p.get("active", True)]
+    rows = []
+    lines = ["💎 Buy / Change Seller Plan", ""]
+    current, _ = await effective_plan(owner_id)
+    for plan in plans:
+        lines.append(
+            f"• {plan.get('name', 'Plan')} — ₹{plan.get('price', 0):g} / "
+            f"{plan.get('duration_days', 30)} days"
+        )
+        request_type = (
+            "upgrade"
+            if float(plan.get("price", 0)) >= float(current.get("price", 0))
+            else "downgrade"
+        )
+        rows.append([
+            InlineKeyboardButton(
+                f"Select {plan.get('name', 'Plan')}",
+                callback_data=f"seller_buy_{request_type}_{plan.get('plan_id')}",
+            )
+        ])
+    if not plans:
+        lines.append("No paid seller plans are available right now.")
+    rows.append([InlineKeyboardButton("⬅ Back", callback_data="main_seller_profile")])
+    await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+
+
 _channel_operation_locks: dict[int, asyncio.Lock] = {}
 
 
@@ -804,7 +833,7 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"• {p.get('name','Plan')} — ₹{p.get('price',0):g} / {p.get('duration_days',30)} days")
             typ = "upgrade" if float(p.get("price", 0)) >= float(current.get("price", 0)) else "downgrade"
             rows.append([InlineKeyboardButton(f"Select {p.get('name')}", callback_data=f"seller_buy_{typ}_{p.get('plan_id')}")])
-        rows.append([InlineKeyboardButton("⬅ Back", callback_data="main_home")])
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data="main_seller_profile")])
         markup = InlineKeyboardMarkup(rows)
         text = "\n".join(lines)
         # A seller payment screen may be a photo (QR code). Telegram cannot use
@@ -853,16 +882,8 @@ async def seller_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 checkout = await create_checkout(tx)
                 text = (
                     f"💳 {gateway.title()} Payment\n\n"
-                    f"Plan: {plan.get('name')}\n"
-                    f"Amount: ₹{plan.get('price',0):g}\n"
-                    f"Duration: {plan.get('duration_days', 30)} days\n"
+                    f"Plan: {plan.get('name')}\nAmount: ₹{plan.get('price',0):g}\n"
                     f"Transaction: {tx['transaction_id']}\n\n"
-                    "📊 Plan Limitations\n"
-                    f"• Clone Bots: {_limit_text(plan.get('bot_limit', 1))}\n"
-                    f"• Active Subscribers: {_limit_text(plan.get('active_subscriber_limit', 25))}\n"
-                    f"• Channels/Groups: {_limit_text(plan.get('channel_limit', 1))}\n"
-                    f"• Subscription Plans: {_limit_text(plan.get('plan_limit', 2))}\n"
-                    f"• Admins: {_limit_text(plan.get('admin_limit', 1))}\n\n"
                     "Payment successful hone ke baad plan automatically activate hoga."
                 )
                 rows.append([InlineKeyboardButton("💳 Pay Now", url=checkout.get("checkout_url"))])

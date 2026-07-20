@@ -900,8 +900,6 @@ async def main_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("💎 Buy / Change Plan",callback_data="seller_upgrade_plan")],
                 [InlineKeyboardButton("📜 Plan History",callback_data="seller_plan_history")],
-                [InlineKeyboardButton("🤝 Seller Referral",callback_data="main_seller_referral")],
-                [InlineKeyboardButton("🆘 Help & Commands",callback_data="main_help")],
                 [InlineKeyboardButton("⬅ Seller Dashboard",callback_data="main_seller_dashboard")],
             ]),
         )
