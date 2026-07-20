@@ -567,5 +567,38 @@ async def fulfill_transaction(tx: dict) -> None:
                 seller_id,
                 {"transaction_id": tx["transaction_id"], "error": str(exc)[:500]},
             )
+
+        # Notify the seller/admins inside the same clone bot. This is kept
+        # separate from invite delivery, so the seller is notified even when
+        # the subscriber has already joined every connected chat.
+        try:
+            from services.bot_manager import bot_manager
+            notice = await bot_manager.notify_automatic_payment_success(
+                seller_id,
+                tx["payer_user_id"],
+                {
+                    "plan_name": plan.get("name", "Subscription"),
+                    "amount": tx.get("amount", 0),
+                    "gateway": tx.get("gateway", ""),
+                    "transaction_id": tx.get("gateway_payment_id") or tx.get("transaction_id", ""),
+                    "payment_date": tx.get("paid_at") or tx.get("updated_at") or tx.get("created_at"),
+                    "expiry_date": expiry,
+                    "duration": plan.get("duration_text") or f"{plan.get('duration_minutes', 0)} minutes",
+                    "invoice_no": invoice.get("invoice_no"),
+                },
+            )
+            await audit(
+                "child_gateway_seller_notification",
+                tx["payer_user_id"],
+                seller_id,
+                {"transaction_id": tx["transaction_id"], **notice},
+            )
+        except Exception as exc:
+            await audit(
+                "child_gateway_seller_notification_failed",
+                tx["payer_user_id"],
+                seller_id,
+                {"transaction_id": tx["transaction_id"], "error": str(exc)[:500]},
+            )
         return
     raise GatewayError("Unsupported transaction purpose")
