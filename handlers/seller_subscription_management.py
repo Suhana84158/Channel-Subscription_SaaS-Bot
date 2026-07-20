@@ -27,9 +27,10 @@ def back(target="sub_mgmt_home"): return kb([[InlineKeyboardButton("⬅ Back", c
 
 def main_menu():
     return kb([
-        [InlineKeyboardButton("💳 Payment Setting", callback_data="sub_mgmt_payment")],
+        [InlineKeyboardButton("📋 Plan Manage", callback_data="sub_mgmt_plans"), InlineKeyboardButton("💳 Payment Setting", callback_data="sub_mgmt_payment")],
         [InlineKeyboardButton("🆓 Free Plan Manage", callback_data="sub_mgmt_free"), InlineKeyboardButton("💎 Paid Plan Manage", callback_data="sub_mgmt_paid")],
         [InlineKeyboardButton("🎁 Free Trial", callback_data="sub_mgmt_trial"), InlineKeyboardButton("🧾 Pending Payments", callback_data="sub_mgmt_pending")],
+        [InlineKeyboardButton("👤 Assign / Suspend Seller", callback_data="sub_mgmt_seller_control")],
         [InlineKeyboardButton("📜 Subscription History", callback_data="sub_mgmt_history"), InlineKeyboardButton("💰 Seller Revenue", callback_data="sub_mgmt_revenue")],
         [InlineKeyboardButton("🏷 Branding Control", callback_data="sub_mgmt_branding")],
         [InlineKeyboardButton("⬅ Owner Dashboard", callback_data="main_owner_dashboard")],
@@ -316,10 +317,47 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ Extension cancelled.",
             reply_markup=back(f"main_seller_view_{seller_id}" if seller_id else "main_owner_sellers"),
         ); return
-    if a=="sub_mgmt_history":
-        hist=await subscription_history(limit=25); lines=["📜 Seller Subscription History\n"]
-        for h in hist: lines.append(f"• {h.get('owner_id')} | {h.get('action')} | {h.get('new_plan',h.get('target_plan_id','-'))} | {h.get('created_at').strftime('%d-%m %H:%M')}")
-        await q.edit_message_text("\n".join(lines),reply_markup=back()); return
+    if a == "sub_mgmt_history" or a.startswith("sub_mgmt_history_"):
+        seller_id = None
+        if a.startswith("sub_mgmt_history_"):
+            raw_id = a.replace("sub_mgmt_history_", "", 1)
+            if raw_id.isdigit():
+                seller_id = int(raw_id)
+
+        hist = await subscription_history(owner_id=seller_id, limit=25)
+        seller = await get_seller(seller_id) if seller_id is not None else None
+        if seller_id is not None:
+            seller_name = (seller or {}).get("first_name") or str(seller_id)
+            lines = [
+                "📜 Seller Subscription History",
+                "",
+                f"Seller: {seller_name}",
+                f"Seller ID: {seller_id}",
+                "",
+            ]
+            back_target = f"main_seller_view_{seller_id}"
+        else:
+            lines = ["📜 Seller Subscription History", ""]
+            back_target = "sub_mgmt_home"
+
+        if not hist:
+            lines.append("No subscription history found for this seller.")
+        else:
+            for h in hist:
+                created = h.get("created_at")
+                when = created.strftime("%d-%m-%Y %I:%M %p") if created else "-"
+                plan_name = h.get("new_plan", h.get("target_plan_id", "-"))
+                lines.append(
+                    f"• {h.get('action', '-')}\n"
+                    f"  Plan: {plan_name}\n"
+                    f"  Date: {when}"
+                )
+
+        await q.edit_message_text(
+            "\n\n".join(lines),
+            reply_markup=back(back_target),
+        )
+        return
     if a=="sub_mgmt_revenue":
         r=await seller_revenue_summary(); await q.edit_message_text(f"💰 Seller Revenue\n\nTotal: ₹{r['total']:g} ({r['count']} payments)\nThis month: ₹{r['month_total']:g} ({r['month_count']} payments)",reply_markup=back()); return
     if a=="sub_mgmt_branding":

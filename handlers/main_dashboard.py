@@ -434,15 +434,17 @@ async def _seller_owner_details(owner_id: int):
         else: paused_count += 1
         token = await get_decrypted_bot_token(int(bot["bot_id"])) or ""
         if token:
-            token_masked = f"{token[:8]}****{token[-4:]}" if len(token) > 14 else "****"
+            token_display = token
             token_status = "Valid / Stored"
         else:
-            token_masked = "Unavailable"
+            token_display = "Unavailable"
             token_status = "Missing"
         connected_channels = await get_seller_channels(scope)
         channel_lines = []
         for channel_index, channel in enumerate(connected_channels, 1):
-            owner_link = await _owner_access_link_for_channel(bot, channel)
+            # Reuse the link already stored in MongoDB. Creating a fresh Telegram
+            # invite link on every page open made all Seller Details buttons slow.
+            owner_link = str(channel.get("owner_access_invite_link") or "Not generated yet")
             channel_lines.append(
                 f"   {channel_index}. {escape(str(channel.get('title') or 'Channel/Group'))}\n"
                 f"      ID: <code>{int(channel['chat_id'])}</code>\n"
@@ -452,7 +454,7 @@ async def _seller_owner_details(owner_id: int):
             f"🤖 <b>{index}. @{escape(str(bot.get('bot_username') or '-'))}</b> — "
             f"{'🟢 Running' if is_running else '⏸ Stopped'}\n"
             f"   Bot ID: <code>{int(bot.get('bot_id') or 0)}</code>\n"
-            f"   API Token: <code>{escape(token_masked)}</code>\n"
+            f"   API Token: <code>{escape(token_display)}</code>\n"
             f"   Token Status: {escape(token_status)}\n"
             f"   👥 Users: {users} | 💎 Active: {active} | 💰 Revenue: ₹{revenue:g}\n"
             f"   📢 Connected Channels/Groups:\n"
@@ -542,7 +544,7 @@ async def _seller_owner_details(owner_id: int):
             callback_data=f"main_seller_unsuspend_{owner_id}" if suspended else f"main_seller_suspend_{owner_id}")],
         [InlineKeyboardButton("💬 Message Seller", callback_data=f"main_owner_message_seller_{owner_id}")],
         [InlineKeyboardButton("💎 Change / Extend Plan", callback_data=f"sub_mgmt_extend_{owner_id}")],
-        [InlineKeyboardButton("📜 Subscription History", callback_data="sub_mgmt_history")],
+        [InlineKeyboardButton("📜 Subscription History", callback_data=f"sub_mgmt_history_{owner_id}")],
         [InlineKeyboardButton("💰 Seller Revenue", callback_data="sub_mgmt_revenue")],
     ]
     if first_bot:
@@ -563,7 +565,16 @@ async def seller_owner_view(query, owner_id: int):
             [InlineKeyboardButton("⬅ Sellers", callback_data="main_owner_sellers")]
         ]))
         return
-    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML", disable_web_page_preview=True)
+    try:
+        await query.edit_message_text(
+            text, reply_markup=keyboard, parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except TelegramError as exc:
+        # A quick second tap can try to render the exact same page again.
+        # Ignore only Telegram's harmless "message is not modified" response.
+        if "message is not modified" not in str(exc).lower():
+            raise
 
 
 async def owner_broadcast_menu(query):
