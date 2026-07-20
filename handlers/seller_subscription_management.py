@@ -69,28 +69,53 @@ async def _show_owner_payment_settings(q, cfg):
     rz = gateways.get("razorpay") or {}
     cf = gateways.get("cashfree") or {}
     manual_enabled = bool(gateway_cfg.get("manual_enabled", True))
-    qr_status = "Added ✅" if cfg.get("payment_qr_file_id") else "Not Added ❌"
+    qr_added = bool(cfg.get("payment_qr_file_id"))
     text = (
-        "💳 Owner Payment Settings\n\n"
+        "💳 Payment Settings\n\n"
         f"{'✅' if rz.get('enabled') else '❌'} Razorpay: {'Enabled' if rz.get('enabled') else 'Disabled'} | Credentials: {'Added' if rz.get('key_id') and rz.get('key_secret') else 'Not added'}\n"
         f"{'✅' if cf.get('enabled') else '❌'} Cashfree: {'Enabled' if cf.get('enabled') else 'Disabled'} | Credentials: {'Added' if cf.get('client_id') and cf.get('client_secret') else 'Not added'}\n"
-        f"{'✅' if manual_enabled else '❌'} Manual Payment: {'Enabled' if manual_enabled else 'Disabled'}\n"
-        "Mode: LIVE\n\n"
-        f"UPI ID: {cfg.get('payment_upi_id') or '-'}\n"
-        f"UPI Name: {cfg.get('payment_upi_name') or '-'}\n"
-        f"QR Code: {qr_status}"
+        f"{'✅' if manual_enabled else '❌'} Manual Payment: {'Enabled' if manual_enabled else 'Disabled'}\n\n"
+        f"UPI ID: {cfg.get('payment_upi_id') or 'Not added'}\n"
+        f"UPI Name: {cfg.get('payment_upi_name') or 'Not added'}\n"
+        f"QR Code: {'Added ✅' if qr_added else 'Not added ❌'}"
     )
     markup = kb([
-        [InlineKeyboardButton("🌐 Automatic Payment Gateways", callback_data="pgcfg_owner_home")],
-        [InlineKeyboardButton(f"{'✅' if manual_enabled else '❌'} Manual Payment — {'ON' if manual_enabled else 'OFF'}", callback_data="sub_mgmt_manual_toggle")],
+        [InlineKeyboardButton("🌐 Automatic Payment Gateway", callback_data="pgcfg_owner_home")],
+        [InlineKeyboardButton("💵 Manual Payment", callback_data="sub_mgmt_manual_payment")],
+        [InlineKeyboardButton("⬅ Back", callback_data="sub_mgmt_home")],
+    ])
+    if q.message and not q.message.text:
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        await q.message.chat.send_message(text, reply_markup=markup)
+    else:
+        await q.edit_message_text(text, reply_markup=markup)
+
+
+async def _show_owner_manual_payment(q, cfg):
+    gateway_cfg = await get_gateway_config("owner", 0, decrypt=True)
+    manual_enabled = bool(gateway_cfg.get("manual_enabled", True))
+    qr_added = bool(cfg.get("payment_qr_file_id"))
+    text = (
+        "💵 Manual Payment\n\n"
+        f"UPI ID: {cfg.get('payment_upi_id') or 'Not added'}\n"
+        f"UPI Name: {cfg.get('payment_upi_name') or 'Not added'}\n"
+        f"QR Code: {'Added ✅' if qr_added else 'Not added ❌'}"
+    )
+    markup = kb([
+        [InlineKeyboardButton(
+            f"{'✅' if manual_enabled else '❌'} {'Disable' if manual_enabled else 'Enable'} Manual Payment",
+            callback_data="sub_mgmt_manual_toggle",
+        )],
         [InlineKeyboardButton("🏦 Set UPI ID", callback_data="sub_mgmt_payment_upi_id")],
         [InlineKeyboardButton("👤 Set UPI Name", callback_data="sub_mgmt_payment_upi_name")],
         [InlineKeyboardButton("🖼 Upload / Change QR", callback_data="sub_mgmt_payment_qr")],
         [InlineKeyboardButton("🗑 Remove QR", callback_data="sub_mgmt_payment_qr_remove")],
         [InlineKeyboardButton("👀 Preview Payment Details", callback_data="sub_mgmt_payment_preview")],
-        [InlineKeyboardButton("⬅ Back", callback_data="sub_mgmt_home")],
+        [InlineKeyboardButton("⬅ Back", callback_data="sub_mgmt_payment")],
     ])
-    # A preview is a photo message; Telegram cannot edit its caption into a text message.
     if q.message and not q.message.text:
         try:
             await q.message.delete()
@@ -112,24 +137,28 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if a=="sub_mgmt_payment":
         await _show_owner_payment_settings(q, cfg)
         return
+    if a=="sub_mgmt_manual_payment":
+        await _show_owner_manual_payment(q, cfg)
+        return
     if a=="sub_mgmt_manual_toggle":
         gateway_cfg=await get_gateway_config("owner",0,decrypt=True)
         await set_gateway_preferences("owner",0,manual_enabled=not gateway_cfg.get("manual_enabled",True))
         cfg=await get_config()
-        await _show_owner_payment_settings(q, cfg)
+        await _show_owner_manual_payment(q, cfg)
         return
     if a=="sub_mgmt_payment_upi_id":
         context.user_data.clear(); context.user_data["sub_wait"]="payment_upi_id"
-        await q.edit_message_text("🏦 Send Owner UPI ID", reply_markup=back("sub_mgmt_payment")); return
+        await q.edit_message_text("🏦 Send Owner UPI ID", reply_markup=back("sub_mgmt_manual_payment")); return
     if a=="sub_mgmt_payment_upi_name":
         context.user_data.clear(); context.user_data["sub_wait"]="payment_upi_name"
-        await q.edit_message_text("👤 Send Owner UPI Name", reply_markup=back("sub_mgmt_payment")); return
+        await q.edit_message_text("👤 Send Owner UPI Name", reply_markup=back("sub_mgmt_manual_payment")); return
     if a=="sub_mgmt_payment_qr":
         context.user_data.clear(); context.user_data["sub_wait"]="payment_qr"
-        await q.edit_message_text("🖼 Upload the Owner payment QR image.", reply_markup=back("sub_mgmt_payment")); return
+        await q.edit_message_text("🖼 Upload the Owner payment QR image.", reply_markup=back("sub_mgmt_manual_payment")); return
     if a=="sub_mgmt_payment_qr_remove":
         await update_config(payment_qr_file_id="")
-        await q.edit_message_text("✅ Owner payment QR removed.", reply_markup=back("sub_mgmt_payment")); return
+        cfg=await get_config()
+        await _show_owner_manual_payment(q, cfg); return
     if a=="sub_mgmt_payment_preview":
         preview=(
             "💳 Seller Plan Payment\n\n"
@@ -137,7 +166,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏦 UPI ID: {cfg.get('payment_upi_id') or 'Not Set'}\n\n"
             "Sellers will see these details while buying a plan."
         )
-        preview_kb=kb([[InlineKeyboardButton("⬅ Back",callback_data="sub_mgmt_payment")]])
+        preview_kb=kb([[InlineKeyboardButton("⬅ Back",callback_data="sub_mgmt_manual_payment")]])
         if cfg.get("payment_qr_file_id"):
             await q.message.reply_photo(cfg["payment_qr_file_id"],caption=preview,reply_markup=preview_kb)
         else:
@@ -437,7 +466,11 @@ async def receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             plan_id=context.user_data["extend_plan_id"]
             await extension_confirmation(update.effective_message,context,seller_id,plan_id,days)
             return
-        context.user_data.clear(); await update.effective_message.reply_text("✅ Saved.",reply_markup=main_menu())
+        context.user_data.clear()
+        if mode in {"payment_upi_id", "payment_upi_name"}:
+            await update.effective_message.reply_text("✅ Saved.", reply_markup=back("sub_mgmt_manual_payment"))
+        else:
+            await update.effective_message.reply_text("✅ Saved.",reply_markup=main_menu())
     except Exception as e: await update.effective_message.reply_text(f"❌ Invalid format: {e}")
 
 async def seller_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -447,7 +480,7 @@ async def seller_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         await update.effective_message.reply_text(
             "✅ Owner payment QR saved.",
-            reply_markup=main_menu(),
+            reply_markup=back("sub_mgmt_manual_payment"),
         )
         return
 
