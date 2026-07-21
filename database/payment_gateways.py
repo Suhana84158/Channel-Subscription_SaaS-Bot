@@ -345,6 +345,65 @@ async def reserve_webhook_event(
         return False
 
 
+async def claim_transaction_notification(transaction_id: str, notification: str) -> bool:
+    """Atomically reserve a one-time post-payment notification/delivery.
+
+    This is a second idempotency barrier for side effects such as subscriber
+    invite delivery and seller notifications. It prevents duplicate messages
+    even if the fulfillment function is reached twice by webhook/callback races.
+    """
+    name = str(notification or "").strip().lower()
+    if not name.replace("_", "").isalnum():
+        raise ValueError("Invalid notification name")
+    field = f"notifications.{name}.claimed_at"
+    now = datetime.now(timezone.utc)
+    result = await _transactions().update_one(
+        {
+            "transaction_id": str(transaction_id),
+            field: {"$exists": False},
+        },
+        {
+            "$set": {
+                field: now,
+                f"notifications.{name}.status": "claimed",
+                "updated_at": now,
+            }
+        },
+    )
+    return result.modified_count == 1
+
+
+async def complete_transaction_notification(transaction_id: str, notification: str, details: dict | None = None) -> None:
+    name = str(notification or "").strip().lower()
+    now = datetime.now(timezone.utc)
+    await _transactions().update_one(
+        {"transaction_id": str(transaction_id)},
+        {
+            "$set": {
+                f"notifications.{name}.status": "sent",
+                f"notifications.{name}.sent_at": now,
+                f"notifications.{name}.details": details or {},
+                "updated_at": now,
+            }
+        },
+    )
+
+
+async def fail_transaction_notification(transaction_id: str, notification: str, error: str) -> None:
+    name = str(notification or "").strip().lower()
+    now = datetime.now(timezone.utc)
+    await _transactions().update_one(
+        {"transaction_id": str(transaction_id)},
+        {
+            "$set": {
+                f"notifications.{name}.status": "failed",
+                f"notifications.{name}.error": str(error)[:500],
+                "updated_at": now,
+            }
+        },
+    )
+
+
 async def gateway_history(scope: str, owner_id: int, limit: int = 50) -> list[dict]:
     return await _transactions().find({"scope": scope, "owner_id": int(owner_id)}).sort("created_at", -1).to_list(length=limit)
 
