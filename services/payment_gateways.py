@@ -14,6 +14,9 @@ from config import PUBLIC_BASE_URL
 from database.payment_gateways import (
     claim_transaction_fulfillment,
     claim_transaction_success,
+    claim_transaction_notification,
+    complete_transaction_notification,
+    fail_transaction_notification,
     get_gateway_config,
     get_gateway_transaction,
     get_transaction_by_gateway_order,
@@ -541,66 +544,72 @@ async def fulfill_transaction(tx: dict) -> None:
 
         # Fulfillment is already safely recorded. Invite delivery is best effort
         # and can be retried separately without charging or extending again.
-        try:
-            from services.bot_manager import bot_manager
-            delivery = await bot_manager.deliver_subscription_access(
-                seller_id,
-                tx["payer_user_id"],
-                success_details={
-                    "plan_name": plan.get("name", "Subscription"),
-                    "amount": tx.get("amount", 0),
-                    "gateway": tx.get("gateway", ""),
-                    "transaction_id": tx.get("transaction_id", ""),
-                    "payment_date": tx.get("paid_at") or tx.get("updated_at") or tx.get("created_at"),
-                    "expiry_date": expiry,
-                    "duration": plan.get("duration_text") or f"{plan.get('duration_minutes', 0)} minutes",
-                },
-            )
-            await audit(
-                "child_gateway_access_delivery",
-                tx["payer_user_id"],
-                seller_id,
-                {"transaction_id": tx["transaction_id"], **delivery},
-            )
-        except Exception as exc:
-            await audit(
-                "child_gateway_access_delivery_failed",
-                tx["payer_user_id"],
-                seller_id,
-                {"transaction_id": tx["transaction_id"], "error": str(exc)[:500]},
-            )
+        if await claim_transaction_notification(tx["transaction_id"], "subscriber_access"):
+            try:
+                from services.bot_manager import bot_manager
+                delivery = await bot_manager.deliver_subscription_access(
+                    seller_id,
+                    tx["payer_user_id"],
+                    success_details={
+                        "plan_name": plan.get("name", "Subscription"),
+                        "amount": tx.get("amount", 0),
+                        "gateway": tx.get("gateway", ""),
+                        "transaction_id": tx.get("transaction_id", ""),
+                        "payment_date": tx.get("paid_at") or tx.get("updated_at") or tx.get("created_at"),
+                        "expiry_date": expiry,
+                        "duration": plan.get("duration_text") or f"{plan.get('duration_minutes', 0)} minutes",
+                    },
+                )
+                await complete_transaction_notification(tx["transaction_id"], "subscriber_access", delivery)
+                await audit(
+                    "child_gateway_access_delivery",
+                    tx["payer_user_id"],
+                    seller_id,
+                    {"transaction_id": tx["transaction_id"], **delivery},
+                )
+            except Exception as exc:
+                await fail_transaction_notification(tx["transaction_id"], "subscriber_access", str(exc))
+                await audit(
+                    "child_gateway_access_delivery_failed",
+                    tx["payer_user_id"],
+                    seller_id,
+                    {"transaction_id": tx["transaction_id"], "error": str(exc)[:500]},
+                )
 
         # Notify the seller/admins inside the same clone bot. This is kept
         # separate from invite delivery, so the seller is notified even when
         # the subscriber has already joined every connected chat.
-        try:
-            from services.bot_manager import bot_manager
-            notice = await bot_manager.notify_automatic_payment_success(
-                seller_id,
-                tx["payer_user_id"],
-                {
-                    "plan_name": plan.get("name", "Subscription"),
-                    "amount": tx.get("amount", 0),
-                    "gateway": tx.get("gateway", ""),
-                    "transaction_id": tx.get("gateway_payment_id") or tx.get("transaction_id", ""),
-                    "payment_date": tx.get("paid_at") or tx.get("updated_at") or tx.get("created_at"),
-                    "expiry_date": expiry,
-                    "duration": plan.get("duration_text") or f"{plan.get('duration_minutes', 0)} minutes",
-                    "invoice_no": invoice.get("invoice_no"),
-                },
-            )
-            await audit(
-                "child_gateway_seller_notification",
-                tx["payer_user_id"],
-                seller_id,
-                {"transaction_id": tx["transaction_id"], **notice},
-            )
-        except Exception as exc:
-            await audit(
-                "child_gateway_seller_notification_failed",
-                tx["payer_user_id"],
-                seller_id,
-                {"transaction_id": tx["transaction_id"], "error": str(exc)[:500]},
-            )
+        if await claim_transaction_notification(tx["transaction_id"], "seller_notice"):
+            try:
+                from services.bot_manager import bot_manager
+                notice = await bot_manager.notify_automatic_payment_success(
+                    seller_id,
+                    tx["payer_user_id"],
+                    {
+                        "plan_name": plan.get("name", "Subscription"),
+                        "amount": tx.get("amount", 0),
+                        "gateway": tx.get("gateway", ""),
+                        "transaction_id": tx.get("gateway_payment_id") or tx.get("transaction_id", ""),
+                        "payment_date": tx.get("paid_at") or tx.get("updated_at") or tx.get("created_at"),
+                        "expiry_date": expiry,
+                        "duration": plan.get("duration_text") or f"{plan.get('duration_minutes', 0)} minutes",
+                        "invoice_no": invoice.get("invoice_no"),
+                    },
+                )
+                await complete_transaction_notification(tx["transaction_id"], "seller_notice", notice)
+                await audit(
+                    "child_gateway_seller_notification",
+                    tx["payer_user_id"],
+                    seller_id,
+                    {"transaction_id": tx["transaction_id"], **notice},
+                )
+            except Exception as exc:
+                await fail_transaction_notification(tx["transaction_id"], "seller_notice", str(exc))
+                await audit(
+                    "child_gateway_seller_notification_failed",
+                    tx["payer_user_id"],
+                    seller_id,
+                    {"transaction_id": tx["transaction_id"], "error": str(exc)[:500]},
+                )
         return
     raise GatewayError("Unsupported transaction purpose")
