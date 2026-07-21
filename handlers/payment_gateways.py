@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, filters
@@ -55,7 +58,7 @@ def _webhook_setup_text(scope: str, owner_id: int, gcfg: dict) -> str:
     return (
         "🔗 Razorpay Webhook Setup\n\n"
         "Your unique webhook URL has been generated automatically.\n\n"
-        f"Webhook URL:\n`{_webhook_url(scope, owner_id)}`\n\n"
+        f"Webhook URL:\n{_webhook_url(scope, owner_id)}\n\n"
         "Required Events:\n"
         "• payment.captured\n"
         "• order.paid\n"
@@ -245,11 +248,23 @@ async def gateway_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if gateway == "razorpay" and suffix == "webhook":
-        await q.edit_message_text(
-            _webhook_setup_text(scope, owner_id, gcfg),
-            reply_markup=_webhook_keyboard(scope),
-            parse_mode="Markdown",
-        )
+        try:
+            await q.edit_message_text(
+                _webhook_setup_text(scope, owner_id, gcfg),
+                reply_markup=_webhook_keyboard(scope),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            logger.exception(
+                "Razorpay webhook setup page failed scope=%s owner_id=%s",
+                scope, owner_id,
+            )
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=_webhook_setup_text(scope, owner_id, gcfg),
+                reply_markup=_webhook_keyboard(scope),
+                disable_web_page_preview=True,
+            )
         return
 
     if gateway == "razorpay" and suffix == "guide":
