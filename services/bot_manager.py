@@ -108,7 +108,7 @@ def _seller_webhook_setup_text(owner_id: int, g: dict) -> str:
     return (
         "🔗 Razorpay Webhook Setup\n\n"
         "Your unique webhook URL has been generated automatically.\n\n"
-        f"Webhook URL:\n`{_seller_razorpay_webhook_url(owner_id)}`\n\n"
+        f"Webhook URL:\n{_seller_razorpay_webhook_url(owner_id)}\n\n"
         "Required Events:\n"
         "• payment.captured\n"
         "• order.paid\n"
@@ -1954,16 +1954,24 @@ class SellerBotManager:
             ); return
 
         if a=="a_pg_webhook_setup":
-            cfg=await get_gateway_config("seller",owner,decrypt=True); g=(cfg.get("gateways") or {}).get("razorpay",{})
-            await q.edit_message_text(
-                _seller_webhook_setup_text(owner,g),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🧪 Test Webhook",callback_data="a_pg_test_webhook")],
-                    [InlineKeyboardButton("📖 Setup Guide",callback_data="a_pg_webhook_guide")],
-                    [InlineKeyboardButton("⬅ Back",callback_data="a_pg_view_razorpay")],
-                ]),
-            ); return
+            # Keep this page plain-text. Telegram Markdown parsing can reject a
+            # generated URL containing special characters, making the button
+            # appear to do nothing.
+            try:
+                cfg=await get_gateway_config("seller",owner,decrypt=True)
+                g=(cfg.get("gateways") or {}).get("razorpay",{})
+                await q.edit_message_text(
+                    _seller_webhook_setup_text(owner,g),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🧪 Test Webhook",callback_data="a_pg_test_webhook")],
+                        [InlineKeyboardButton("📖 Setup Guide",callback_data="a_pg_webhook_guide")],
+                        [InlineKeyboardButton("⬅ Back",callback_data="a_pg_view_razorpay")],
+                    ]),
+                )
+            except Exception as exc:
+                logger.exception("Seller Razorpay webhook setup page failed for owner=%s", owner)
+                await q.answer("Webhook Setup could not open. Please try again.", show_alert=True)
+            return
 
         if a=="a_pg_webhook_guide":
             links=await get_official_links(); rows=[]
