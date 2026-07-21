@@ -177,11 +177,32 @@ def health():
 
 @app.route("/payment/return/<transaction_id>", methods=["GET", "POST"])
 def payment_return(transaction_id):
+    from services.payment_gateways import verify_and_process_return
+
+    message = "Payment status is being verified"
+    detail = "You may return to Telegram. Activation happens after secure gateway verification."
+    try:
+        ok, result = _run(verify_and_process_return(str(transaction_id)), timeout=35)
+        if ok and result in {"processed", "already processed"}:
+            message = "Payment verified successfully"
+            detail = "Your Telegram plan has been processed. You may return to the bot."
+            if result == "processed":
+                try:
+                    _run(_notify_success(str(transaction_id)), timeout=30)
+                except Exception:
+                    logger.exception("Return verification notification failed transaction_id=%s", transaction_id)
+        elif not ok:
+            message = "Payment verification needs attention"
+            detail = "Please return to Telegram and contact support with your transaction ID."
+    except Exception:
+        logger.exception("Payment return verification failed transaction_id=%s", transaction_id)
+
+    safe_tx = html.escape(str(transaction_id))
     return (
         "<html><body style='font-family:sans-serif;text-align:center;padding:40px'>"
-        "<h2>Payment status is being verified</h2>"
-        f"<p>Transaction: {transaction_id}</p>"
-        "<p>You may return to Telegram. Activation happens only after secure gateway verification.</p>"
+        f"<h2>{html.escape(message)}</h2>"
+        f"<p>Transaction: {safe_tx}</p>"
+        f"<p>{html.escape(detail)}</p>"
         "</body></html>"
     )
 
