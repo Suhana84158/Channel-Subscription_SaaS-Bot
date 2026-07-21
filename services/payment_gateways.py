@@ -309,64 +309,6 @@ async def _create_paytm(tx: dict, s: dict) -> dict:
     return {"gateway_order_id": tx["transaction_id"], "txn_token": txn_token, "checkout_url": f"{_base_url()}/checkout/paytm/{tx['transaction_id']}", "gateway_response": data, "status": "pending", "paytm_host": host, "paytm_mid": mid}
 
 
-async def verify_and_process_return(transaction_id: str) -> tuple[bool, str]:
-    """Securely verify a returned Razorpay payment as a webhook backup.
-
-    The browser return itself is never trusted. The payment-link status is
-    fetched directly from Razorpay with the stored owner/seller credentials,
-    then the same idempotent fulfillment path is used.
-    """
-    tx = await get_gateway_transaction(str(transaction_id))
-    if not tx:
-        return False, "unknown transaction"
-    if tx.get("status") == "fulfilled":
-        return True, "already processed"
-    if tx.get("gateway") != "razorpay":
-        return True, "verification pending"
-
-    cfg = await get_gateway_config(tx["scope"], int(tx["owner_id"]), decrypt=True)
-    settings = (cfg.get("gateways") or {}).get("razorpay") or {}
-    key_id, key_secret = settings.get("key_id"), settings.get("key_secret")
-    payment_link_id = str(tx.get("gateway_order_id") or "")
-    if not key_id or not key_secret or not payment_link_id:
-        return False, "Razorpay verification configuration is incomplete"
-
-    auth = base64.b64encode(f"{key_id}:{key_secret}".encode()).decode()
-    data = await _request(
-        "GET",
-        f"https://api.razorpay.com/v1/payment_links/{payment_link_id}",
-        headers={"Authorization": f"Basic {auth}"},
-    )
-    if str(data.get("status", "")).lower() != "paid":
-        return True, "verification pending"
-    if str(data.get("reference_id") or "") != str(tx["transaction_id"]):
-        return False, "Razorpay reference mismatch"
-    if str(data.get("currency", "INR")).upper() != str(tx.get("currency", "INR")).upper():
-        return False, "Razorpay currency mismatch"
-    if not _amount_matches(float(data.get("amount", 0)) / 100.0, tx.get("amount")):
-        return False, "Razorpay amount mismatch"
-
-    payments = data.get("payments") or []
-    payment_id = ""
-    if payments and isinstance(payments, list):
-        payment_id = str((payments[-1] or {}).get("payment_id") or "")
-    payment_id = payment_id or payment_link_id
-
-    await claim_transaction_success(tx["transaction_id"], payment_id, {"return_verification": data})
-    work = await claim_transaction_fulfillment(tx["transaction_id"])
-    if not work:
-        current = await get_gateway_transaction(tx["transaction_id"])
-        if current and current.get("status") == "fulfilled":
-            return True, "already processed"
-        return True, "already processing"
-    try:
-        await fulfill_transaction(work)
-    except Exception as exc:
-        await mark_transaction_fulfillment_retry(tx["transaction_id"], str(exc))
-        raise
-    return True, "processed"
-
-
 async def verify_and_process_webhook(gateway: str, scope: str, owner_id: int, headers: dict[str, str], raw_body: bytes, payload: dict) -> tuple[bool, str]:
     cfg = await get_gateway_config(scope, owner_id, decrypt=True)
     s = (cfg.get("gateways") or {}).get(gateway) or {}
@@ -376,27 +318,15 @@ async def verify_and_process_webhook(gateway: str, scope: str, owner_id: int, he
         if not secret or not hmac.compare_digest(expected, headers.get("x-razorpay-signature", "")):
             return False, "invalid signature"
         await mark_valid_webhook_received(scope, owner_id, "razorpay")
-        event = str(payload.get("event", ""))
-        razorpay_payload = payload.get("payload") or {}
-        entity = ((razorpay_payload.get("payment") or {}).get("entity") or {})
-        payment_link = ((razorpay_payload.get("payment_link") or {}).get("entity") or {})
-        order_entity = ((razorpay_payload.get("order") or {}).get("entity") or {})
-        txid = (
-            (entity.get("notes") or {}).get("transaction_id")
-            or payment_link.get("reference_id")
-            or (payment_link.get("notes") or {}).get("transaction_id")
-            or (order_entity.get("notes") or {}).get("transaction_id")
-        )
+        event = payload.get("event", "")
+        entity = (((payload.get("payload") or {}).get("payment") or {}).get("entity") or {})
+        order = (((payload.get("payload") or {}).get("payment_link") or {}).get("entity") or {})
+        txid = (entity.get("notes") or {}).get("transaction_id") or order.get("reference_id")
         success = event in {"payment.captured", "order.paid", "payment_link.paid"}
-        payment_id = str(entity.get("id") or order_entity.get("payment_id") or "")
-        if not payment_id and payment_link.get("payments"):
-            payment_id = str((payment_link.get("payments") or [{}])[-1].get("payment_id") or "")
-        event_identity = entity.get("id") or payment_link.get("id") or order_entity.get("id")
-        event_key = (
-            f"{payload.get('account_id', '')}:{event}:{event_identity}"
-            if event_identity
-            else hashlib.sha256(raw_body).hexdigest()
-        )
+        payment_id = entity.get("id", "")
+        if not payment_id and order.get("payments"):
+            payment_id = order.get("payments", [{}])[-1].get("payment_id", "")
+        event_key = payload.get("account_id", "") + ":" + event + ":" + str(entity.get("id") or order.get("id"))
     elif gateway == "cashfree":
         timestamp = headers.get("x-webhook-timestamp", "")
         signature = headers.get("x-webhook-signature", "")
@@ -556,24 +486,7 @@ async def fulfill_transaction(tx: dict) -> None:
                 "invoice_no": invoice.get("invoice_no"),
             },
         )
-        try:
-            from keep_alive import send_runtime_message
-            if purchase.get("status") == "decision_required":
-                from handlers.seller import plan_change_text, plan_change_keyboard
-                await send_runtime_message(
-                    tx["payer_user_id"],
-                    plan_change_text(purchase),
-                    reply_markup=plan_change_keyboard(purchase["payment_id"]),
-                )
-            elif purchase.get("decision") == "same_plan_extended":
-                await send_runtime_message(
-                    tx["payer_user_id"],
-                    f"✅ Plan Extended Successfully\n\nPlan: {plan.get('name', plan_id)}\nDuration Added: {int(plan.get('duration_days', 30))} Days\nYour remaining validity has been preserved.",
-                )
-        except Exception:
-            pass
-
-        await mark_transaction_fulfilled(
+        fulfilled = await mark_transaction_fulfilled(
             tx["transaction_id"],
             {
                 "plan_id": plan_id,
@@ -583,6 +496,74 @@ async def fulfill_transaction(tx: dict) -> None:
                 "invoice_no": invoice.get("invoice_no"),
             },
         )
+        if not fulfilled:
+            return
+
+        # All seller-plan messages are emitted here, after fulfillment is saved.
+        # Separate atomic notification claims guarantee exactly one message for
+        # each stage even when Razorpay sends payment.captured, order.paid and
+        # payment_link.paid almost simultaneously.
+        from keep_alive import send_runtime_message
+
+        if await claim_transaction_notification(
+            tx["transaction_id"], "seller_plan_payment_verified"
+        ):
+            try:
+                duration_days = int(plan.get("duration_days", 30) or 30)
+                status_line = (
+                    "✅ Your seller plan has been extended successfully."
+                    if purchase.get("decision") == "same_plan_extended"
+                    else "✅ Your payment is secure. Please complete the plan decision below."
+                )
+                payment_text = (
+                    "✅ Payment verified automatically\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📦 Plan Name: {plan.get('name', plan_id)}\n"
+                    f"💰 Amount: ₹{float(tx.get('amount') or 0):g}\n"
+                    f"💳 Gateway: {str(tx.get('gateway') or '').title() or '-'}\n"
+                    f"🧾 Transaction ID: {tx.get('gateway_payment_id') or tx.get('transaction_id') or '-'}\n"
+                    f"⌛ Duration: {duration_days} days\n"
+                    f"🧾 Invoice: {invoice.get('invoice_no', '-')}\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"{status_line}"
+                )
+                await send_runtime_message(tx["payer_user_id"], payment_text)
+                await complete_transaction_notification(
+                    tx["transaction_id"],
+                    "seller_plan_payment_verified",
+                    {"purchase_status": purchase.get("status")},
+                )
+            except Exception as exc:
+                await fail_transaction_notification(
+                    tx["transaction_id"],
+                    "seller_plan_payment_verified",
+                    str(exc),
+                )
+
+        # A second message is needed only when the purchased plan differs from
+        # the active plan. It is deliberately sent after the verified message.
+        if purchase.get("status") == "decision_required" and await claim_transaction_notification(
+            tx["transaction_id"], "seller_plan_change_detected"
+        ):
+            try:
+                from handlers.seller import plan_change_text, plan_change_keyboard
+
+                await send_runtime_message(
+                    tx["payer_user_id"],
+                    plan_change_text(purchase),
+                    reply_markup=plan_change_keyboard(purchase["payment_id"]),
+                )
+                await complete_transaction_notification(
+                    tx["transaction_id"],
+                    "seller_plan_change_detected",
+                    {"payment_id": purchase.get("payment_id")},
+                )
+            except Exception as exc:
+                await fail_transaction_notification(
+                    tx["transaction_id"],
+                    "seller_plan_change_detected",
+                    str(exc),
+                )
         return
     if tx["purpose"] == "child_subscription":
         seller_id = tx["owner_id"]
