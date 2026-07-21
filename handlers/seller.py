@@ -1314,22 +1314,46 @@ def _fmt_dt(value):
         return str(value)
 
 
+def _display_plan_limit(value) -> str:
+    if value is None:
+        return "Not set"
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number < 0:
+        return "Unlimited"
+    return f"{number:,}"
+
+
 def plan_change_text(purchase: dict) -> str:
+    limits = purchase.get("plan_limits") or {}
+    amount = float(purchase.get("amount", 0) or 0)
+    purchased_plan = purchase.get("plan_name") or purchase.get("plan_id") or "Unknown"
+    transaction_id = purchase.get("verified_reference") or purchase.get("payment_id") or "Not available"
+    payment_method = str(purchase.get("source") or "Payment").replace("gateway:", "").title()
+
     return (
-        "🔄 Plan Change Detected\n\n"
-        "🎉 Payment Verified Successfully!\n\n"
+        "🔄 Plan Change Detected 🎉\n\n"
+        "✅ Payment Verified Successfully!\n\n"
         "Your payment has been verified successfully.\n\n"
         "The plan you purchased is different from your current active subscription.\n"
         "Please choose how you would like to activate your new plan.\n\n"
-        "━━━━━━━━━━━━━━\n"
-        f"Current Plan: {str(purchase.get('current_plan_id') or 'Free').replace('_',' ').title()}\n"
-        f"Purchased Plan: {purchase.get('plan_name') or purchase.get('plan_id')}\n"
-        f"Current Plan Expires: {_fmt_dt(purchase.get('current_expiry'))}\n"
-        f"Purchased Duration: {int(purchase.get('duration_days', 0))} Days\n"
-        f"Payment Amount: ₹{float(purchase.get('amount', 0)):g}\n"
-        f"Payment Method: {str(purchase.get('source') or 'Payment').replace('gateway:','').title()}\n"
-        f"Transaction ID: {purchase.get('verified_reference') or purchase.get('payment_id')}\n"
         "━━━━━━━━━━━━━━\n\n"
+        f"Current Plan: {str(purchase.get('current_plan_id') or 'Free').replace('_', ' ').title()}\n"
+        f"Purchased Plan: {purchased_plan} — ₹{amount:g}\n"
+        f"Current Plan Expires: {_fmt_dt(purchase.get('current_expiry'))}\n"
+        f"Purchased Duration: {int(purchase.get('duration_days', 0) or 0)} Days\n"
+        f"Payment Amount: ₹{amount:g}\n"
+        f"Payment Method: {payment_method}\n"
+        f"Transaction ID: {transaction_id}\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "📊 New Plan Limits\n"
+        f"• Clone Bots: {_display_plan_limit(limits.get('bot_limit'))}\n"
+        f"• Active Subscribers: {_display_plan_limit(limits.get('active_subscriber_limit'))}\n"
+        f"• Channels/Groups: {_display_plan_limit(limits.get('channel_limit'))}\n"
+        f"• Subscription Plans: {_display_plan_limit(limits.get('plan_limit'))}\n"
+        f"• Admins: {_display_plan_limit(limits.get('admin_limit'))}\n\n"
         "Choose one option below:"
     )
 
