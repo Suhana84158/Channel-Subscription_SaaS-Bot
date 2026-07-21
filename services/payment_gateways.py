@@ -309,6 +309,64 @@ async def _create_paytm(tx: dict, s: dict) -> dict:
     return {"gateway_order_id": tx["transaction_id"], "txn_token": txn_token, "checkout_url": f"{_base_url()}/checkout/paytm/{tx['transaction_id']}", "gateway_response": data, "status": "pending", "paytm_host": host, "paytm_mid": mid}
 
 
+async def verify_and_process_return(transaction_id: str) -> tuple[bool, str]:
+    """Securely verify a returned Razorpay payment as a webhook backup.
+
+    The browser return itself is never trusted. The payment-link status is
+    fetched directly from Razorpay with the stored owner/seller credentials,
+    then the same idempotent fulfillment path is used.
+    """
+    tx = await get_gateway_transaction(str(transaction_id))
+    if not tx:
+        return False, "unknown transaction"
+    if tx.get("status") == "fulfilled":
+        return True, "already processed"
+    if tx.get("gateway") != "razorpay":
+        return True, "verification pending"
+
+    cfg = await get_gateway_config(tx["scope"], int(tx["owner_id"]), decrypt=True)
+    settings = (cfg.get("gateways") or {}).get("razorpay") or {}
+    key_id, key_secret = settings.get("key_id"), settings.get("key_secret")
+    payment_link_id = str(tx.get("gateway_order_id") or "")
+    if not key_id or not key_secret or not payment_link_id:
+        return False, "Razorpay verification configuration is incomplete"
+
+    auth = base64.b64encode(f"{key_id}:{key_secret}".encode()).decode()
+    data = await _request(
+        "GET",
+        f"https://api.razorpay.com/v1/payment_links/{payment_link_id}",
+        headers={"Authorization": f"Basic {auth}"},
+    )
+    if str(data.get("status", "")).lower() != "paid":
+        return True, "verification pending"
+    if str(data.get("reference_id") or "") != str(tx["transaction_id"]):
+        return False, "Razorpay reference mismatch"
+    if str(data.get("currency", "INR")).upper() != str(tx.get("currency", "INR")).upper():
+        return False, "Razorpay currency mismatch"
+    if not _amount_matches(float(data.get("amount", 0)) / 100.0, tx.get("amount")):
+        return False, "Razorpay amount mismatch"
+
+    payments = data.get("payments") or []
+    payment_id = ""
+    if payments and isinstance(payments, list):
+        payment_id = str((payments[-1] or {}).get("payment_id") or "")
+    payment_id = payment_id or payment_link_id
+
+    await claim_transaction_success(tx["transaction_id"], payment_id, {"return_verification": data})
+    work = await claim_transaction_fulfillment(tx["transaction_id"])
+    if not work:
+        current = await get_gateway_transaction(tx["transaction_id"])
+        if current and current.get("status") == "fulfilled":
+            return True, "already processed"
+        return True, "already processing"
+    try:
+        await fulfill_transaction(work)
+    except Exception as exc:
+        await mark_transaction_fulfillment_retry(tx["transaction_id"], str(exc))
+        raise
+    return True, "processed"
+
+
 async def verify_and_process_webhook(gateway: str, scope: str, owner_id: int, headers: dict[str, str], raw_body: bytes, payload: dict) -> tuple[bool, str]:
     cfg = await get_gateway_config(scope, owner_id, decrypt=True)
     s = (cfg.get("gateways") or {}).get(gateway) or {}
@@ -318,15 +376,27 @@ async def verify_and_process_webhook(gateway: str, scope: str, owner_id: int, he
         if not secret or not hmac.compare_digest(expected, headers.get("x-razorpay-signature", "")):
             return False, "invalid signature"
         await mark_valid_webhook_received(scope, owner_id, "razorpay")
-        event = payload.get("event", "")
-        entity = (((payload.get("payload") or {}).get("payment") or {}).get("entity") or {})
-        order = (((payload.get("payload") or {}).get("payment_link") or {}).get("entity") or {})
-        txid = (entity.get("notes") or {}).get("transaction_id") or order.get("reference_id")
+        event = str(payload.get("event", ""))
+        razorpay_payload = payload.get("payload") or {}
+        entity = ((razorpay_payload.get("payment") or {}).get("entity") or {})
+        payment_link = ((razorpay_payload.get("payment_link") or {}).get("entity") or {})
+        order_entity = ((razorpay_payload.get("order") or {}).get("entity") or {})
+        txid = (
+            (entity.get("notes") or {}).get("transaction_id")
+            or payment_link.get("reference_id")
+            or (payment_link.get("notes") or {}).get("transaction_id")
+            or (order_entity.get("notes") or {}).get("transaction_id")
+        )
         success = event in {"payment.captured", "order.paid", "payment_link.paid"}
-        payment_id = entity.get("id", "")
-        if not payment_id and order.get("payments"):
-            payment_id = order.get("payments", [{}])[-1].get("payment_id", "")
-        event_key = payload.get("account_id", "") + ":" + event + ":" + str(entity.get("id") or order.get("id"))
+        payment_id = str(entity.get("id") or order_entity.get("payment_id") or "")
+        if not payment_id and payment_link.get("payments"):
+            payment_id = str((payment_link.get("payments") or [{}])[-1].get("payment_id") or "")
+        event_identity = entity.get("id") or payment_link.get("id") or order_entity.get("id")
+        event_key = (
+            f"{payload.get('account_id', '')}:{event}:{event_identity}"
+            if event_identity
+            else hashlib.sha256(raw_body).hexdigest()
+        )
     elif gateway == "cashfree":
         timestamp = headers.get("x-webhook-timestamp", "")
         signature = headers.get("x-webhook-signature", "")
