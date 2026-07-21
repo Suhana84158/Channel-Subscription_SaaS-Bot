@@ -177,32 +177,11 @@ def health():
 
 @app.route("/payment/return/<transaction_id>", methods=["GET", "POST"])
 def payment_return(transaction_id):
-    from services.payment_gateways import verify_and_process_return
-
-    message = "Payment status is being verified"
-    detail = "You may return to Telegram. Activation happens after secure gateway verification."
-    try:
-        ok, result = _run(verify_and_process_return(str(transaction_id)), timeout=35)
-        if ok and result in {"processed", "already processed"}:
-            message = "Payment verified successfully"
-            detail = "Your Telegram plan has been processed. You may return to the bot."
-            if result == "processed":
-                try:
-                    _run(_notify_success(str(transaction_id)), timeout=30)
-                except Exception:
-                    logger.exception("Return verification notification failed transaction_id=%s", transaction_id)
-        elif not ok:
-            message = "Payment verification needs attention"
-            detail = "Please return to Telegram and contact support with your transaction ID."
-    except Exception:
-        logger.exception("Payment return verification failed transaction_id=%s", transaction_id)
-
-    safe_tx = html.escape(str(transaction_id))
     return (
         "<html><body style='font-family:sans-serif;text-align:center;padding:40px'>"
-        f"<h2>{html.escape(message)}</h2>"
-        f"<p>Transaction: {safe_tx}</p>"
-        f"<p>{html.escape(detail)}</p>"
+        "<h2>Payment status is being verified</h2>"
+        f"<p>Transaction: {transaction_id}</p>"
+        "<p>You may return to Telegram. Activation happens only after secure gateway verification.</p>"
         "</body></html>"
     )
 
@@ -307,88 +286,9 @@ async def _notify_success(transaction_id):
         return
 
     if tx.get("purpose") == "seller_plan":
-        if _main_bot:
-            from config import ADMIN_IDS
-            from database.seller_subscriptions import get_assignment, get_paid_plan
-
-            fulfillment = tx.get("fulfillment") or {}
-            metadata = tx.get("metadata") or {}
-            plan = await get_paid_plan(
-                fulfillment.get("plan_id") or metadata.get("plan_id", "")
-            ) or {}
-
-            try:
-                seller_chat = await _main_bot.get_chat(int(tx["payer_user_id"]))
-                seller_name = getattr(seller_chat, "full_name", None) or "Unknown"
-                seller_username = getattr(seller_chat, "username", None)
-            except Exception:
-                seller_name = str(metadata.get("customer_name") or "Unknown")
-                seller_username = metadata.get("username")
-
-            def _format_dt(value):
-                if not value:
-                    return "-"
-                if hasattr(value, "strftime"):
-                    return value.strftime("%d %b %Y, %I:%M %p UTC")
-                return str(value)
-
-            username_text = f"@{seller_username}" if seller_username else "Not Set"
-            payment_date = tx.get("paid_at") or tx.get("fulfilled_at") or tx.get("updated_at")
-            expiry_date = fulfillment.get("expiry_date")
-            if not expiry_date:
-                assignment = await get_assignment(int(tx["payer_user_id"]))
-                expiry_date = (assignment or {}).get("expiry_date")
-            duration_days = int(plan.get("duration_days") or 0)
-            duration_text = f"{duration_days} days" if duration_days else "Unlimited"
-            plan_name = str(plan.get("name") or metadata.get("description") or "Seller Plan")
-
-            limits_text = (
-                f"• Clone Bots: {int(plan.get('bot_limit', 0))}\n"
-                f"• Active Subscribers: {int(plan.get('active_subscriber_limit', 0))}\n"
-                f"• Channels/Groups: {int(plan.get('channel_limit', 0))}\n"
-                f"• Subscription Plans: {int(plan.get('plan_limit', 0))}\n"
-                f"• Admins: {int(plan.get('admin_limit', 0))}"
-            )
-
-            details = (
-                "✅ Payment verified automatically\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 Seller Name: {seller_name}\n"
-                f"🆔 Seller Username: {username_text}\n"
-                f"🔢 Seller ID: {tx.get('payer_user_id')}\n"
-                f"📦 Plan Name: {plan_name}\n"
-                f"💰 Amount: ₹{float(tx.get('amount') or 0):g}\n"
-                f"💳 Gateway: {str(tx.get('gateway') or '').title() or '-'}\n"
-                f"🧾 Transaction ID: {tx.get('transaction_id') or '-'}\n"
-                f"📅 Payment Date: {_format_dt(payment_date)}\n"
-                f"⏳ Expiry Date: {_format_dt(expiry_date)}\n"
-                f"⌛ Duration: {duration_text}\n"
-                f"🧾 Invoice: {fulfillment.get('invoice_no', '-')}\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "📊 Plan Limitations\n"
-                f"{limits_text}"
-            )
-
-            await _main_bot.send_message(
-                int(tx["payer_user_id"]),
-                details + "\n\n✅ Your seller plan is now active.",
-            )
-
-            owner_notice = (
-                "💰 Seller plan activated automatically\n\n"
-                + details.replace("✅ Payment verified automatically", "✅ Payment verified")
-            )
-            for admin_id in {int(value) for value in ADMIN_IDS}:
-                try:
-                    await _main_bot.send_message(admin_id, owner_notice)
-                except Exception:
-                    logger.exception(
-                        "Failed to notify owner about seller plan payment "
-                        "admin_id=%s seller_id=%s transaction_id=%s",
-                        admin_id,
-                        tx.get("payer_user_id"),
-                        tx.get("transaction_id"),
-                    )
+        # Seller-plan notifications are sent inside fulfill_transaction() in a
+        # strict order with atomic one-time claims. Keeping this notifier silent
+        # prevents webhook/return callbacks from repeating those messages.
         return
 
     if tx.get("purpose") == "child_subscription":
