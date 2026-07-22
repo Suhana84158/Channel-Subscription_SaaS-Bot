@@ -9,7 +9,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from config import TIMEZONE
 from scheduler.expiry_worker import check_expired_users
 from scheduler.payment_recovery import recover_payments_job
-from scheduler.gateway_recovery import recover_gateway_transactions_job
+from scheduler.gateway_recovery import (
+    recover_gateway_transactions_job,
+    recover_subscriber_access_notifications_job,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +124,13 @@ def _register_core_jobs() -> None:
         trigger="interval",
         minutes=2,
         job_id="gateway_transaction_recovery",
+        replace_existing=True,
+    )
+    _remember_job(
+        func=recover_subscriber_access_notifications_job,
+        trigger="interval",
+        minutes=2,
+        job_id="subscriber_invite_recovery",
         replace_existing=True,
     )
     _restore_registered_jobs()

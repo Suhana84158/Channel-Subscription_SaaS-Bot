@@ -8,12 +8,18 @@ from database.payment_gateways import (
     get_gateway_transaction,
     mark_transaction_fulfillment_retry,
     recoverable_gateway_transactions,
+    recoverable_subscriber_access_notifications,
+    reset_failed_transaction_notification,
+    claim_transaction_notification,
+    complete_transaction_notification,
+    fail_transaction_notification,
     update_gateway_transaction,
 )
 from services.payment_gateways import (
     GatewayError,
     _verify_cashfree_payment,
     fulfill_transaction,
+    retry_subscriber_access_notification,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,3 +64,40 @@ async def recover_gateway_transactions_job() -> None:
             logger.warning("Gateway recovery deferred transaction_id=%s error=%s", transaction_id, exc)
         except Exception:
             logger.exception("Gateway recovery failed transaction_id=%s", transaction_id)
+
+
+async def recover_subscriber_access_notifications_job() -> None:
+    """Retry invite delivery for paid users without repeating payment fulfillment."""
+    items = await recoverable_subscriber_access_notifications(limit=50)
+    for tx in items:
+        transaction_id = str(tx.get("transaction_id") or "")
+        if not transaction_id:
+            continue
+        try:
+            reopened = await reset_failed_transaction_notification(
+                transaction_id, "subscriber_access"
+            )
+            if not reopened:
+                continue
+            claimed = await claim_transaction_notification(
+                transaction_id, "subscriber_access"
+            )
+            if not claimed:
+                continue
+            delivery = await retry_subscriber_access_notification(tx)
+            await complete_transaction_notification(
+                transaction_id, "subscriber_access", delivery
+            )
+            logger.info(
+                "Recovered subscriber invite delivery transaction_id=%s sent=%s",
+                transaction_id,
+                delivery.get("sent", 0),
+            )
+        except Exception as exc:
+            await fail_transaction_notification(
+                transaction_id, "subscriber_access", str(exc)
+            )
+            logger.exception(
+                "Subscriber invite recovery failed transaction_id=%s",
+                transaction_id,
+            )
