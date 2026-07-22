@@ -3726,7 +3726,7 @@ class SellerBotManager:
             started=await self.start_bot(int(record["bot_id"])) if record else False
             running=self.get_running(int(owner_id)) if started else None
         if not running:
-            return {"sent":0,"already_member":0,"failed":0,"error":"Clone bot is not running"}
+            return {"sent":0,"already_member":0,"failed":0,"total_channels":0,"error":"Clone bot is not running"}
 
         bot=running.application.bot
         timezone_name = await self.seller_timezone(int(owner_id))
@@ -3811,9 +3811,9 @@ class SellerBotManager:
                     disable_web_page_preview=True,
                 )
             except TelegramError as exc:
-                return {"sent":0,"already_member":already_member,"failed":failed+len(links),"error":str(exc)}
+                return {"sent":0,"already_member":already_member,"failed":failed+len(links),"total_channels":len(channels),"error":str(exc)}
 
-        return {"sent":len(links),"already_member":already_member,"failed":failed,"error":""}
+        return {"sent":len(links),"already_member":already_member,"failed":failed,"total_channels":len(channels),"error":""}
 
     async def expiry_job(self,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)

@@ -453,6 +453,47 @@ async def verify_and_process_webhook(gateway: str, scope: str, owner_id: int, he
     return True, "processed"
 
 
+async def retry_subscriber_access_notification(tx: dict) -> dict:
+    """Retry only the subscriber invite message for an already fulfilled payment."""
+    if tx.get("purpose") != "child_subscription":
+        raise GatewayError("Transaction is not a child subscription")
+
+    seller_id = int(tx["owner_id"])
+    plan = await get_plan(seller_id, tx["metadata"]["plan_id"])
+    if not plan:
+        raise GatewayError("Child subscription plan no longer exists")
+
+    existing_sub = await get_subscription(seller_id, int(tx["payer_user_id"])) or {}
+    expiry = existing_sub.get("expiry_date") or (tx.get("fulfillment") or {}).get("expiry_date")
+
+    from services.bot_manager import bot_manager
+    delivery = await bot_manager.deliver_subscription_access(
+        seller_id,
+        int(tx["payer_user_id"]),
+        success_details={
+            "plan_name": plan.get("name", "Subscription"),
+            "amount": tx.get("amount", 0),
+            "gateway": tx.get("gateway", ""),
+            "transaction_id": tx.get("transaction_id", ""),
+            "payment_date": tx.get("paid_at") or tx.get("updated_at") or tx.get("created_at"),
+            "expiry_date": expiry,
+            "duration": plan.get("duration_text") or f"{plan.get('duration_minutes', 0)} minutes",
+        },
+    )
+
+    total_channels = int(delivery.get("total_channels") or 0)
+    sent = int(delivery.get("sent") or 0)
+    already_member = int(delivery.get("already_member") or 0)
+    failed = int(delivery.get("failed") or 0)
+    error = str(delivery.get("error") or "").strip()
+    if error or failed or (total_channels > 0 and sent == 0 and already_member < total_channels):
+        raise GatewayError(
+            error
+            or f"Invite delivery incomplete: sent={sent}, already_member={already_member}, failed={failed}, total={total_channels}"
+        )
+    return delivery
+
+
 async def fulfill_transaction(tx: dict) -> None:
     if tx["purpose"] == "seller_plan":
         plan_id = tx["metadata"]["plan_id"]
@@ -611,6 +652,21 @@ async def fulfill_transaction(tx: dict) -> None:
                         "duration": plan.get("duration_text") or f"{plan.get('duration_minutes', 0)} minutes",
                     },
                 )
+                total_channels = int(delivery.get("total_channels") or 0)
+                sent = int(delivery.get("sent") or 0)
+                already_member = int(delivery.get("already_member") or 0)
+                failed = int(delivery.get("failed") or 0)
+                error = str(delivery.get("error") or "").strip()
+
+                # A paid user must not be marked as notified when no access was
+                # delivered because the clone bot was offline, lacked admin
+                # rights, or Telegram temporarily rejected invite creation.
+                if error or failed or (total_channels > 0 and sent == 0 and already_member < total_channels):
+                    raise GatewayError(
+                        error
+                        or f"Invite delivery incomplete: sent={sent}, already_member={already_member}, failed={failed}, total={total_channels}"
+                    )
+
                 await complete_transaction_notification(tx["transaction_id"], "subscriber_access", delivery)
                 await audit(
                     "child_gateway_access_delivery",
