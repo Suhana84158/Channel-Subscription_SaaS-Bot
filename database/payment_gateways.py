@@ -404,6 +404,51 @@ async def fail_transaction_notification(transaction_id: str, notification: str, 
     )
 
 
+async def recoverable_subscriber_access_notifications(limit: int = 100) -> list[dict]:
+    """Return fulfilled child-subscription payments whose invite delivery failed.
+
+    Fulfillment and access delivery are separate side effects. A successful
+    payment must stay fulfilled even if Telegram is temporarily unavailable,
+    while this query lets the scheduler retry only the missing invite message.
+    """
+    now = datetime.now(timezone.utc)
+    retry_before = now - timedelta(minutes=1)
+    query = {
+        "purpose": "child_subscription",
+        "status": "fulfilled",
+        "notifications.subscriber_access.status": "failed",
+        "updated_at": {"$lte": retry_before},
+    }
+    return await _transactions().find(query).sort("updated_at", 1).limit(
+        max(1, min(int(limit), 500))
+    ).to_list(length=max(1, min(int(limit), 500)))
+
+
+async def reset_failed_transaction_notification(transaction_id: str, notification: str) -> bool:
+    """Atomically reopen one failed notification so it can be claimed again."""
+    name = str(notification or "").strip().lower()
+    if not name.replace("_", "").isalnum():
+        raise ValueError("Invalid notification name")
+    now = datetime.now(timezone.utc)
+    result = await _transactions().update_one(
+        {
+            "transaction_id": str(transaction_id),
+            f"notifications.{name}.status": "failed",
+        },
+        {
+            "$unset": {
+                f"notifications.{name}.claimed_at": "",
+                f"notifications.{name}.sent_at": "",
+            },
+            "$set": {
+                f"notifications.{name}.status": "retry_pending",
+                "updated_at": now,
+            },
+        },
+    )
+    return result.modified_count == 1
+
+
 async def gateway_history(scope: str, owner_id: int, limit: int = 50) -> list[dict]:
     return await _transactions().find({"scope": scope, "owner_id": int(owner_id)}).sort("created_at", -1).to_list(length=limit)
 
