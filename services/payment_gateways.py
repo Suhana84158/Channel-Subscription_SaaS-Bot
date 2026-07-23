@@ -95,9 +95,9 @@ async def _verify_cashfree_payment(
 ) -> tuple[str, dict]:
     """Re-query Cashfree before fulfillment and verify the paid order details."""
     order_id = str(transaction["transaction_id"])
-    mode = str(settings.get("mode") or transaction.get("gateway_mode") or "live").lower()
+    mode = str(transaction.get("gateway_mode") or settings.get("mode") or "live").lower()
     if mode not in {"test", "live"}:
-        mode = str(settings.get("mode") or "live").lower()
+        mode = str(s.get("mode") or "live").lower()
     if mode not in {"test", "live"}:
         mode = "live"
     base = _cashfree_base(mode)
@@ -143,43 +143,6 @@ async def _verify_cashfree_payment(
     if not payment_id:
         raise GatewayError("Cashfree payment ID is missing")
     return payment_id, {"order": order, "payment": successful}
-
-
-async def verify_and_fulfill_cashfree_transaction(transaction_id: str) -> tuple[bool, str]:
-    """Verify a Cashfree order directly and fulfill it even when webhook delivery is delayed.
-
-    Safe to call from the return page and recovery scheduler because the existing
-    success and fulfillment claims are atomic/idempotent.
-    """
-    tx = await get_gateway_transaction(str(transaction_id))
-    if not tx:
-        return False, "transaction not found"
-    if tx.get("gateway") != "cashfree":
-        return False, "not a Cashfree transaction"
-    if tx.get("status") == "fulfilled" or tx.get("fulfilled_at") is not None:
-        return True, "already fulfilled"
-
-    cfg = await get_gateway_config(tx["scope"], tx["owner_id"], decrypt=True)
-    settings = (cfg.get("gateways") or {}).get("cashfree") or {}
-    payment_id, verified_payload = await _verify_cashfree_payment(tx, settings)
-
-    await claim_transaction_success(
-        tx["transaction_id"],
-        str(payment_id),
-        {"server_verification": verified_payload, "source": "direct_status_check"},
-    )
-    work = await claim_transaction_fulfillment(tx["transaction_id"])
-    if not work:
-        current = await get_gateway_transaction(tx["transaction_id"])
-        if current and (current.get("status") == "fulfilled" or current.get("fulfilled_at") is not None):
-            return True, "already fulfilled"
-        return True, "already processing"
-    try:
-        await fulfill_transaction(work)
-    except Exception as exc:
-        await mark_transaction_fulfillment_retry(tx["transaction_id"], str(exc))
-        raise
-    return True, "processed"
 
 
 async def test_gateway_connection(scope: str, owner_id: int, gateway: str) -> dict:
@@ -252,9 +215,7 @@ async def _create_razorpay(tx: dict, s: dict) -> dict:
 
 
 async def _create_cashfree(tx: dict, s: dict) -> dict:
-    mode = str(s.get("mode") or "live").lower()
-    if mode not in {"test", "live"}:
-        mode = "live"
+    mode = "live"
     base = _cashfree_base(mode)
     amount = round(float(tx["amount"]), 2)
     if amount <= 0:
@@ -351,6 +312,51 @@ async def _create_paytm(tx: dict, s: dict) -> dict:
     if not txn_token:
         raise GatewayError(f"Paytm transaction token missing: {data}")
     return {"gateway_order_id": tx["transaction_id"], "txn_token": txn_token, "checkout_url": f"{_base_url()}/checkout/paytm/{tx['transaction_id']}", "gateway_response": data, "status": "pending", "paytm_host": host, "paytm_mid": mid}
+
+
+async def verify_and_fulfill_cashfree_return(transaction_id: str) -> tuple[bool, str]:
+    """Verify a Cashfree order from the browser return route.
+
+    Cashfree webhooks can be delayed or blocked by dashboard configuration.
+    The return route therefore performs the same server-side verification and
+    idempotent fulfillment without trusting browser query parameters.
+    """
+    tx = await get_gateway_transaction(str(transaction_id))
+    if not tx or tx.get("gateway") != "cashfree":
+        return False, "transaction not found"
+    if tx.get("status") == "fulfilled" or tx.get("fulfilled_at") is not None:
+        return True, "already fulfilled"
+
+    cfg = await get_gateway_config(tx["scope"], tx["owner_id"], decrypt=True)
+    settings = (cfg.get("gateways") or {}).get("cashfree") or {}
+    try:
+        payment_id, verified_payload = await _verify_cashfree_payment(tx, settings)
+    except GatewayError as exc:
+        await update_gateway_transaction(
+            tx["transaction_id"],
+            status="verification_pending",
+            verification_error=str(exc)[:500],
+            verification_checked_at=time.time(),
+        )
+        return False, str(exc)
+
+    await claim_transaction_success(
+        tx["transaction_id"],
+        str(payment_id),
+        {"source": "cashfree_return", "server_verification": verified_payload},
+    )
+    work = await claim_transaction_fulfillment(tx["transaction_id"])
+    if not work:
+        current = await get_gateway_transaction(tx["transaction_id"])
+        if current and (current.get("status") == "fulfilled" or current.get("fulfilled_at") is not None):
+            return True, "already fulfilled"
+        return True, "already processing"
+    try:
+        await fulfill_transaction(work)
+    except Exception as exc:
+        await mark_transaction_fulfillment_retry(tx["transaction_id"], str(exc))
+        raise
+    return True, "fulfilled"
 
 
 async def verify_and_process_webhook(gateway: str, scope: str, owner_id: int, headers: dict[str, str], raw_body: bytes, payload: dict) -> tuple[bool, str]:
