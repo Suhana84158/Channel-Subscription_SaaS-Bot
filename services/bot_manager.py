@@ -2344,6 +2344,18 @@ class SellerBotManager:
                     await q.answer("Seller plan limit reached",show_alert=True)
                     await context.bot.send_message(owner, await plan_limit_warning(owner), reply_markup=self.limit_keyboard("a_pending"))
                     return
+                previous_sub=await get_subscription(owner,p["user_id"])
+                now=datetime.now(timezone.utc)
+                previous_expiry=(previous_sub or {}).get("expiry_date")
+                if previous_expiry and previous_expiry.tzinfo is None:
+                    previous_expiry=previous_expiry.replace(tzinfo=timezone.utc)
+                was_already_active=bool(
+                    previous_sub
+                    and previous_sub.get("active")
+                    and previous_expiry
+                    and previous_expiry>now
+                )
+
                 expiry=await activate_subscription(
                     owner,
                     p["user_id"],
@@ -2446,14 +2458,34 @@ class SellerBotManager:
                 expiry_text=self.format_dt(expiry)
                 invoice=await create_invoice(owner,p["user_id"],p,(await get_seller_settings(owner)).get("bot_name","Seller"))
                 await audit("child_payment_approved",owner,owner,{"payment_id":pid,"invoice_no":invoice["invoice_no"]})
+                if was_already_active:
+                    status_text=(
+                        "ℹ️ Your subscription was already active.\n"
+                        "Your new payment has been added to your existing subscription.\n\n"
+                        f"📅 Previous Expiry: {self.format_dt(previous_expiry)}\n"
+                        f"📅 New Expiry: {expiry_text}\n\n"
+                        "🔗 A fresh private invite link has been generated for you."
+                    )
+                else:
+                    status_text=(
+                        f"📅 Expiry Date: {expiry_text}\n\n"
+                        "🔗 Your fresh private invite link has been generated."
+                    )
+
                 await context.bot.send_message(
                     p["user_id"],
-                    "🎉 Payment approved\n"
-                    f"Plan: {p['plan']}\n"
-                    f"Added validity: {p.get('duration_text') or '-'}\n"
-                    f"New expiry: {expiry_text}\n"
-                    f"Receipt/Invoice: {invoice['invoice_no']}\n\n"
-                    + "\n".join(links),
+                    "✅ Payment approved manually\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📦 Purchased Plan: {p['plan']}\n"
+                    f"💰 Amount: ₹{float(p.get('amount') or 0):g}\n"
+                    f"🧾 Payment ID: {pid}\n"
+                    f"⌛ Added Duration: {p.get('duration_text') or '-'}\n"
+                    f"🧾 Receipt/Invoice: {invoice['invoice_no']}\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"{status_text}\n\n"
+                    "Join using your private invite link(s):\n\n"
+                    + "\n\n".join(links),
+                    disable_web_page_preview=True,
                 )
 
                 approved_caption=await self.payment_details_caption(
@@ -3745,8 +3777,11 @@ class SellerBotManager:
                 status=getattr(member,"status","")
                 is_member=getattr(member,"is_member",None)
                 if status in {"creator","administrator","member"} or (status=="restricted" and is_member is not False):
+                    # Keep membership information for delivery statistics, but do
+                    # not skip link creation. Every successful new payment gets a
+                    # fresh private invite link, even when the user is already in
+                    # the connected channel/group.
                     already_member+=1
-                    continue
                 if status=="kicked":
                     try:
                         await bot.unban_chat_member(chat_id,int(user_id),only_if_banned=True)
@@ -3785,20 +3820,35 @@ class SellerBotManager:
                     def _format_dt(value):
                         return self.format_dt(value, timezone_name, "%d %b %Y, %I:%M %p %Z")
 
+                    was_already_active = bool(success_details.get("was_already_active"))
+                    if was_already_active:
+                        subscription_note = (
+                            "ℹ️ Your subscription was already active.\n"
+                            "Your new purchase has been added to your existing subscription.\n\n"
+                            f"📅 Previous Expiry: {_format_dt(success_details.get('previous_expiry'))}\n"
+                            f"📅 New Expiry: {_format_dt(success_details.get('expiry_date'))}\n\n"
+                            "🔗 A fresh private invite link has been generated for you."
+                        )
+                    else:
+                        subscription_note = (
+                            f"⏳ Expiry Date: {_format_dt(success_details.get('expiry_date'))}\n\n"
+                            "🔗 Your fresh private invite link has been generated."
+                        )
+
                     text = (
                         "✅ Payment verified automatically\n"
                         "━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"👤 Name: {full_name}\n"
                         f"🆔 Username: {username_text}\n"
-                        f"📦 Plan Name: {success_details.get('plan_name') or 'Subscription'}\n"
+                        f"📦 Purchased Plan: {success_details.get('plan_name') or 'Subscription'}\n"
                         f"💰 Amount: ₹{float(success_details.get('amount') or 0):g}\n"
                         f"💳 Gateway: {str(success_details.get('gateway') or '').title() or '-'}\n"
                         f"🧾 Transaction ID: {success_details.get('transaction_id') or '-'}\n"
                         f"📅 Payment Date: {_format_dt(success_details.get('payment_date'))}\n"
-                        f"⏳ Expiry Date: {_format_dt(success_details.get('expiry_date'))}\n"
-                        f"⌛ Duration: {success_details.get('duration') or '-'}\n"
+                        f"⌛ Added Duration: {success_details.get('duration') or '-'}\n"
                         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "🔗 Join using your private invite link(s):\n\n"
+                        f"{subscription_note}\n\n"
+                        "Join using your private invite link(s):\n\n"
                         + "\n\n".join(links)
                     )
                 else:

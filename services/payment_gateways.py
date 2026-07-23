@@ -625,6 +625,20 @@ async def fulfill_transaction(tx: dict) -> None:
             tx["transaction_id"], tx.get("gateway_payment_id", ""),
         )
 
+        # Capture the state before activation so every payment method can show
+        # whether this purchase created a new subscription or extended an active one.
+        existing_sub = await get_subscription(seller_id, tx["payer_user_id"])
+        now = datetime.now(timezone.utc)
+        previous_expiry = (existing_sub or {}).get("expiry_date")
+        if previous_expiry and previous_expiry.tzinfo is None:
+            previous_expiry = previous_expiry.replace(tzinfo=timezone.utc)
+        was_already_active = bool(
+            existing_sub
+            and existing_sub.get("active")
+            and previous_expiry
+            and previous_expiry > now
+        )
+
         # Only the first fulfillment attempt may add validity. A webhook or
         # recovery retry must never extend the same purchase a second time.
         if payment.get("_created_now"):
@@ -633,7 +647,6 @@ async def fulfill_transaction(tx: dict) -> None:
                 plan["duration_minutes"], tx["amount"], plan.get("duration_text"),
             )
         else:
-            existing_sub = await get_subscription(seller_id, tx["payer_user_id"])
             expiry = (existing_sub or {}).get("expiry_date")
 
         invoice = await create_invoice(seller_id, tx["payer_user_id"], payment, "Seller")
@@ -659,6 +672,8 @@ async def fulfill_transaction(tx: dict) -> None:
                         "payment_date": tx.get("paid_at") or tx.get("updated_at") or tx.get("created_at"),
                         "expiry_date": expiry,
                         "duration": plan.get("duration_text") or f"{plan.get('duration_minutes', 0)} minutes",
+                        "was_already_active": was_already_active,
+                        "previous_expiry": previous_expiry,
                     },
                 )
                 if delivery.get("error") or (
