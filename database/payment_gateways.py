@@ -404,46 +404,43 @@ async def fail_transaction_notification(transaction_id: str, notification: str, 
     )
 
 
-async def recoverable_subscriber_access_notifications(limit: int = 100) -> list[dict]:
-    """Return fulfilled child-subscription payments whose invite delivery failed.
+async def recoverable_failed_notifications(limit: int = 100) -> list[dict]:
+    """Return fulfilled child-subscription transactions whose invite delivery failed.
 
-    Fulfillment and access delivery are separate side effects. A successful
-    payment must stay fulfilled even if Telegram is temporarily unavailable,
-    while this query lets the scheduler retry only the missing invite message.
+    Payment fulfillment and subscription activation are already complete for these
+    records. Recovery must retry only the subscriber access message, never charge,
+    extend validity, or create another invoice.
     """
-    now = datetime.now(timezone.utc)
-    retry_before = now - timedelta(minutes=1)
     query = {
         "purpose": "child_subscription",
         "status": "fulfilled",
+        "fulfilled_at": {"$exists": True},
         "notifications.subscriber_access.status": "failed",
-        "updated_at": {"$lte": retry_before},
     }
-    return await _transactions().find(query).sort("updated_at", 1).limit(
-        max(1, min(int(limit), 500))
-    ).to_list(length=max(1, min(int(limit), 500)))
+    safe_limit = max(1, min(int(limit), 500))
+    return await _transactions().find(query).sort("updated_at", 1).limit(safe_limit).to_list(length=safe_limit)
 
 
-async def reset_failed_transaction_notification(transaction_id: str, notification: str) -> bool:
-    """Atomically reopen one failed notification so it can be claimed again."""
+async def reclaim_failed_transaction_notification(transaction_id: str, notification: str) -> bool:
+    """Atomically reclaim one failed notification for a retry worker."""
     name = str(notification or "").strip().lower()
     if not name.replace("_", "").isalnum():
         raise ValueError("Invalid notification name")
     now = datetime.now(timezone.utc)
+    status_field = f"notifications.{name}.status"
     result = await _transactions().update_one(
         {
             "transaction_id": str(transaction_id),
-            f"notifications.{name}.status": "failed",
+            status_field: "failed",
         },
         {
-            "$unset": {
-                f"notifications.{name}.claimed_at": "",
-                f"notifications.{name}.sent_at": "",
-            },
             "$set": {
-                f"notifications.{name}.status": "retry_pending",
+                status_field: "claimed",
+                f"notifications.{name}.claimed_at": now,
                 "updated_at": now,
             },
+            "$inc": {f"notifications.{name}.retry_count": 1},
+            "$unset": {f"notifications.{name}.error": ""},
         },
     )
     return result.modified_count == 1
