@@ -92,7 +92,7 @@ async def recover_failed_invite_deliveries_job() -> None:
             if not claimed:
                 continue
 
-            from database.seller_data import get_plan, get_subscription
+            from database.seller_data import fulfill_subscription_payment, get_plan, get_subscription
             from services.bot_manager import bot_manager
 
             seller_id = int(tx.get("owner_id") or 0)
@@ -102,11 +102,19 @@ async def recover_failed_invite_deliveries_job() -> None:
             if not plan:
                 raise GatewayError("Child subscription plan no longer exists")
 
-            fulfillment = tx.get("fulfillment") or {}
-            expiry = fulfillment.get("expiry_date")
-            if expiry is None:
-                sub = await get_subscription(seller_id, user_id)
-                expiry = (sub or {}).get("expiry_date")
+            # Ensure the subscription exists before retrying access delivery.
+            # This repairs already-fulfilled gateway transactions from older
+            # code where the payment record was saved but activation was skipped.
+            subscription_result = await fulfill_subscription_payment(
+                seller_id,
+                user_id,
+                f"gateway:{transaction_id}",
+                plan.get("name", "Subscription"),
+                int(plan.get("duration_minutes", 0) or 0),
+                tx.get("amount", 0),
+                plan.get("duration_text"),
+            )
+            expiry = subscription_result.get("expiry_date")
 
             delivery = await bot_manager.deliver_subscription_access(
                 seller_id,
