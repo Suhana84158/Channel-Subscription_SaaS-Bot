@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import hmac
 import json
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
@@ -28,7 +28,7 @@ from database.payment_gateways import (
     mark_valid_webhook_received,
     update_gateway_transaction,
 )
-from database.seller_data import activate_subscription, fulfill_subscription_payment, get_plan, create_automatic_payment, get_subscription
+from database.seller_data import activate_subscription, get_plan, create_automatic_payment, get_subscription
 from database.seller_subscriptions import get_paid_plan, process_verified_plan_purchase
 from database.platform_features import create_invoice, audit
 
@@ -98,7 +98,7 @@ async def _verify_cashfree_payment(
     order_id = str(transaction["transaction_id"])
     mode = str(transaction.get("gateway_mode") or settings.get("mode") or "live").lower()
     if mode not in {"test", "live"}:
-        mode = str(s.get("mode") or "live").lower()
+        mode = str(settings.get("mode") or "live").lower()
     if mode not in {"test", "live"}:
         mode = "live"
     base = _cashfree_base(mode)
@@ -144,52 +144,6 @@ async def _verify_cashfree_payment(
     if not payment_id:
         raise GatewayError("Cashfree payment ID is missing")
     return payment_id, {"order": order, "payment": successful}
-
-
-_cashfree_watch_tasks: dict[str, asyncio.Task] = {}
-
-
-def _start_cashfree_payment_watch(transaction_id: str) -> None:
-    """Start an in-process Cashfree status watcher immediately after checkout creation.
-
-    Webhooks and the global recovery scheduler remain active, but this watcher
-    removes their timing dependency: even if the buyer closes the browser before
-    Cashfree redirects to the return URL, the payment is verified and fulfilled.
-    """
-    txid = str(transaction_id or "").strip()
-    if not txid:
-        return
-    current = _cashfree_watch_tasks.get(txid)
-    if current and not current.done():
-        return
-
-    async def _watch() -> None:
-        try:
-            # Allow the buyer time to complete checkout, then poll for up to 20 minutes.
-            await asyncio.sleep(8)
-            for _ in range(80):
-                tx = await get_gateway_transaction(txid)
-                if not tx or tx.get("status") == "fulfilled" or tx.get("fulfilled_at") is not None:
-                    return
-                try:
-                    verified, _ = await verify_and_fulfill_cashfree_return(txid)
-                    if verified:
-                        return
-                except Exception:
-                    # The durable scheduler will also retry; keep this watcher quiet
-                    # while the order is still pending or Cashfree is temporarily unavailable.
-                    pass
-                await asyncio.sleep(15)
-        finally:
-            _cashfree_watch_tasks.pop(txid, None)
-
-    try:
-        _cashfree_watch_tasks[txid] = asyncio.create_task(
-            _watch(), name=f"cashfree-watch-{txid}"
-        )
-    except RuntimeError:
-        # No running event loop: the durable scheduler/return route will handle it.
-        pass
 
 
 async def test_gateway_connection(scope: str, owner_id: int, gateway: str) -> dict:
@@ -240,8 +194,6 @@ async def create_checkout(transaction: dict) -> dict:
     else:
         raise GatewayError("Unsupported gateway")
     await update_gateway_transaction(transaction["transaction_id"], **result)
-    if gateway == "cashfree":
-        _start_cashfree_payment_watch(transaction["transaction_id"])
     return result
 
 
@@ -688,19 +640,15 @@ async def fulfill_transaction(tx: dict) -> None:
             and previous_expiry > now
         )
 
-        # Apply the purchased validity with a transaction-scoped idempotency
-        # key. This also repairs transactions where the payment record was
-        # created earlier but subscription activation did not finish.
-        fulfillment = await fulfill_subscription_payment(
-            seller_id,
-            tx["payer_user_id"],
-            f"gateway:{tx['transaction_id']}",
-            plan["name"],
-            plan["duration_minutes"],
-            tx["amount"],
-            plan.get("duration_text"),
-        )
-        expiry = fulfillment.get("expiry_date")
+        # Only the first fulfillment attempt may add validity. A webhook or
+        # recovery retry must never extend the same purchase a second time.
+        if payment.get("_created_now"):
+            expiry = await activate_subscription(
+                seller_id, tx["payer_user_id"], plan["name"],
+                plan["duration_minutes"], tx["amount"], plan.get("duration_text"),
+            )
+        else:
+            expiry = (existing_sub or {}).get("expiry_date")
 
         invoice = await create_invoice(seller_id, tx["payer_user_id"], payment, "Seller")
         await audit("child_gateway_payment_paid", tx["payer_user_id"], seller_id, {"transaction_id": tx["transaction_id"], "gateway": tx["gateway"], "invoice_no": invoice.get("invoice_no")})
