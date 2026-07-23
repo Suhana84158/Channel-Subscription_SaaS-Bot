@@ -58,7 +58,7 @@ from database.platform_features import (
     set_scheduled_status,
 )
 from database.seller_data import (
-    activate_subscription, active_subscriptions, add_channel, create_payment, create_plan, delete_plan,
+    activate_subscription, fulfill_subscription_payment, active_subscriptions, add_channel, create_payment, create_plan, delete_plan,
     ensure_seller_defaults, expired_subscriptions, get_channels, get_payment,
     get_plan, get_plans, get_seller_settings, get_subscription, get_user, mark_expired,
     payment_history, pending_payments, remove_channel, set_payment_status,
@@ -2356,14 +2356,16 @@ class SellerBotManager:
                     and previous_expiry>now
                 )
 
-                expiry=await activate_subscription(
+                manual_fulfillment=await fulfill_subscription_payment(
                     owner,
                     p["user_id"],
+                    f"manual:{owner}:{pid}",
                     p["plan"],
                     p["duration_minutes"],
                     amount=p.get("amount"),
                     duration_text=p.get("duration_text"),
                 )
+                expiry=manual_fulfillment.get("expiry_date")
 
                 referral=await mark_referral_rewarded(
                     owner,

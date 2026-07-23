@@ -27,7 +27,7 @@ from database.payment_gateways import (
     mark_valid_webhook_received,
     update_gateway_transaction,
 )
-from database.seller_data import activate_subscription, get_plan, create_automatic_payment, get_subscription
+from database.seller_data import activate_subscription, fulfill_subscription_payment, get_plan, create_automatic_payment, get_subscription
 from database.seller_subscriptions import get_paid_plan, process_verified_plan_purchase
 from database.platform_features import create_invoice, audit
 
@@ -639,15 +639,19 @@ async def fulfill_transaction(tx: dict) -> None:
             and previous_expiry > now
         )
 
-        # Only the first fulfillment attempt may add validity. A webhook or
-        # recovery retry must never extend the same purchase a second time.
-        if payment.get("_created_now"):
-            expiry = await activate_subscription(
-                seller_id, tx["payer_user_id"], plan["name"],
-                plan["duration_minutes"], tx["amount"], plan.get("duration_text"),
-            )
-        else:
-            expiry = (existing_sub or {}).get("expiry_date")
+        # Apply the purchased validity with a transaction-scoped idempotency
+        # key. This also repairs transactions where the payment record was
+        # created earlier but subscription activation did not finish.
+        fulfillment = await fulfill_subscription_payment(
+            seller_id,
+            tx["payer_user_id"],
+            f"gateway:{tx['transaction_id']}",
+            plan["name"],
+            plan["duration_minutes"],
+            tx["amount"],
+            plan.get("duration_text"),
+        )
+        expiry = fulfillment.get("expiry_date")
 
         invoice = await create_invoice(seller_id, tx["payer_user_id"], payment, "Seller")
         await audit("child_gateway_payment_paid", tx["payer_user_id"], seller_id, {"transaction_id": tx["transaction_id"], "gateway": tx["gateway"], "invoice_no": invoice.get("invoice_no")})
