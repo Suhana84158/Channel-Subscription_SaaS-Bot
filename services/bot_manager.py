@@ -3726,11 +3726,14 @@ class SellerBotManager:
             started=await self.start_bot(int(record["bot_id"])) if record else False
             running=self.get_running(int(owner_id)) if started else None
         if not running:
-            return {"sent":0,"already_member":0,"failed":0,"total_channels":0,"error":"Clone bot is not running"}
+            return {"sent":0,"already_member":0,"failed":0,"error":"Clone bot is not running"}
 
         bot=running.application.bot
         timezone_name = await self.seller_timezone(int(owner_id))
         channels=await get_channels(int(owner_id))
+        if not channels:
+            return {"sent":0,"already_member":0,"failed":0,"error":"No channel/group is connected to this clone bot"}
+
         links=[]
         already_member=0
         failed=0
@@ -3811,9 +3814,14 @@ class SellerBotManager:
                     disable_web_page_preview=True,
                 )
             except TelegramError as exc:
-                return {"sent":0,"already_member":already_member,"failed":failed+len(links),"total_channels":len(channels),"error":str(exc)}
+                return {"sent":0,"already_member":already_member,"failed":failed+len(links),"error":str(exc)}
 
-        return {"sent":len(links),"already_member":already_member,"failed":failed,"total_channels":len(channels),"error":""}
+        error = ""
+        if not links and already_member == 0:
+            error = "Invite link could not be created for any connected channel/group"
+        elif failed and not links:
+            error = "Invite link creation failed for all connected channel/groups"
+        return {"sent":len(links),"already_member":already_member,"failed":failed,"error":error}
 
     async def expiry_job(self,context:ContextTypes.DEFAULT_TYPE):
         owner=self.owner(context)
