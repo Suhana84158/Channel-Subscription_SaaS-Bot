@@ -177,11 +177,30 @@ def health():
 
 @app.route("/payment/return/<transaction_id>", methods=["GET", "POST"])
 def payment_return(transaction_id):
+    from database.payment_gateways import get_gateway_transaction
+
+    tx = _run(get_gateway_transaction(transaction_id))
+    verified = False
+    message = "Payment status is being verified"
+    if tx and tx.get("gateway") == "cashfree":
+        try:
+            from services.payment_gateways import verify_and_fulfill_cashfree_return
+
+            verified, result = _run(verify_and_fulfill_cashfree_return(transaction_id), timeout=60)
+            message = (
+                "Payment verified. Your subscription and private invite link have been sent in Telegram."
+                if verified
+                else "Payment is still being verified. Please return to Telegram; automatic recovery will continue."
+            )
+        except Exception:
+            message = "Payment is being verified. Please return to Telegram; automatic recovery will continue."
+
+    title = "Payment verified" if verified else "Payment status is being verified"
     return (
         "<html><body style='font-family:sans-serif;text-align:center;padding:40px'>"
-        "<h2>Payment status is being verified</h2>"
-        f"<p>Transaction: {transaction_id}</p>"
-        "<p>You may return to Telegram. Activation happens only after secure gateway verification.</p>"
+        f"<h2>{title}</h2>"
+        f"<p>Transaction: {html.escape(str(transaction_id))}</p>"
+        f"<p>{message}</p>"
         "</body></html>"
     )
 
