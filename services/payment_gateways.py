@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -145,6 +146,52 @@ async def _verify_cashfree_payment(
     return payment_id, {"order": order, "payment": successful}
 
 
+_cashfree_watch_tasks: dict[str, asyncio.Task] = {}
+
+
+def _start_cashfree_payment_watch(transaction_id: str) -> None:
+    """Start an in-process Cashfree status watcher immediately after checkout creation.
+
+    Webhooks and the global recovery scheduler remain active, but this watcher
+    removes their timing dependency: even if the buyer closes the browser before
+    Cashfree redirects to the return URL, the payment is verified and fulfilled.
+    """
+    txid = str(transaction_id or "").strip()
+    if not txid:
+        return
+    current = _cashfree_watch_tasks.get(txid)
+    if current and not current.done():
+        return
+
+    async def _watch() -> None:
+        try:
+            # Allow the buyer time to complete checkout, then poll for up to 20 minutes.
+            await asyncio.sleep(8)
+            for _ in range(80):
+                tx = await get_gateway_transaction(txid)
+                if not tx or tx.get("status") == "fulfilled" or tx.get("fulfilled_at") is not None:
+                    return
+                try:
+                    verified, _ = await verify_and_fulfill_cashfree_return(txid)
+                    if verified:
+                        return
+                except Exception:
+                    # The durable scheduler will also retry; keep this watcher quiet
+                    # while the order is still pending or Cashfree is temporarily unavailable.
+                    pass
+                await asyncio.sleep(15)
+        finally:
+            _cashfree_watch_tasks.pop(txid, None)
+
+    try:
+        _cashfree_watch_tasks[txid] = asyncio.create_task(
+            _watch(), name=f"cashfree-watch-{txid}"
+        )
+    except RuntimeError:
+        # No running event loop: the durable scheduler/return route will handle it.
+        pass
+
+
 async def test_gateway_connection(scope: str, owner_id: int, gateway: str) -> dict:
     """Validate stored credentials without creating or charging a payment."""
     cfg = await get_gateway_config(scope, owner_id, decrypt=True)
@@ -193,6 +240,8 @@ async def create_checkout(transaction: dict) -> dict:
     else:
         raise GatewayError("Unsupported gateway")
     await update_gateway_transaction(transaction["transaction_id"], **result)
+    if gateway == "cashfree":
+        _start_cashfree_payment_watch(transaction["transaction_id"])
     return result
 
 
