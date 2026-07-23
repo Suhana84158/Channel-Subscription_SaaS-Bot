@@ -3009,7 +3009,21 @@ class SellerBotManager:
                     message_id=message.message_id,
                 )
                 await save_private_message_link(owner,owner,copied.message_id,user.id)
-            await message.reply_text("✅ Message sent to live support.")
+            confirmation = await message.reply_text("✅ Message sent to live support.")
+
+            async def delete_support_confirmation() -> None:
+                await asyncio.sleep(3)
+                try:
+                    await confirmation.delete()
+                except TelegramError as exc:
+                    logger.debug(
+                        "Could not auto-delete live support confirmation owner=%s user=%s: %s",
+                        owner,
+                        user.id,
+                        exc,
+                    )
+
+            asyncio.create_task(delete_support_confirmation())
         except ApplicationHandlerStop:
             raise
         except TelegramError as exc:
