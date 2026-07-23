@@ -343,6 +343,106 @@ async def activate_subscription(
     )
     return expiry
 
+async def fulfill_subscription_payment(
+    owner_id,
+    user_id,
+    fulfillment_key,
+    plan_name,
+    duration_minutes,
+    amount=None,
+    duration_text=None,
+):
+    """Idempotently activate/extend one seller subscription payment.
+
+    The fulfillment key is stored in the same MongoDB update that changes the
+    expiry date. Webhook retries, recovery jobs, or duplicate admin callbacks
+    therefore cannot add the same purchased duration twice.
+    """
+    now = datetime.now(timezone.utc)
+    key = str(fulfillment_key or "").strip()
+    if not key:
+        raise ValueError("fulfillment_key is required")
+
+    added_minutes = max(0, int(duration_minutes or 0))
+    payment_amount = float(amount or 0)
+
+    already_applied = {
+        "$in": [key, {"$ifNull": ["$fulfillment_keys", []]}]
+    }
+    active_before = {
+        "$and": [
+            {"$eq": [{"$ifNull": ["$active", False]}, True]},
+            {"$gt": [{"$ifNull": ["$expiry_date", now]}, now]},
+        ]
+    }
+    base_expiry = {"$cond": [active_before, "$expiry_date", now]}
+    new_expiry = {
+        "$dateAdd": {
+            "startDate": base_expiry,
+            "unit": "minute",
+            "amount": added_minutes,
+        }
+    }
+
+    set_fields = {
+        "owner_id": int(owner_id),
+        "user_id": int(user_id),
+        "plan": {"$cond": [already_applied, {"$ifNull": ["$plan", plan_name]}, plan_name]},
+        "active": {"$cond": [already_applied, {"$ifNull": ["$active", True]}, True]},
+        "expiry_date": {"$cond": [already_applied, "$expiry_date", new_expiry]},
+        "last_renewed_at": {"$cond": [already_applied, "$last_renewed_at", now]},
+        "last_added_minutes": {"$cond": [already_applied, "$last_added_minutes", added_minutes]},
+        "total_duration_minutes": {
+            "$cond": [
+                already_applied,
+                {"$ifNull": ["$total_duration_minutes", 0]},
+                {"$add": [{"$ifNull": ["$total_duration_minutes", 0]}, added_minutes]},
+            ]
+        },
+        "total_paid": {
+            "$cond": [
+                already_applied,
+                {"$ifNull": ["$total_paid", 0]},
+                {"$add": [{"$ifNull": ["$total_paid", 0]}, payment_amount]},
+            ]
+        },
+        "amount": {"$cond": [already_applied, "$amount", payment_amount]},
+        "last_payment_amount": {"$cond": [already_applied, "$last_payment_amount", payment_amount]},
+        "duration_text": {"$cond": [already_applied, "$duration_text", duration_text or ""]},
+        "last_duration_text": {"$cond": [already_applied, "$last_duration_text", duration_text or ""]},
+        "removed_by_admin": {"$cond": [already_applied, {"$ifNull": ["$removed_by_admin", False]}, False]},
+        "start_date": {
+            "$cond": [
+                already_applied,
+                {"$ifNull": ["$start_date", now]},
+                {"$cond": [active_before, {"$ifNull": ["$start_date", now]}, now]},
+            ]
+        },
+        "created_at": {"$ifNull": ["$created_at", now]},
+        "updated_at": {"$cond": [already_applied, {"$ifNull": ["$updated_at", now]}, now]},
+        "fulfillment_keys": {
+            "$cond": [
+                already_applied,
+                {"$ifNull": ["$fulfillment_keys", []]},
+                {"$concatArrays": [{"$ifNull": ["$fulfillment_keys", []]}, [key]]},
+            ]
+        },
+        "last_fulfillment_key": {"$cond": [already_applied, "$last_fulfillment_key", key]},
+    }
+
+    result = await c(SUBS).find_one_and_update(
+        {"owner_id": int(owner_id), "user_id": int(user_id)},
+        [{"$set": set_fields}],
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return {
+        "expiry_date": (result or {}).get("expiry_date"),
+        "subscription": result or {},
+        "fulfillment_key": key,
+    }
+
+
 async def active_subscriptions(owner_id, limit=5000):
     now=datetime.now(timezone.utc)
     return await c(SUBS).find({
