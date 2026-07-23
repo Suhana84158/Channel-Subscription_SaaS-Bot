@@ -38,10 +38,23 @@ async def recover_gateway_transactions_job() -> None:
             ):
                 continue
 
-            if current.get("status") in {"pending", "verification_pending"} and current.get("gateway") == "cashfree":
+            if current.get("gateway") == "cashfree" and current.get("status") in {"pending", "verification_pending"}:
                 cfg = await get_gateway_config(current["scope"], current["owner_id"], decrypt=True)
                 settings = (cfg.get("gateways") or {}).get("cashfree") or {}
-                payment_id, verified = await _verify_cashfree_payment(current, settings)
+                try:
+                    payment_id, verified = await _verify_cashfree_payment(current, settings)
+                except GatewayError as exc:
+                    await update_gateway_transaction(
+                        transaction_id,
+                        status="verification_pending",
+                        verification_error=str(exc)[:500],
+                    )
+                    logger.info(
+                        "Cashfree payment still pending transaction_id=%s error=%s",
+                        transaction_id,
+                        exc,
+                    )
+                    continue
                 await update_gateway_transaction(
                     transaction_id,
                     status="paid",
