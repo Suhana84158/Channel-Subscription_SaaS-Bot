@@ -100,11 +100,12 @@ async def save_gateway_config(
         if isinstance(value, str):
             value = value.strip()
         if key == "mode":
-            # Automatic gateways always operate in live mode.
-            value = "live"
+            value = str(value or "live").lower()
+            if value not in VALID_MODES:
+                raise ValueError("Mode must be test or live")
         item[key] = value
 
-    item["mode"] = "live"
+    item["mode"] = str(item.get("mode") or "live").lower()
 
     if item.get("enabled") and not gateway_is_ready(gateway, item):
         missing = ", ".join(gateway_missing_fields(gateway, item))
@@ -458,7 +459,8 @@ async def recoverable_gateway_transactions(limit: int = 100) -> list[dict]:
         "$or": [
             {"status": {"$in": ["paid", "paid_unfulfilled"]}},
             {"status": "fulfilling", "fulfillment_lease_until": {"$lte": now}},
-            {"status": "verification_pending", "updated_at": {"$lte": now - timedelta(minutes=2)}},
+            {"status": "verification_pending", "updated_at": {"$lte": now - timedelta(minutes=1)}},
+            {"gateway": "cashfree", "status": "pending", "updated_at": {"$lte": now - timedelta(minutes=1)}},
         ],
     }
     return await _transactions().find(query).sort("updated_at", 1).limit(max(1, min(int(limit), 500))).to_list(length=max(1, min(int(limit), 500)))
