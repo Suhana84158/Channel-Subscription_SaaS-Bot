@@ -7,6 +7,7 @@ TOPICS = "clone_live_support_topics"
 MESSAGE_LINKS = "clone_live_support_message_links"
 BLOCKS = "clone_live_support_blocks"
 TEMPLATES = "clone_live_support_templates"
+AUTO_REPLIES = "clone_live_support_auto_replies"
 
 
 def c(name: str):
@@ -27,6 +28,7 @@ async def initialize_live_support_indexes():
     await c(MESSAGE_LINKS).create_index("created_at", expireAfterSeconds=60 * 60 * 24 * 180)
     await c(BLOCKS).create_index([("owner_id", 1), ("user_id", 1)], unique=True)
     await c(TEMPLATES).create_index([("owner_id", 1), ("command", 1)], unique=True)
+    await c(AUTO_REPLIES).create_index([("owner_id", 1), ("keyword", 1)], unique=True)
     await initialize_live_support_delivery_indexes()
 
 
@@ -273,6 +275,73 @@ async def delete_support_template(owner_id: int, command: str):
     return await c(TEMPLATES).delete_one(
         {"owner_id": int(owner_id), "command": command}
     )
+
+
+async def list_support_auto_replies(owner_id: int):
+    return await c(AUTO_REPLIES).find(
+        {"owner_id": int(owner_id)}
+    ).sort("keyword", 1).to_list(length=None)
+
+
+async def get_support_auto_reply(owner_id: int, keyword: str):
+    keyword = " ".join(str(keyword or "").strip().lower().split())
+    return await c(AUTO_REPLIES).find_one(
+        {"owner_id": int(owner_id), "keyword": keyword}
+    )
+
+
+async def save_support_auto_reply(owner_id: int, keyword: str, **values):
+    keyword = " ".join(str(keyword or "").strip().lower().split())
+    if (
+        not keyword
+        or len(keyword) > 20
+        or not keyword.replace(" ", "").replace("_", "").isalnum()
+    ):
+        raise ValueError("Use only letters, numbers, spaces or underscore (max 20 characters)")
+
+    allowed = {"text", "media_type", "media_file_id", "buttons"}
+    clean = {key: value for key, value in values.items() if key in allowed}
+    now = datetime.now(timezone.utc)
+    clean["updated_at"] = now
+    defaults = {
+        "owner_id": int(owner_id),
+        "keyword": keyword,
+        "text": "",
+        "media_type": "",
+        "media_file_id": "",
+        "buttons": [],
+        "created_at": now,
+    }
+    for key in clean:
+        defaults.pop(key, None)
+    await c(AUTO_REPLIES).update_one(
+        {"owner_id": int(owner_id), "keyword": keyword},
+        {"$set": clean, "$setOnInsert": defaults},
+        upsert=True,
+    )
+    return await get_support_auto_reply(owner_id, keyword)
+
+
+async def delete_support_auto_reply(owner_id: int, keyword: str):
+    keyword = " ".join(str(keyword or "").strip().lower().split())
+    return await c(AUTO_REPLIES).delete_one(
+        {"owner_id": int(owner_id), "keyword": keyword}
+    )
+
+
+async def match_support_auto_reply(owner_id: int, message_text: str):
+    normalized = " ".join(str(message_text or "").strip().lower().split())
+    if not normalized:
+        return None
+    items = await list_support_auto_replies(owner_id)
+    # Prefer the longest matching keyword so a specific phrase wins over a short word.
+    items.sort(key=lambda item: len(item.get("keyword", "")), reverse=True)
+    padded = f" {normalized} "
+    for item in items:
+        keyword = " ".join(str(item.get("keyword") or "").split())
+        if keyword and f" {keyword} " in padded:
+            return item
+    return None
 
 # Delivery receipts make forwarding idempotent across retries and restarts.
 DELIVERIES = "clone_live_support_deliveries"
