@@ -68,8 +68,8 @@ def seller_welcome_keyboard(has_bot: bool):
     return InlineKeyboardMarkup(rows)
 
 
-async def role_welcome(user_id: int):
-    if await _is_owner(user_id):
+async def role_welcome(user_id: int, *, owner_checked: bool = False):
+    if not owner_checked and await _is_owner(user_id):
         return (
             "🚀 Main Bot Platform\n\n"
             "👑 Welcome, Owner!\n\n"
@@ -232,10 +232,17 @@ async def start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.debug("Callback acknowledgement failed", exc_info=True)
 
-    await _bounded(
-        get_or_create_user(query.from_user),
-        default=None,
-        label="callback user registration",
+    # Registration does not affect which dashboard is shown. Run it in the
+    # background so a slow MongoDB write cannot delay the Start/Home callback.
+    registration_task = asyncio.create_task(
+        _bounded(
+            get_or_create_user(query.from_user),
+            default=None,
+            label="callback user registration",
+        )
+    )
+    registration_task.add_done_callback(
+        lambda task: task.exception() if not task.cancelled() else None
     )
 
     try:
@@ -254,7 +261,7 @@ async def start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        text, keyboard = await role_welcome(query.from_user.id)
+        text, keyboard = await role_welcome(query.from_user.id, owner_checked=True)
         await asyncio.wait_for(
             query.edit_message_text(text, reply_markup=keyboard),
             timeout=12,
