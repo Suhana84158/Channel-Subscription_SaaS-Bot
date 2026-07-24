@@ -36,7 +36,8 @@ from database.live_support import (
     is_support_blocked, save_private_message_link, save_support_topic,
     set_support_block, update_live_support_settings,
     list_support_templates, get_support_template, save_support_template,
-    delete_support_template,
+    delete_support_template, list_support_auto_replies, get_support_auto_reply,
+    save_support_auto_reply, delete_support_auto_reply, match_support_auto_reply,
 )
 from database.platform_features import (
     audit,
@@ -388,6 +389,7 @@ class SellerBotManager:
                 callback_data="a_live_support_mode_topic",
             )],
             [InlineKeyboardButton(f"📌 Group: {group_title[:28]}",callback_data="a_live_support_group_info")],
+            [InlineKeyboardButton("🤖 Auto Reply",callback_data="a_support_auto_replies")],
             [InlineKeyboardButton("⚡ Reply Templates",callback_data="a_support_templates")],
             [InlineKeyboardButton("🚫 Blocked Users Count",callback_data="a_live_support_blocks")],
             [InlineKeyboardButton("⬅ Back",callback_data="a_home")],
@@ -423,6 +425,50 @@ class SellerBotManager:
             icon="🔴" if duration=="Off" else "🟢"
             rows.append([InlineKeyboardButton(f"/{command}   {icon} {duration}",callback_data=f"a_support_tpl_view_{command}")])
         rows.append([InlineKeyboardButton("⬅ Back",callback_data="a_live_support")])
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def support_auto_replies_menu(items):
+        rows=[[InlineKeyboardButton("➕ Add Auto Reply",callback_data="a_support_ar_add")]]
+        for item in items:
+            keyword=item.get("keyword","")
+            rows.append([InlineKeyboardButton(f"🔑 {keyword[:42]}",callback_data=f"a_support_ar_view_{keyword}")])
+        rows.append([InlineKeyboardButton("⬅ Back",callback_data="a_live_support")])
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def support_auto_reply_edit_menu(keyword):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📄 Text",callback_data=f"a_support_ar_text_{keyword}")],
+            [InlineKeyboardButton("🖼 Media",callback_data=f"a_support_ar_media_{keyword}")],
+            [InlineKeyboardButton("🔗 URL Buttons",callback_data=f"a_support_ar_buttons_{keyword}")],
+            [InlineKeyboardButton("👀 Full Preview",callback_data=f"a_support_ar_preview_{keyword}")],
+            [InlineKeyboardButton("🗑 Delete Auto Reply",callback_data=f"a_support_ar_delete_{keyword}")],
+            [InlineKeyboardButton("⬅ Back",callback_data="a_support_auto_replies")],
+        ])
+
+    @staticmethod
+    def support_auto_reply_text_menu(keyword, has_text=False):
+        rows=[]
+        if has_text:
+            rows.append([InlineKeyboardButton("🗑 Remove Text",callback_data=f"a_support_ar_rmtext_{keyword}")])
+        rows.append([InlineKeyboardButton("⬅ Back",callback_data=f"a_support_ar_view_{keyword}")])
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def support_auto_reply_media_menu(keyword, has_media=False):
+        rows=[]
+        if has_media:
+            rows.append([InlineKeyboardButton("🗑 Remove Media",callback_data=f"a_support_ar_rmmedia_{keyword}")])
+        rows.append([InlineKeyboardButton("⬅ Back",callback_data=f"a_support_ar_view_{keyword}")])
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def support_auto_reply_buttons_menu(keyword, has_buttons=False):
+        rows=[]
+        if has_buttons:
+            rows.append([InlineKeyboardButton("🚫 Remove Keyboard",callback_data=f"a_support_ar_rmbuttons_{keyword}")])
+        rows.append([InlineKeyboardButton("⬅ Back",callback_data=f"a_support_ar_view_{keyword}")])
         return InlineKeyboardMarkup(rows)
 
     @staticmethod
@@ -2056,6 +2102,70 @@ class SellerBotManager:
                 "User ke support topic ke first details message se Block/Unblock kiya ja sakta hai.",
                 reply_markup=self.back("a_live_support"),
             ); return
+        if a=="a_support_auto_replies":
+            items=await list_support_auto_replies(owner)
+            await q.edit_message_text(
+                "🤖 Live Support Auto Reply\n\nSet a keyword, then configure its text, media and URL buttons. When a user message contains that keyword, the saved reply is sent automatically.",
+                reply_markup=self.support_auto_replies_menu(items),
+            ); return
+        if a=="a_support_ar_add":
+            context.user_data.clear(); context.user_data["wait_support_ar_keyword"]=True
+            await q.edit_message_text(
+                "🔑 Send the keyword or phrase for this auto reply.\n\nExample: payment",
+                reply_markup=self.back("a_support_auto_replies"),
+            ); return
+        if a.startswith("a_support_ar_view_"):
+            keyword=a.replace("a_support_ar_view_","")
+            item=await get_support_auto_reply(owner,keyword)
+            if not item:
+                await q.edit_message_text("❌ Auto reply not found",reply_markup=self.back("a_support_auto_replies")); return
+            count=sum(len(row) for row in (item.get("buttons") or []))
+            await q.edit_message_text(
+                f"🤖 Auto Reply\n\n🔑 Keyword: {keyword}\n📄 Text: {'✅' if item.get('text') else '❌'}\n🖼 Media: {'✅' if item.get('media_file_id') else '❌'}\n🔗 URL Buttons: {count}",
+                reply_markup=self.support_auto_reply_edit_menu(keyword),
+            ); return
+        if a.startswith("a_support_ar_text_"):
+            keyword=a.replace("a_support_ar_text_","")
+            item=await get_support_auto_reply(owner,keyword) or {}
+            context.user_data.clear(); context.user_data["wait_support_ar_text"]=keyword
+            await q.edit_message_text(
+                "📄 Send the auto-reply text.\n\nHTML and variables are supported: {NAME} {ID} {USERNAME} {PLAN} {EXPIRY}",
+                reply_markup=self.support_auto_reply_text_menu(keyword,bool(item.get("text"))),
+            ); return
+        if a.startswith("a_support_ar_media_"):
+            keyword=a.replace("a_support_ar_media_","")
+            item=await get_support_auto_reply(owner,keyword) or {}
+            context.user_data.clear(); context.user_data["wait_support_ar_media"]=keyword
+            await q.edit_message_text(
+                "🖼 Send a photo, video, GIF or document.",
+                reply_markup=self.support_auto_reply_media_menu(keyword,bool(item.get("media_file_id"))),
+            ); return
+        if a.startswith("a_support_ar_buttons_"):
+            keyword=a.replace("a_support_ar_buttons_","")
+            item=await get_support_auto_reply(owner,keyword) or {}
+            context.user_data.clear(); context.user_data["wait_support_ar_buttons"]=keyword
+            await q.edit_message_text(
+                "🔗 Send URL buttons in this format:\nButton title - https://example.com\n\nSame row:\nButton 1 - URL && Button 2 - URL",
+                reply_markup=self.support_auto_reply_buttons_menu(keyword,bool(item.get("buttons"))),
+            ); return
+        if a.startswith("a_support_ar_rmtext_"):
+            keyword=a.replace("a_support_ar_rmtext_",""); await save_support_auto_reply(owner,keyword,text="")
+            await q.edit_message_text("✅ Text removed",reply_markup=self.support_auto_reply_text_menu(keyword,False)); return
+        if a.startswith("a_support_ar_rmmedia_"):
+            keyword=a.replace("a_support_ar_rmmedia_",""); await save_support_auto_reply(owner,keyword,media_type="",media_file_id="")
+            await q.edit_message_text("✅ Media removed",reply_markup=self.support_auto_reply_media_menu(keyword,False)); return
+        if a.startswith("a_support_ar_rmbuttons_"):
+            keyword=a.replace("a_support_ar_rmbuttons_",""); await save_support_auto_reply(owner,keyword,buttons=[])
+            await q.edit_message_text("✅ Keyboard removed",reply_markup=self.support_auto_reply_buttons_menu(keyword,False)); return
+        if a.startswith("a_support_ar_delete_"):
+            keyword=a.replace("a_support_ar_delete_",""); await delete_support_auto_reply(owner,keyword)
+            await q.edit_message_text("✅ Auto reply deleted",reply_markup=self.support_auto_replies_menu(await list_support_auto_replies(owner))); return
+        if a.startswith("a_support_ar_preview_"):
+            keyword=a.replace("a_support_ar_preview_",""); item=await get_support_auto_reply(owner,keyword)
+            if item:
+                await self.send_support_template(context,owner,q.from_user.id,item,q.from_user)
+            await q.answer("Preview sent",show_alert=True); return
+
         if a=="a_support_templates":
             templates=await list_support_templates(owner)
             text="⚡ Live Support Reply Templates\n\nTopic/private support me saved command bhejo, jaise /payment. Bot saved text, media aur buttons user ko reply ke roop me bhejega.\n\nVariables: {NAME} {ID} {USERNAME} {PLAN} {EXPIRY}"
@@ -2973,6 +3083,9 @@ class SellerBotManager:
             raise ApplicationHandlerStop
 
         await upsert_user(owner,user)
+        auto_reply=None
+        if message.text and not message.text.startswith("/"):
+            auto_reply=await match_support_auto_reply(owner,message.text)
         mode=support.get("mode","topic")
         try:
             if mode=="topic":
@@ -3009,21 +3122,19 @@ class SellerBotManager:
                     message_id=message.message_id,
                 )
                 await save_private_message_link(owner,owner,copied.message_id,user.id)
-            confirmation = await message.reply_text("✅ Message sent to live support.")
-
-            async def delete_support_confirmation() -> None:
+            if auto_reply:
+                try:
+                    await self.send_support_template(context,owner,user.id,auto_reply,user)
+                except TelegramError as exc:
+                    logger.warning("Support auto reply failed owner=%s user=%s: %s",owner,user.id,exc)
+            confirmation=await message.reply_text("✅ Message sent to live support.")
+            async def _delete_support_confirmation():
                 await asyncio.sleep(3)
                 try:
                     await confirmation.delete()
-                except TelegramError as exc:
-                    logger.debug(
-                        "Could not auto-delete live support confirmation owner=%s user=%s: %s",
-                        owner,
-                        user.id,
-                        exc,
-                    )
-
-            asyncio.create_task(delete_support_confirmation())
+                except TelegramError:
+                    pass
+            asyncio.create_task(_delete_support_confirmation())
         except ApplicationHandlerStop:
             raise
         except TelegramError as exc:
@@ -3138,6 +3249,27 @@ class SellerBotManager:
                 except Exception as exc:
                     await update.effective_message.reply_text(f"❌ {exc}")
                 return
+            if context.user_data.get("wait_support_ar_keyword"):
+                keyword=" ".join(text.strip().lower().split())
+                try:
+                    await save_support_auto_reply(owner,keyword)
+                except Exception as exc:
+                    await update.effective_message.reply_text(f"❌ {exc}"); return
+                context.user_data.clear()
+                await update.effective_message.reply_text(
+                    "✅ Auto reply created",
+                    reply_markup=self.support_auto_reply_edit_menu(keyword),
+                ); return
+            if context.user_data.get("wait_support_ar_text"):
+                keyword=context.user_data["wait_support_ar_text"]
+                await save_support_auto_reply(owner,keyword,text=text); context.user_data.clear()
+                await update.effective_message.reply_text("✅ Text saved",reply_markup=self.support_auto_reply_edit_menu(keyword)); return
+            if context.user_data.get("wait_support_ar_buttons"):
+                keyword=context.user_data["wait_support_ar_buttons"]
+                try: rows=self.parse_welcome_buttons(text)
+                except Exception as exc: await update.effective_message.reply_text(f"❌ {exc}"); return
+                await save_support_auto_reply(owner,keyword,buttons=rows); context.user_data.clear()
+                await update.effective_message.reply_text("✅ URL buttons saved",reply_markup=self.support_auto_reply_edit_menu(keyword)); return
             if context.user_data.get("wait_support_tpl_command"):
                 command=text.strip().lower().lstrip("/")
                 try:
@@ -3521,6 +3653,17 @@ class SellerBotManager:
         owner=self.owner(context)
         if update.effective_user.id!=owner:
             return
+        if context.user_data.get("wait_support_ar_media"):
+            keyword=context.user_data["wait_support_ar_media"]
+            msg=update.effective_message; media_type=""; file_id=""
+            if msg.photo: media_type="photo"; file_id=msg.photo[-1].file_id
+            elif msg.video: media_type="video"; file_id=msg.video.file_id
+            elif msg.animation: media_type="animation"; file_id=msg.animation.file_id
+            elif msg.document: media_type="document"; file_id=msg.document.file_id
+            if not file_id: await msg.reply_text("❌ Send a photo, video, GIF or document."); return
+            await save_support_auto_reply(owner,keyword,media_type=media_type,media_file_id=file_id)
+            context.user_data.clear(); await msg.reply_text("✅ Media saved",reply_markup=self.support_auto_reply_edit_menu(keyword))
+            raise ApplicationHandlerStop
         if context.user_data.get("wait_support_tpl_media"):
             command=context.user_data["wait_support_tpl_media"]
             msg=update.effective_message; media_type=""; file_id=""
